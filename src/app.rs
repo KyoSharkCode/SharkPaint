@@ -60,6 +60,10 @@ pub struct SharkPaintApp {
     pending_start: Option<Pos2>,
     /// Latest pen pressure reported since the current press began.
     contact_pressure: Option<f32>,
+    /// A pen or finger is currently touching the tablet.
+    touch_active: bool,
+    /// The current press came from a pen or finger rather than the mouse.
+    press_is_touch: bool,
     pen_seen: bool,
     fit_pending: bool,
     new_dialog: Option<NewCanvasDialog>,
@@ -88,6 +92,8 @@ impl SharkPaintApp {
             last_pressure: 1.0,
             pending_start: None,
             contact_pressure: None,
+            touch_active: false,
+            press_is_touch: false,
             pen_seen: false,
             fit_pending: true,
             new_dialog: None,
@@ -466,14 +472,27 @@ impl SharkPaintApp {
             match event {
                 Event::Touch { phase, force, .. } => match phase {
                     TouchPhase::Start | TouchPhase::Move => {
-                        if let Some(f) = force {
-                            let f = f.clamp(0.0, 1.0);
-                            self.pen_pressure = Some(f);
-                            self.contact_pressure = Some(f);
-                            self.pen_seen = true;
+                        if *phase == TouchPhase::Start {
+                            self.touch_active = true;
+                            self.pen_pressure = None;
+                        }
+                        match force {
+                            Some(f) => {
+                                let f = f.clamp(0.0, 1.0);
+                                self.pen_pressure = Some(f);
+                                self.contact_pressure = Some(f);
+                                self.pen_seen = true;
+                            }
+                            // Windows reports zero pressure as "no reading". Once the
+                            // pen has reported pressure in this contact, that means 0.
+                            None if self.pen_pressure.is_some() => self.pen_pressure = Some(0.0),
+                            None => {}
                         }
                     }
-                    TouchPhase::End | TouchPhase::Cancel => self.pen_pressure = None,
+                    TouchPhase::End | TouchPhase::Cancel => {
+                        self.touch_active = false;
+                        self.pen_pressure = None;
+                    }
                 },
                 Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => {
                     if navigating || !over_canvas(*pos) {
@@ -484,16 +503,27 @@ impl SharkPaintApp {
                         self.pick_color(c);
                         continue;
                     }
-                    // The press can arrive before the pen reports any pressure, so
-                    // the first dab waits for the next sample instead of assuming
-                    // full pressure (which stamped a full-size dot).
+                    // The first dab waits for a real pressure reading: a pen touching
+                    // down reports no pressure at first, and assuming full pressure
+                    // there stamped a full-size dot at the start of every stroke.
                     self.doc.end_stroke();
                     self.pending_start = Some(c);
+                    self.press_is_touch = self.touch_active;
                     self.contact_pressure = self.pen_pressure;
                 }
                 Event::PointerMoved(pos) if self.pending_start.is_some() || self.doc.is_stroking() => {
                     let c = to_canvas(*pos);
-                    let pressure = self.pen_pressure.unwrap_or(1.0);
+                    let pressure = match (self.press_is_touch, self.pen_pressure) {
+                        (_, Some(p)) => p,
+                        (false, None) => 1.0, // mouse
+                        (true, None) => {
+                            // Pen is down but has not reported pressure yet: no ink.
+                            if self.pending_start.is_some() {
+                                self.pending_start = Some(c);
+                            }
+                            continue;
+                        }
+                    };
                     self.last_pressure = pressure;
                     if let Some(start) = self.pending_start.take() {
                         self.begin_stroke(start, pressure);
@@ -504,7 +534,8 @@ impl SharkPaintApp {
                 | Event::PointerGone => {
                     // A tap without movement still leaves one dab.
                     if let Some(start) = self.pending_start.take() {
-                        let pressure = self.contact_pressure.unwrap_or(1.0);
+                        let fallback = if self.press_is_touch { 0.0 } else { 1.0 };
+                        let pressure = self.contact_pressure.unwrap_or(fallback);
                         self.last_pressure = pressure;
                         self.begin_stroke(start, pressure);
                     }
