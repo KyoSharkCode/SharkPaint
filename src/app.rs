@@ -339,6 +339,8 @@ pub struct SharkPaintApp {
     ref_texture: Option<(usize, TextureHandle)>,
     /// Where the reference panel was last drawn, to route dropped files.
     refs_rect: Option<Rect>,
+    /// The pointer is over the reference panel, so pasted images go there.
+    pointer_on_references: bool,
     /// Colours the user saved, and the ones used lately (most recent first).
     palette: Vec<[u8; 3]>,
     recent: Vec<[u8; 3]>,
@@ -424,6 +426,7 @@ impl SharkPaintApp {
             ref_view: (Vec2::ZERO, 1.0),
             ref_texture: None,
             refs_rect: None,
+            pointer_on_references: false,
             palette: Vec::new(),
             recent: Vec::new(),
             tool_keys: Tool::ALL.iter().map(|t| t.0.default_key()).collect(),
@@ -1850,6 +1853,10 @@ impl SharkPaintApp {
     /// Pastes an image that arrived from the clipboard. What SharkPaint itself
     /// copied goes back exactly where it was; anything else is centred.
     fn paste_image(&mut self, width: usize, height: usize, rgba: Vec<u8>) {
+        if self.pointer_on_references {
+            self.add_reference("Referencia pegada", width, height, rgba);
+            return;
+        }
         match &self.clip {
             Some((rect, own)) if (rect.width(), rect.height()) == (width, height) => {
                 let (rect, own) = (*rect, own.clone());
@@ -1879,6 +1886,8 @@ impl SharkPaintApp {
     fn incoming_images(&mut self, ctx: &egui::Context) {
         let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
         let typing = ctx.text_edit_focused();
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        self.pointer_on_references = self.refs_rect.zip(pointer).is_some_and(|(rect, pos)| rect.contains(pos));
         for event in events {
             match event {
                 Event::Copy if !typing => self.copy(false),
@@ -1898,8 +1907,7 @@ impl SharkPaintApp {
             if path.as_os_str().is_empty() {
                 continue;
             }
-            let pointer = ctx.input(|i| i.pointer.latest_pos());
-            let on_references = self.refs_rect.zip(pointer).is_some_and(|(rect, pos)| rect.contains(pos));
+            let on_references = self.pointer_on_references;
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
                 self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
             } else if on_references {
@@ -1946,8 +1954,13 @@ impl SharkPaintApp {
         let navigating = !typing && (space || move_key || rotate_key);
         let rotating = rotate_key && !space && !move_key;
         // The pointer is over the canvas itself, not a menu or window on top of it.
+        // `contains_pointer` is false while the pointer is on the resize edge of
+        // a floating window, which reaches slightly past the window itself.
+        let canvas_has_pointer = response.contains_pointer();
         let over_canvas = |pos: Pos2| {
-            viewport.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
+            canvas_has_pointer
+                && viewport.contains(pos)
+                && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
         };
 
         // --- Navigation -----------------------------------------------------
