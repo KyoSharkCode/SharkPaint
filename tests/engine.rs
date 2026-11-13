@@ -745,3 +745,60 @@ fn deleting_clears_only_the_selection() {
     doc.undo();
     assert!(red(&doc, 40, 50));
 }
+
+#[test]
+fn clipped_layers_show_only_over_their_base() {
+    let mut doc = Document::new(200, 200);
+    line(&mut doc, &hard_brush(60.0), [255, 0, 0], false, (40.0, 100.0), (160.0, 100.0)); // base: red bar
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [0, 0, 255], false, (100.0, 20.0), (100.0, 180.0)); // blue stripe across it
+    assert_eq!(pixel(&doc, 100, 30), [0, 0, 255, 255]);
+
+    let mut props = doc.active().props.clone();
+    props.clip = true;
+    doc.set_layer_props(1, props, false);
+    assert_eq!(pixel(&doc, 100, 100), [0, 0, 255, 255]); // over the bar: visible
+    assert_eq!(pixel(&doc, 100, 30), [255, 255, 255, 255]); // outside it: clipped away
+    assert_eq!(pixel(&doc, 60, 100), [255, 0, 0, 255]);
+
+    // Hiding the base hides what is clipped to it.
+    let mut base = doc.layers()[0].props.clone();
+    base.visible = false;
+    doc.set_layer_props(0, base, false);
+    assert_eq!(pixel(&doc, 100, 100), [255, 255, 255, 255]);
+    doc.undo();
+
+    // The flag survives saving, and merging down keeps the clipped look.
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert!(loaded.layers()[1].props.clip && !loaded.layers()[0].props.clip);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    let stacked = doc.render_rgba8(doc.bounds());
+    assert!(doc.merge_down());
+    assert_eq!(doc.render_rgba8(doc.bounds()), stacked);
+}
+
+#[test]
+fn copying_takes_the_selected_pixels() {
+    let mut doc = doc_with_block(); // red block x 30..70, y 40..60
+    let (rect, rgba) = doc.copy_pixels().unwrap();
+    assert_eq!(rect, IRect::new(30, 40, 70, 60));
+    assert_eq!(rgba.len(), 40 * 20 * 4);
+    assert!(rgba.chunks(4).all(|p| p == [255, 0, 0, 255]));
+
+    doc.select_polygon(&rect_points(60.0, 30.0, 90.0, 70.0)); // overlaps its right end
+    let (rect, rgba) = doc.copy_pixels().unwrap();
+    assert_eq!(rect, IRect::new(60, 30, 90, 70));
+    let at = |x: i32, y: i32| { let i = ((y - 30) * 30 + (x - 60)) as usize * 4; [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]] };
+    assert_eq!(at(65, 50), [255, 0, 0, 255]);
+    assert_eq!(at(80, 50), [0, 0, 0, 0]);
+
+    // Pasting it back in place reproduces those pixels on a new layer.
+    doc.add_image_layer("copia", rect.width(), rect.height(), &rgba, rect.x0, rect.y0);
+    assert_eq!(doc.layers()[2].pixel(65, 50), doc.layers()[1].pixel(65, 50));
+    assert_eq!(doc.layers()[2].pixel(40, 50), [0; 4]);
+
+    doc.select_polygon(&rect_points(120.0, 120.0, 180.0, 180.0)); // nothing there
+    assert!(doc.copy_pixels().is_none());
+}

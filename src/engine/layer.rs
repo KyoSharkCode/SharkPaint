@@ -169,6 +169,9 @@ pub struct LayerProps {
     pub blend: BlendMode,
     /// Painting keeps the layer's existing transparency.
     pub alpha_lock: bool,
+    /// Clipping mask: the layer shows only where the nearest unclipped layer
+    /// beneath it has pixels.
+    pub clip: bool,
 }
 
 impl LayerProps {
@@ -179,6 +182,7 @@ impl LayerProps {
             opacity: 1.0,
             blend: BlendMode::Normal,
             alpha_lock: false,
+            clip: false,
         }
     }
 

@@ -12,6 +12,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
+- Máscaras de recorte: una capa puede mostrarse solo donde la de debajo tiene dibujo.
+- Copiar, cortar y pegar la selección o la capa (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`).
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
   caja sobre el lienzo).
@@ -28,7 +30,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
-- Máscaras de recorte y grupos de capas.
+- Grupos de capas.
 - Sumar y restar selecciones, y deshacer los cambios de selección.
 - Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
   de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
@@ -62,7 +64,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Ctrl+O` | Abrir proyecto |
 | `Ctrl+S` / `Ctrl+Mayús+S` | Guardar / Guardar como |
 | `Ctrl+E` | Exportar PNG |
-| `Ctrl+V` | Pegar una imagen del portapapeles |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copiar / Cortar / Pegar (también imágenes de otras aplicaciones) |
 | `Ctrl+N` | Nuevo lienzo |
 
 ## Tableta gráfica

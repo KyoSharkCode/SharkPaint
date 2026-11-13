@@ -181,12 +181,17 @@ impl Document {
         let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
         below.version = version;
-        let (opacity, mode) = (top.props.opacity15(), top.props.blend);
+        let (opacity, mode, clipped) = (top.props.opacity15(), top.props.blend, top.props.clip);
         for (idx, src) in top.tiles.iter().enumerate() {
             let Some(src) = src else { continue };
+            if clipped && below.tiles[idx].is_none() {
+                continue; // clipped to nothing here
+            }
             let dst = Arc::make_mut(below.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())));
             for (d, s) in dst.0.iter_mut().zip(src.0.iter()) {
                 let mut px = d.map(u32::from);
+                // A clipped layer only counts where the layer beneath has pixels.
+                let opacity = if clipped { (opacity * d[3] as u32) >> 15 } else { opacity };
                 blend_over(&mut px, *s, opacity, mode);
                 *d = px.map(|c| c as u16);
             }
@@ -389,12 +394,26 @@ impl Document {
                 let x1 = rect.x1.min(ox + TILE as i32);
                 let y0 = rect.y0.max(oy);
                 let y1 = rect.y1.min(oy + TILE as i32);
-                let tiles: Vec<(&Tile, &LayerProps)> = self
-                    .layers
-                    .iter()
-                    .filter(|l| l.props.visible && l.props.opacity > 0.0)
-                    .filter_map(|l| l.tiles[l.tile_index(tx, ty)].as_deref().map(|t| (t, &l.props)))
-                    .collect();
+                // Each drawable layer's tile, with the tile and opacity of the
+                // layer it is clipped to, if any.
+                let mut tiles: Vec<(&Tile, &LayerProps, Option<(&Tile, u32)>)> = Vec::new();
+                let mut clip_base: Option<(&Tile, u32)> = None;
+                for (index, layer) in self.layers.iter().enumerate() {
+                    let props = &layer.props;
+                    let shown = props.visible && props.opacity > 0.0;
+                    let tile = layer.tiles[layer.tile_index(tx, ty)].as_deref();
+                    if props.clip && index > 0 {
+                        if let (true, Some(tile), Some(base)) = (shown, tile, clip_base) {
+                            tiles.push((tile, props, Some(base)));
+                        }
+                    } else {
+                        // A hidden or empty base hides everything clipped to it.
+                        clip_base = tile.filter(|_| shown).map(|t| (t, props.opacity15()));
+                        if let (true, Some(tile)) = (shown, tile) {
+                            tiles.push((tile, props, None));
+                        }
+                    }
+                }
                 for y in y0..y1 {
                     let row = (y - oy) as usize * TILE;
                     let out_row = (y - rect.y0) as usize * w;
@@ -406,8 +425,12 @@ impl Document {
                         }
                         let i = row + (x - ox) as usize;
                         let mut c = [paper[0], paper[1], paper[2], ONE];
-                        for (tile, props) in &tiles {
-                            blend_over(&mut c, tile.0[i], props.opacity15(), props.blend);
+                        for (tile, props, base) in &tiles {
+                            let mut opacity = props.opacity15();
+                            if let Some((base, base_opacity)) = base {
+                                opacity = (opacity * ((base.0[i][3] as u32 * base_opacity) >> 15)) >> 15;
+                            }
+                            blend_over(&mut c, tile.0[i], opacity, props.blend);
                         }
                         out[o] = to8(c[0]);
                         out[o + 1] = to8(c[1]);

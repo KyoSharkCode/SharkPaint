@@ -12,7 +12,8 @@
 //! active     u32      index of the active layer
 //! per layer:
 //!   name     u32 length + UTF-8 bytes
-//!   flags    u8       bit 0 = visible, bit 1 = transparency locked
+//!   flags    u8       bit 0 = visible, bit 1 = transparency locked,
+//!                     bit 2 = clipped to the layer beneath
 //!   opacity  u16      0..=32768
 //!   blend    u8       0 = normal
 //!   tiles    u32      number of stored tiles
@@ -105,7 +106,7 @@ impl Document {
             let props = &layer.props;
             w.write_all(&(props.name.len() as u32).to_le_bytes())?;
             w.write_all(props.name.as_bytes())?;
-            w.write_all(&[props.visible as u8 | (props.alpha_lock as u8) << 1])?;
+            w.write_all(&[props.visible as u8 | (props.alpha_lock as u8) << 1 | (props.clip as u8) << 2])?;
             w.write_all(&(props.opacity15() as u16).to_le_bytes())?;
             w.write_all(&[props.blend.id()])?;
 
@@ -172,6 +173,7 @@ impl Document {
             let mut layer = Layer::new(width, height, name);
             layer.props.visible = flags & 1 != 0;
             layer.props.alpha_lock = flags & 2 != 0;
+            layer.props.clip = flags & 4 != 0;
             layer.props.opacity = (opacity as f32 / ONE as f32).min(1.0);
             layer.props.blend = BlendMode::from_id(blend).ok_or_else(|| invalid("modo de fusión desconocido"))?;
             let tile_count = read_u32(r)? as usize;

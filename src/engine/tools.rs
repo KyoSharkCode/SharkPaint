@@ -867,3 +867,38 @@ impl Document {
         self.mark_dirty(rect);
     }
 }
+
+// --- Copying ----------------------------------------------------------------
+
+impl Document {
+    /// The selected part of the active layer (or all of it without a
+    /// selection) as an image: where it sits on the canvas and its 8-bit,
+    /// non-premultiplied RGBA pixels. `None` if there is nothing there.
+    pub fn copy_pixels(&self) -> Option<(IRect, Vec<u8>)> {
+        let layer = &self.layers[self.active_layer];
+        let rect = match &self.selection {
+            Some(selection) => selection.bounds,
+            None => content_bounds(layer, &layer.tiles)?,
+        };
+        let mut out = Vec::with_capacity(rect.width() * rect.height() * 4);
+        let mut any = false;
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                let px = layer.pixel(x, y);
+                let share = self.selection.as_ref().map_or(255, |s| s.coverage(x, y) as u32);
+                let alpha = px[3] as u32 * share / 255;
+                if alpha == 0 {
+                    out.extend_from_slice(&[0, 0, 0, 0]);
+                    continue;
+                }
+                any = true;
+                for c in 0..3 {
+                    // Undo the premultiplication by the pixel's own alpha.
+                    out.push(((px[c] as u32 * 255 + px[3] as u32 / 2) / px[3] as u32).min(255) as u8);
+                }
+                out.push(((alpha * 255 + ONE / 2) >> 15) as u8);
+            }
+        }
+        any.then_some((rect, out))
+    }
+}

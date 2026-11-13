@@ -200,6 +200,7 @@ enum Command {
     Open,
     InsertImage,
     PasteImage,
+    Copy(bool),
     Save,
     SaveAs,
     ExportPng,
@@ -269,6 +270,8 @@ pub struct SharkPaintApp {
     xform_empty: Option<(u64, u64, u64)>,
     select_shape: SelectShape,
     select_drag: Option<SelectDrag>,
+    /// What Copy or Cut last took: where it was on the canvas and its pixels.
+    clip: Option<(IRect, Vec<u8>)>,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -350,6 +353,7 @@ impl SharkPaintApp {
             xform_empty: None,
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
+            clip: None,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -694,7 +698,13 @@ impl SharkPaintApp {
                     commands.push(Command::Redo);
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Pegar imagen").shortcut_text("Ctrl+V")).clicked() {
+                if ui.add(egui::Button::new("Cortar").shortcut_text("Ctrl+X")).clicked() {
+                    commands.push(Command::Copy(true));
+                }
+                if ui.add(egui::Button::new("Copiar").shortcut_text("Ctrl+C")).clicked() {
+                    commands.push(Command::Copy(false));
+                }
+                if ui.add(egui::Button::new("Pegar").shortcut_text("Ctrl+V")).clicked() {
                     commands.push(Command::PasteImage);
                 }
             });
@@ -1147,6 +1157,10 @@ impl SharkPaintApp {
         });
         ui.checkbox(&mut props.alpha_lock, "Bloquear transparencia")
             .on_hover_text("Pinta solo sobre lo que ya está dibujado en la capa");
+        ui.add_enabled_ui(active > 0, |ui| {
+            ui.checkbox(&mut props.clip, "Recortar a la capa inferior")
+                .on_hover_text("La capa solo se ve donde la capa de debajo tiene dibujo.\nÚtil para sombras y luces sin salirse del color base.");
+        });
         if props != before {
             self.doc.set_layer_props(active, props, self.prop_edit_active);
             self.prop_edit_active = continuous;
@@ -1188,8 +1202,17 @@ impl SharkPaintApp {
                     }
 
                     // Preview, fitted inside a fixed slot so every row lines up.
+                    // A clipped layer is indented, with a bar tying it to its base.
+                    let indent = if props.clip && i > 0 { 12.0 } else { 0.0 };
+                    if indent > 0.0 {
+                        let x = row.left() + 6.0;
+                        painter.line_segment(
+                            [Pos2::new(x, row.top() + 4.0), Pos2::new(x, row.bottom() + 2.0)],
+                            Stroke::new(2.0, ui.visuals().selection.bg_fill.gamma_multiply(1.6)),
+                        );
+                    }
                     let slot = Rect::from_min_size(
-                        row.min + Vec2::new(4.0, (ROW_HEIGHT - THUMB_SIZE.1 as f32) * 0.5),
+                        row.min + Vec2::new(4.0 + indent, (ROW_HEIGHT - THUMB_SIZE.1 as f32) * 0.5),
                         Vec2::new(THUMB_SIZE.0 as f32, THUMB_SIZE.1 as f32),
                     );
                     if let Some((_, texture)) = self.thumbnails.get(&layer.id) {
@@ -1358,32 +1381,76 @@ impl SharkPaintApp {
         }
     }
 
-    /// Pastes the image on the system clipboard, if there is one.
-    fn paste_clipboard_image(&mut self) {
-        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
-        match image {
-            Ok(image) => self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned()),
-            Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+    /// Copies the selected part of the active layer (all of it without a
+    /// selection) to the clipboard; `cut` also removes it from the layer.
+    fn copy(&mut self, cut: bool) {
+        self.doc.end_stroke();
+        let Some((rect, rgba)) = self.doc.copy_pixels() else {
+            self.status = "No hay nada que copiar en la capa activa.".into();
+            return;
+        };
+        // Also offer it to other applications; failing that is not a problem.
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_image(arboard::ImageData {
+                width: rect.width(),
+                height: rect.height(),
+                bytes: std::borrow::Cow::Borrowed(&rgba),
+            });
+        }
+        self.clip = Some((rect, rgba));
+        if cut {
+            if self.doc.selection().is_some() {
+                self.doc.clear_selection_contents();
+            } else {
+                self.doc.clear_active_layer();
+            }
+        }
+        self.status = if cut { "Cortado." } else { "Copiado." }.into();
+    }
+
+    /// Pastes an image that arrived from the clipboard. What SharkPaint itself
+    /// copied goes back exactly where it was; anything else is centred.
+    fn paste_image(&mut self, width: usize, height: usize, rgba: Vec<u8>) {
+        match &self.clip {
+            Some((rect, own)) if (rect.width(), rect.height()) == (width, height) => {
+                let (rect, own) = (*rect, own.clone());
+                self.doc.add_image_layer("Capa pegada", width, height, &own, rect.x0, rect.y0);
+                self.tool = Tool::Mover;
+                self.status = "Pegado en una capa nueva. Arrástrala para colocarla.".into();
+            }
+            _ => self.insert_image("Imagen pegada", width, height, rgba),
         }
     }
 
-    /// Images arriving by Ctrl+V or by dropping files on the window.
+    /// Pastes whatever image is on the clipboard: the system's, or failing
+    /// that the last thing copied here.
+    fn paste_clipboard_image(&mut self) {
+        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+        match (image, &self.clip) {
+            (Ok(image), _) => self.paste_image(image.width, image.height, image.bytes.into_owned()),
+            (Err(_), Some((rect, own))) => {
+                let (w, h, own) = (rect.width(), rect.height(), own.clone());
+                self.paste_image(w, h, own);
+            }
+            (Err(_), None) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+        }
+    }
+
+    /// Clipboard shortcuts and files dropped on the window.
     fn incoming_images(&mut self, ctx: &egui::Context) {
         let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
+        let typing = ctx.text_edit_focused();
         for event in events {
             match event {
+                Event::Copy if !typing => self.copy(false),
+                Event::Cut if !typing => self.copy(true),
                 Event::PasteImage(image) => {
                     let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
-                    self.insert_image("Imagen pegada", image.size[0], image.size[1], rgba);
+                    self.paste_image(image.size[0], image.size[1], rgba);
                 }
                 // The clipboard also had text, which wins; look for an image anyway
                 // unless the text is headed for a text field.
-                Event::Paste(_) if !ctx.text_edit_focused() => {
-                    let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
-                    if let Ok(image) = image {
-                        self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned());
-                    }
-                }
+                Event::Paste(_) if !typing => self.paste_clipboard_image(),
                 _ => {}
             }
         }
@@ -1821,6 +1888,7 @@ impl SharkPaintApp {
             Command::Open => self.discarding(Discarding::Open, ctx),
             Command::InsertImage => self.pick_image_file(),
             Command::PasteImage => self.paste_clipboard_image(),
+            Command::Copy(cut) => self.copy(cut),
             Command::Save => {
                 self.save_project(false);
             }
