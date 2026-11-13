@@ -1,6 +1,6 @@
 [package]
 name = "sharkpaint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Aplicación nativa de dibujo y pintura digital"
 license = "GPL-3.0-only"
@@ -22,6 +22,10 @@ flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 png = "0.18"
 rfd = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 winresource = "0.1"

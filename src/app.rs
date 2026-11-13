@@ -9,15 +9,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
-    PROJECT_EXTENSION,
+    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference,
+    StrokePoint, PROJECT_EXTENSION,
 };
 
 use crate::icons::icon;
+use crate::settings::{self, Settings};
 use crate::view::View;
 
 const DEFAULT_SIZE: [usize; 2] = [3000, 2000];
 const MAX_BRUSH_SIZE: f32 = 500.0;
+/// Seconds between automatic recovery saves.
+const AUTOSAVE_SECONDS: f64 = 120.0;
+/// Letters that move, rotate and flip the canvas, so tools cannot take them.
+const RESERVED_KEYS: [Key; 3] = [Key::M, Key::R, Key::F];
+/// Reference images are shrunk to this side at most; they are for looking at.
+const MAX_REFERENCE_SIDE: u32 = 2048;
 /// Slot for a layer preview in the layer list, in points.
 const THUMB_SIZE: (usize, usize) = (56, 38);
 const ROW_HEIGHT: f32 = 46.0;
@@ -49,6 +56,11 @@ impl Tool {
 
     fn name(self) -> &'static str {
         Tool::ALL.iter().find(|t| t.0 == self).map_or("", |t| t.2)
+    }
+
+    fn default_key(self) -> Key {
+        let letter = Tool::ALL.iter().find(|t| t.0 == self).map_or("B", |t| t.3);
+        Key::from_name(letter).unwrap_or(Key::B)
     }
 
     /// The tool paints with a round tip whose size the cursor shows.
@@ -200,6 +212,7 @@ enum Command {
     Open,
     InsertImage,
     PasteImage,
+    Copy(bool),
     Save,
     SaveAs,
     ExportPng,
@@ -218,6 +231,9 @@ enum Command {
     ResetRotation,
     Flip,
     ToggleBrushWindow,
+    ToggleReferences,
+    ToggleSymmetry,
+    Preferences,
     Fullscreen,
     FinishTransform(bool),
     SelectAll,
@@ -269,6 +285,8 @@ pub struct SharkPaintApp {
     xform_empty: Option<(u64, u64, u64)>,
     select_shape: SelectShape,
     select_drag: Option<SelectDrag>,
+    /// What Copy or Cut last took: where it was on the canvas and its pixels.
+    clip: Option<(IRect, Vec<u8>)>,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -307,14 +325,38 @@ pub struct SharkPaintApp {
     /// The window may close even with unsaved changes (the user chose to).
     allow_close: bool,
     window_title: String,
-    /// Display scale of the monitor the window is on.
-    display_scale: f32,
-    /// Window size in points while the display scale was last steady.
-    steady_size: Option<Vec2>,
-    /// When the display scale last changed (the window crossed to another monitor).
-    scale_changed_at: Option<f64>,
+    /// The fix for moving between monitors of different scale has been tried.
+    window_hooked: bool,
     /// The floating brush settings window is showing.
     brush_window_open: bool,
+    /// The reference panel is showing.
+    refs_open: bool,
+    /// Which reference is on screen.
+    ref_index: usize,
+    /// Pan (points) and extra zoom of the reference on screen.
+    ref_view: (Vec2, f32),
+    /// Texture of the reference on screen, with the pixels it was made from.
+    ref_texture: Option<(usize, TextureHandle)>,
+    /// Where the reference panel was last drawn, to route dropped files.
+    refs_rect: Option<Rect>,
+    /// The pointer is over the reference panel, so pasted images go there.
+    pointer_on_references: bool,
+    /// Colours the user saved, and the ones used lately (most recent first).
+    palette: Vec<[u8; 3]>,
+    recent: Vec<[u8; 3]>,
+    /// Shortcut key of each tool, in `Tool::ALL` order.
+    tool_keys: Vec<Key>,
+    /// The settings as last written to disk.
+    saved_settings: Settings,
+    prefs_open: bool,
+    /// Strokes are mirrored across the canvas's vertical centre line.
+    symmetry: bool,
+    /// When and at which document revision the recovery file was last written.
+    autosave_time: f64,
+    autosave_revision: u64,
+    autosave_thread: Option<std::thread::JoinHandle<()>>,
+    /// A recovery file from an earlier session, waiting for the user's answer.
+    recovery_prompt: Option<PathBuf>,
 }
 
 impl SharkPaintApp {
@@ -354,6 +396,7 @@ impl SharkPaintApp {
             xform_empty: None,
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
+            clip: None,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -376,11 +419,41 @@ impl SharkPaintApp {
             confirm: None,
             allow_close: false,
             window_title: String::new(),
-            display_scale: 0.0,
-            steady_size: None,
-            scale_changed_at: None,
+            window_hooked: false,
             brush_window_open: true,
+            refs_open: false,
+            ref_index: 0,
+            ref_view: (Vec2::ZERO, 1.0),
+            ref_texture: None,
+            refs_rect: None,
+            pointer_on_references: false,
+            palette: Vec::new(),
+            recent: Vec::new(),
+            tool_keys: Tool::ALL.iter().map(|t| t.0.default_key()).collect(),
+            saved_settings: Settings::default(),
+            prefs_open: false,
+            symmetry: false,
+            autosave_time: 0.0,
+            autosave_revision: 0,
+            autosave_thread: None,
+            recovery_prompt: None,
         };
+        let stored = Settings::load();
+        app.palette = stored.palette.clone();
+        app.recent = stored.recent.clone();
+        for (tool, key) in &stored.tool_keys {
+            let slot = Tool::ALL.iter().position(|t| t.1 == tool);
+            if let (Some(slot), Some(key)) = (slot, Key::from_name(key)) {
+                if !RESERVED_KEYS.contains(&key) {
+                    app.tool_keys[slot] = key;
+                }
+            }
+        }
+        app.saved_settings = app.current_settings();
+        // A drawing saved automatically by a session that did not close cleanly.
+        if open_path.is_none() {
+            app.recovery_prompt = settings::recovery_path().filter(|path| path.exists());
+        }
         // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
@@ -391,6 +464,158 @@ impl SharkPaintApp {
             }
         }
         app
+    }
+
+    fn current_settings(&self) -> Settings {
+        Settings {
+            palette: self.palette.clone(),
+            recent: self.recent.clone(),
+            tool_keys: Tool::ALL
+                .iter()
+                .zip(&self.tool_keys)
+                .map(|(tool, key)| (tool.1.to_owned(), key.name().to_owned()))
+                .collect(),
+        }
+    }
+
+    /// Writes the preferences when they have changed.
+    fn store_settings(&mut self) {
+        let current = self.current_settings();
+        if current != self.saved_settings {
+            current.save();
+            self.saved_settings = current;
+        }
+    }
+
+    /// Remembers a colour that was just painted with.
+    fn note_color(&mut self) {
+        if self.recent.first() != Some(&self.color) {
+            self.recent.retain(|c| *c != self.color);
+            self.recent.insert(0, self.color);
+            self.recent.truncate(14);
+        }
+    }
+
+    /// Saves the drawing to the recovery file now and then, on another thread,
+    /// so work survives a crash or a power cut.
+    fn autosave(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let busy = self.autosave_thread.as_ref().is_some_and(|t| !t.is_finished());
+        if !self.modified() || self.doc.revision() == self.autosave_revision || busy || self.doc.is_stroking() {
+            return;
+        }
+        if now - self.autosave_time < AUTOSAVE_SECONDS {
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
+            return;
+        }
+        let Some(path) = settings::recovery_path() else { return };
+        let snapshot = self.doc.snapshot();
+        self.autosave_time = now;
+        self.autosave_revision = self.doc.revision();
+        self.autosave_thread = Some(std::thread::spawn(move || {
+            let _ = snapshot.save(&path);
+        }));
+    }
+
+    /// Removes the recovery file: the drawing is safely saved or was let go.
+    fn drop_recovery(&mut self) {
+        if let Some(thread) = self.autosave_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(path) = settings::recovery_path() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.autosave_revision = self.doc.revision();
+    }
+
+    fn recovery_window(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.recovery_prompt.clone() else { return };
+        let mut choice = None;
+        egui::Window::new("Recuperar dibujo")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("SharkPaint no se cerró bien la última vez y guardó una copia del dibujo.");
+                ui.label("¿Quieres recuperarla?");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Recuperar").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Descartar").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        match choice {
+            Some(true) => {
+                match Document::load(&path) {
+                    Ok(doc) => {
+                        self.replace_document(doc, None);
+                        // Recovered work has never been saved by the user.
+                        self.saved_revision = u64::MAX;
+                        self.autosave_revision = self.doc.revision();
+                        self.status = "Dibujo recuperado. Guárdalo para conservarlo.".into();
+                    }
+                    Err(e) => self.status = format!("No se pudo recuperar el dibujo: {e}"),
+                }
+                self.recovery_prompt = None;
+            }
+            Some(false) => {
+                self.recovery_prompt = None;
+                self.drop_recovery();
+            }
+            None => {}
+        }
+    }
+
+    /// Preferences: the shortcut key of each tool.
+    fn preferences_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.prefs_open;
+        egui::Window::new("Preferencias")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.strong("Atajos de las herramientas");
+                ui.label("Si eliges una tecla que ya usa otra herramienta, se intercambian.");
+                ui.add_space(4.0);
+                let mut change = None;
+                egui::Grid::new("atajos_herramientas").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                    for (slot, (_, _, label, _)) in Tool::ALL.iter().enumerate() {
+                        ui.label(*label);
+                        egui::ComboBox::from_id_salt(("tecla", slot))
+                            .selected_text(self.tool_keys[slot].name())
+                            .width(60.0)
+                            .show_ui(ui, |ui| {
+                                for letter in 'A'..='Z' {
+                                    let Some(key) = Key::from_name(&letter.to_string()) else { continue };
+                                    if RESERVED_KEYS.contains(&key) {
+                                        continue;
+                                    }
+                                    if ui.selectable_label(self.tool_keys[slot] == key, key.name()).clicked() {
+                                        change = Some((slot, key));
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    }
+                });
+                if let Some((slot, key)) = change {
+                    if let Some(other) = self.tool_keys.iter().position(|k| *k == key) {
+                        self.tool_keys[other] = self.tool_keys[slot];
+                    }
+                    self.tool_keys[slot] = key;
+                }
+                ui.add_space(4.0);
+                ui.label("M, R y F quedan reservadas para mover, rotar y voltear el lienzo.");
+                if ui.button("Restablecer atajos").clicked() {
+                    self.tool_keys = Tool::ALL.iter().map(|t| t.0.default_key()).collect();
+                }
+            });
+        self.prefs_open = open;
     }
 
     fn modified(&self) -> bool {
@@ -405,6 +630,14 @@ impl SharkPaintApp {
         self.view = View::default();
         self.fit_pending = true;
         self.pending_start = None;
+        // Layer ids start over in every document, so old previews must go.
+        self.thumbnails.clear();
+        self.ref_texture = None;
+        self.xform = None;
+        self.xform_empty = None;
+        self.ref_index = 0;
+        self.ref_view = (Vec2::ZERO, 1.0);
+        self.refs_open = !self.doc.references().is_empty();
     }
 
     fn load_project(&mut self, path: PathBuf) {
@@ -449,6 +682,7 @@ impl SharkPaintApp {
                 self.status = format!("Guardado: {}", path.display());
                 self.saved_revision = self.doc.revision();
                 self.path = Some(path);
+                self.drop_recovery();
                 true
             }
             Err(e) => {
@@ -483,6 +717,7 @@ impl SharkPaintApp {
             }
             Discarding::Quit => {
                 self.allow_close = true;
+                self.drop_recovery();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -523,44 +758,6 @@ impl SharkPaintApp {
             }
             Some(2) => self.confirm = None,
             _ => {}
-        }
-    }
-
-    /// Keeps the window the same apparent size when it moves to a monitor with a
-    /// different display scale. Dragging a window across such monitors can leave
-    /// it shrunken on Windows; once the scale settles, the size from before the
-    /// move is restored.
-    fn keep_size_across_monitors(&mut self, ctx: &egui::Context) {
-        let (scale, size, fixed, now) = ctx.input(|i| {
-            let v = i.viewport();
-            (
-                v.native_pixels_per_point.unwrap_or(1.0),
-                v.inner_rect.map(|r| r.size()),
-                v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false) || v.minimized.unwrap_or(false),
-                i.time,
-            )
-        });
-        if self.display_scale == 0.0 {
-            self.display_scale = scale;
-        }
-        if scale != self.display_scale {
-            self.display_scale = scale;
-            self.scale_changed_at = Some(now);
-        }
-        match self.scale_changed_at {
-            Some(changed) if now - changed < 0.6 => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(200));
-            }
-            Some(_) => {
-                self.scale_changed_at = None;
-                if let (Some(want), Some(have), false) = (self.steady_size, size, fixed) {
-                    if (have - want).abs().max_elem() > 8.0 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-                    }
-                }
-            }
-            None if !fixed => self.steady_size = size,
-            None => {}
         }
     }
 
@@ -673,18 +870,12 @@ impl SharkPaintApp {
             if hit(none, Key::F5) {
                 commands.push(Command::ToggleBrushWindow);
             }
-            for (tool, key) in [
-                (Tool::Pincel, Key::B),
-                (Tool::Borrador, Key::E),
-                (Tool::Difuminar, Key::D),
-                (Tool::Relleno, Key::G),
-                (Tool::Cuentagotas, Key::I),
-                (Tool::Mover, Key::V),
-                (Tool::Transformar, Key::T),
-                (Tool::Seleccion, Key::S),
-            ] {
-                if hit(none, key) {
-                    self.tool = tool;
+            if hit(none, Key::F6) {
+                commands.push(Command::ToggleReferences);
+            }
+            for (slot, (tool, ..)) in Tool::ALL.iter().enumerate() {
+                if hit(none, self.tool_keys[slot]) {
+                    self.tool = *tool;
                 }
             }
             let brush = match self.tool {
@@ -738,7 +929,17 @@ impl SharkPaintApp {
                     commands.push(Command::Redo);
                 }
                 ui.separator();
-                if ui.add(egui::Button::new("Pegar imagen").shortcut_text("Ctrl+V")).clicked() {
+                if ui.button("Preferencias…").clicked() {
+                    commands.push(Command::Preferences);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Cortar").shortcut_text("Ctrl+X")).clicked() {
+                    commands.push(Command::Copy(true));
+                }
+                if ui.add(egui::Button::new("Copiar").shortcut_text("Ctrl+C")).clicked() {
+                    commands.push(Command::Copy(false));
+                }
+                if ui.add(egui::Button::new("Pegar").shortcut_text("Ctrl+V")).clicked() {
                     commands.push(Command::PasteImage);
                 }
             });
@@ -830,6 +1031,12 @@ impl SharkPaintApp {
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
                 }
+                if ui.add(egui::Button::new("Simetría").selected(self.symmetry)).clicked() {
+                    commands.push(Command::ToggleSymmetry);
+                }
+                if item(ui, "Referencias", "F6") {
+                    commands.push(Command::ToggleReferences);
+                }
                 if item(ui, "Pantalla completa", "F11") {
                     commands.push(Command::Fullscreen);
                 }
@@ -842,13 +1049,13 @@ impl SharkPaintApp {
                 ui.separator();
                 egui::Grid::new("atajos").num_columns(2).show(ui, |ui| {
                     for (keys, what) in [
-                        ("B / E / D", "Pincel / Borrador / Difuminar"),
-                        ("G / I / V", "Relleno / Cuentagotas / Mover capa"),
-                        ("T", "Transformar (Intro aplica, Esc cancela)"),
-                        ("S", "Selección (Ctrl+A todo, Ctrl+D ninguna)"),
+                        ("Herramientas", "Ver y cambiar en Editar → Preferencias"),
+                        ("Intro / Esc", "Aplicar / cancelar la transformación"),
+                        ("Ctrl+A / Ctrl+D", "Seleccionar todo / Deseleccionar"),
                         ("Supr", "Borrar lo seleccionado"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
+                        ("F6", "Mostrar u ocultar las referencias"),
                         ("Alt + clic", "Tomar color del lienzo"),
                         ("M + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
@@ -873,8 +1080,8 @@ impl SharkPaintApp {
         ui.add_space(4.0);
         let text = ui.visuals().strong_text_color();
         let size = Vec2::splat(ui.available_width());
-        for (tool, name, label, key) in Tool::ALL {
-            let tip = format!("{label} ({key})\nClic de nuevo: ajustes");
+        for (slot, (tool, name, label, _)) in Tool::ALL.into_iter().enumerate() {
+            let tip = format!("{label} ({})\nClic de nuevo: ajustes", self.tool_keys[slot].name());
             let button = egui::Button::image(icon(name, 20.0, text)).selected(self.tool == tool).min_size(size);
             if ui.add(button).on_hover_text(tip).clicked() {
                 if self.tool == tool {
@@ -891,6 +1098,10 @@ impl SharkPaintApp {
         if ui.add(button).on_hover_text("Ajustes del pincel (F5)").clicked() {
             commands.push(Command::ToggleBrushWindow);
         }
+        let button = egui::Button::image(icon("imagen", 20.0, text)).selected(self.refs_open).min_size(size);
+        if ui.add(button).on_hover_text("Referencias (F6)").clicked() {
+            commands.push(Command::ToggleReferences);
+        }
         ui.separator();
         let faint = ui.visuals().weak_text_color().gamma_multiply(0.5);
         for (name, enabled, tip, command) in [
@@ -902,6 +1113,152 @@ impl SharkPaintApp {
             if ui.add_enabled(enabled, button).on_hover_text(tip).clicked() {
                 commands.push(command);
             }
+        }
+    }
+
+    /// Adds an image to the reference panel, shrunk if it is very large.
+    fn add_reference(&mut self, name: &str, width: usize, height: usize, rgba: Vec<u8>) {
+        if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+            self.status = "La imagen no se pudo leer.".into();
+            return;
+        }
+        let (mut width, mut height, mut rgba) = (width as u32, height as u32, rgba);
+        let largest = width.max(height);
+        if largest > MAX_REFERENCE_SIDE {
+            let scale = MAX_REFERENCE_SIDE as f64 / largest as f64;
+            let (w, h) = (((width as f64 * scale) as u32).max(1), ((height as f64 * scale) as u32).max(1));
+            let Some(source) = image::RgbaImage::from_raw(width, height, rgba) else { return };
+            rgba = image::imageops::resize(&source, w, h, image::imageops::FilterType::Triangle).into_raw();
+            (width, height) = (w, h);
+        }
+        self.doc.add_reference(Reference {
+            name: name.to_owned(),
+            width: width as usize,
+            height: height as usize,
+            rgba: std::sync::Arc::new(rgba),
+        });
+        self.ref_index = self.doc.references().len() - 1;
+        self.ref_view = (Vec2::ZERO, 1.0);
+        self.refs_open = true;
+    }
+
+    fn add_reference_file(&mut self, path: &std::path::Path) {
+        match image::open(path) {
+            Ok(decoded) => {
+                let rgba = decoded.into_rgba8();
+                let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Referencia".into());
+                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                self.add_reference(&name, w, h, rgba.into_raw());
+            }
+            Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+        }
+    }
+
+    /// The reference panel: images to look at while drawing. They live beside
+    /// the picture, with their own zoom, and are never exported.
+    fn references_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.refs_open;
+        let mut add_files = false;
+        let mut paste = false;
+        let mut remove = false;
+        let shown = egui::Window::new("Referencias")
+            .open(&mut open)
+            .default_size([340.0, 380.0])
+            .min_size([220.0, 200.0])
+            .default_pos(self.viewport.right_top() + Vec2::new(-360.0, 12.0))
+            .show(ctx, |ui| {
+                let count = self.doc.references().len();
+                self.ref_index = self.ref_index.min(count.saturating_sub(1));
+                ui.horizontal(|ui| {
+                    add_files = ui.button("Añadir…").clicked();
+                    paste = ui.button("Pegar").on_hover_text("Añade la imagen del portapapeles").clicked();
+                    remove = ui.add_enabled(count > 0, egui::Button::new("Quitar")).clicked();
+                    if count > 1 {
+                        ui.separator();
+                        if ui.small_button("◀").clicked() {
+                            self.ref_index = (self.ref_index + count - 1) % count;
+                            self.ref_view = (Vec2::ZERO, 1.0);
+                        }
+                        ui.label(format!("{} / {count}", self.ref_index + 1));
+                        if ui.small_button("▶").clicked() {
+                            self.ref_index = (self.ref_index + 1) % count;
+                            self.ref_view = (Vec2::ZERO, 1.0);
+                        }
+                    }
+                });
+                let Some(reference) = self.doc.references().get(self.ref_index).cloned() else {
+                    ui.add_space(8.0);
+                    ui.label("Añade imágenes de consulta: se quedan aquí, fuera del lienzo y de las capas.");
+                    ui.label("Se guardan con el proyecto y nunca se incluyen al exportar.");
+                    ui.label("También puedes soltar un archivo sobre esta ventana.");
+                    ui.allocate_space(ui.available_size());
+                    return;
+                };
+                // One texture, remade when another image comes on screen.
+                let key = std::sync::Arc::as_ptr(&reference.rgba) as usize;
+                if self.ref_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let image = ColorImage::from_rgba_unmultiplied([reference.width, reference.height], &reference.rgba);
+                    self.ref_texture = Some((key, ui.ctx().load_texture("referencia", image, TextureOptions::LINEAR)));
+                }
+                let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+                let area = response.rect;
+                painter.rect_filled(area, 2.0, Color32::from_gray(24));
+                let size = Vec2::new(reference.width as f32, reference.height as f32);
+                let fit = (area.width() / size.x).min(area.height() / size.y);
+                if response.dragged() {
+                    self.ref_view.0 += response.drag_delta();
+                }
+                if response.double_clicked() {
+                    self.ref_view = (Vec2::ZERO, 1.0);
+                }
+                let hover = response.hover_pos();
+                if let Some(pos) = hover {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        // Zoom around the pointer.
+                        let old = fit * self.ref_view.1;
+                        self.ref_view.1 = (self.ref_view.1 * (scroll * 0.0025).exp()).clamp(0.2, 40.0);
+                        let center = area.center() + self.ref_view.0;
+                        self.ref_view.0 += (pos - center) * (1.0 - fit * self.ref_view.1 / old);
+                    }
+                    ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                }
+                let scale = fit * self.ref_view.1;
+                let shown = Rect::from_center_size(area.center() + self.ref_view.0, size * scale);
+                if let Some((_, texture)) = &self.ref_texture {
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.with_clip_rect(area).image(texture.id(), shown, uv, Color32::WHITE);
+                }
+                // A click takes the colour under the pointer.
+                if let Some(pos) = hover.filter(|_| response.clicked() && !response.double_clicked()) {
+                    let at = (pos - shown.min) / scale;
+                    let (x, y) = (at.x.floor() as i64, at.y.floor() as i64);
+                    if x >= 0 && y >= 0 && (x as usize) < reference.width && (y as usize) < reference.height {
+                        let i = (y as usize * reference.width + x as usize) * 4;
+                        self.color = [reference.rgba[i], reference.rgba[i + 1], reference.rgba[i + 2]];
+                    }
+                }
+            });
+        self.refs_rect = shown.map(|window| window.response.rect);
+        self.refs_open = open;
+        if add_files {
+            let picked = rfd::FileDialog::new()
+                .set_title("Añadir referencias")
+                .add_filter("Imágenes", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+                .pick_files();
+            for path in picked.unwrap_or_default() {
+                self.add_reference_file(&path);
+            }
+        }
+        if paste {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image()) {
+                Ok(image) => self.add_reference("Referencia pegada", image.width, image.height, image.bytes.into_owned()),
+                Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+            }
+        }
+        if remove {
+            self.doc.remove_reference(self.ref_index);
+            self.ref_view = (Vec2::ZERO, 1.0);
         }
     }
 
@@ -930,6 +1287,50 @@ impl SharkPaintApp {
                 self.color = [color.r(), color.g(), color.b()];
             }
         });
+
+        // Saved colours, then the ones used lately.
+        let swatch = |ui: &mut egui::Ui, color: [u8; 3], tip: &str| {
+            let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+            ui.painter().rect_filled(rect, 3.0, Color32::from_rgb(color[0], color[1], color[2]));
+            let edge = if response.hovered() { Color32::WHITE } else { Color32::from_gray(70) };
+            ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+            response.on_hover_text(format!("#{:02X}{:02X}{:02X}\n{tip}", color[0], color[1], color[2]))
+        };
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(3.0);
+            ui.label("Paleta");
+            let mut remove = None;
+            for (i, color) in self.palette.clone().into_iter().enumerate() {
+                let response = swatch(ui, color, "Clic: usar · Clic derecho: quitar");
+                if response.clicked() {
+                    self.color = color;
+                }
+                if response.secondary_clicked() {
+                    remove = Some(i);
+                }
+            }
+            if let Some(i) = remove {
+                self.palette.remove(i);
+            }
+            let add = egui::Button::new("+").small().min_size(Vec2::splat(18.0));
+            if ui.add(add).on_hover_text("Guardar el color actual en la paleta").clicked()
+                && !self.palette.contains(&self.color)
+            {
+                self.palette.push(self.color);
+            }
+        });
+        if !self.recent.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(3.0);
+                ui.label("Recientes");
+                for color in self.recent.clone() {
+                    if swatch(ui, color, "Clic: usar").clicked() {
+                        self.color = color;
+                    }
+                }
+            });
+        }
     }
 
     fn transform_panel(&mut self, ui: &mut egui::Ui) {
@@ -1067,6 +1468,10 @@ impl SharkPaintApp {
             }
         }
 
+        if self.tool != Tool::Difuminar {
+            ui.checkbox(&mut self.symmetry, "Simetría")
+                .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
+        }
         ui.add_space(4.0);
         let before = self.active_brush().clone();
         let smudging = self.tool == Tool::Difuminar;
@@ -1191,6 +1596,10 @@ impl SharkPaintApp {
         });
         ui.checkbox(&mut props.alpha_lock, "Bloquear transparencia")
             .on_hover_text("Pinta solo sobre lo que ya está dibujado en la capa");
+        ui.add_enabled_ui(active > 0, |ui| {
+            ui.checkbox(&mut props.clip, "Recortar a la capa inferior")
+                .on_hover_text("La capa solo se ve donde la capa de debajo tiene dibujo.\nÚtil para sombras y luces sin salirse del color base.");
+        });
         if props != before {
             self.doc.set_layer_props(active, props, self.prop_edit_active);
             self.prop_edit_active = continuous;
@@ -1232,8 +1641,17 @@ impl SharkPaintApp {
                     }
 
                     // Preview, fitted inside a fixed slot so every row lines up.
+                    // A clipped layer is indented, with a bar tying it to its base.
+                    let indent = if props.clip && i > 0 { 12.0 } else { 0.0 };
+                    if indent > 0.0 {
+                        let x = row.left() + 6.0;
+                        painter.line_segment(
+                            [Pos2::new(x, row.top() + 4.0), Pos2::new(x, row.bottom() + 2.0)],
+                            Stroke::new(2.0, ui.visuals().selection.bg_fill.gamma_multiply(1.6)),
+                        );
+                    }
                     let slot = Rect::from_min_size(
-                        row.min + Vec2::new(4.0, (ROW_HEIGHT - THUMB_SIZE.1 as f32) * 0.5),
+                        row.min + Vec2::new(4.0 + indent, (ROW_HEIGHT - THUMB_SIZE.1 as f32) * 0.5),
                         Vec2::new(THUMB_SIZE.0 as f32, THUMB_SIZE.1 as f32),
                     );
                     if let Some((_, texture)) = self.thumbnails.get(&layer.id) {
@@ -1344,6 +1762,9 @@ impl SharkPaintApp {
     }
 
     fn begin_stroke(&mut self, at: Pos2, pressure: f32) {
+        if self.tool == Tool::Pincel {
+            self.note_color();
+        }
         let brush = self.active_brush().clone();
         let point = StrokePoint::new(at.x, at.y, pressure);
         match self.tool {
@@ -1402,32 +1823,82 @@ impl SharkPaintApp {
         }
     }
 
-    /// Pastes the image on the system clipboard, if there is one.
-    fn paste_clipboard_image(&mut self) {
-        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
-        match image {
-            Ok(image) => self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned()),
-            Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+    /// Copies the selected part of the active layer (all of it without a
+    /// selection) to the clipboard; `cut` also removes it from the layer.
+    fn copy(&mut self, cut: bool) {
+        self.doc.end_stroke();
+        let Some((rect, rgba)) = self.doc.copy_pixels() else {
+            self.status = "No hay nada que copiar en la capa activa.".into();
+            return;
+        };
+        // Also offer it to other applications; failing that is not a problem.
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_image(arboard::ImageData {
+                width: rect.width(),
+                height: rect.height(),
+                bytes: std::borrow::Cow::Borrowed(&rgba),
+            });
+        }
+        self.clip = Some((rect, rgba));
+        if cut {
+            if self.doc.selection().is_some() {
+                self.doc.clear_selection_contents();
+            } else {
+                self.doc.clear_active_layer();
+            }
+        }
+        self.status = if cut { "Cortado." } else { "Copiado." }.into();
+    }
+
+    /// Pastes an image that arrived from the clipboard. What SharkPaint itself
+    /// copied goes back exactly where it was; anything else is centred.
+    fn paste_image(&mut self, width: usize, height: usize, rgba: Vec<u8>) {
+        if self.pointer_on_references {
+            self.add_reference("Referencia pegada", width, height, rgba);
+            return;
+        }
+        match &self.clip {
+            Some((rect, own)) if (rect.width(), rect.height()) == (width, height) => {
+                let (rect, own) = (*rect, own.clone());
+                self.doc.add_image_layer("Capa pegada", width, height, &own, rect.x0, rect.y0);
+                self.tool = Tool::Mover;
+                self.status = "Pegado en una capa nueva. Arrástrala para colocarla.".into();
+            }
+            _ => self.insert_image("Imagen pegada", width, height, rgba),
         }
     }
 
-    /// Images arriving by Ctrl+V or by dropping files on the window.
+    /// Pastes whatever image is on the clipboard: the system's, or failing
+    /// that the last thing copied here.
+    fn paste_clipboard_image(&mut self) {
+        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+        match (image, &self.clip) {
+            (Ok(image), _) => self.paste_image(image.width, image.height, image.bytes.into_owned()),
+            (Err(_), Some((rect, own))) => {
+                let (w, h, own) = (rect.width(), rect.height(), own.clone());
+                self.paste_image(w, h, own);
+            }
+            (Err(_), None) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+        }
+    }
+
+    /// Clipboard shortcuts and files dropped on the window.
     fn incoming_images(&mut self, ctx: &egui::Context) {
         let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
+        let typing = ctx.text_edit_focused();
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        self.pointer_on_references = self.refs_rect.zip(pointer).is_some_and(|(rect, pos)| rect.contains(pos));
         for event in events {
             match event {
+                Event::Copy if !typing => self.copy(false),
+                Event::Cut if !typing => self.copy(true),
                 Event::PasteImage(image) => {
                     let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
-                    self.insert_image("Imagen pegada", image.size[0], image.size[1], rgba);
+                    self.paste_image(image.size[0], image.size[1], rgba);
                 }
                 // The clipboard also had text, which wins; look for an image anyway
                 // unless the text is headed for a text field.
-                Event::Paste(_) if !ctx.text_edit_focused() => {
-                    let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
-                    if let Ok(image) = image {
-                        self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned());
-                    }
-                }
+                Event::Paste(_) if !typing => self.paste_clipboard_image(),
                 _ => {}
             }
         }
@@ -1436,8 +1907,12 @@ impl SharkPaintApp {
             if path.as_os_str().is_empty() {
                 continue;
             }
+            let on_references = self.pointer_on_references;
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
                 self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            } else if on_references {
+                // Dropped on the reference panel: it is for looking at, not drawing on.
+                self.add_reference_file(&path);
             } else {
                 self.insert_image_file(&path);
             }
@@ -1479,8 +1954,13 @@ impl SharkPaintApp {
         let navigating = !typing && (space || move_key || rotate_key);
         let rotating = rotate_key && !space && !move_key;
         // The pointer is over the canvas itself, not a menu or window on top of it.
+        // `contains_pointer` is false while the pointer is on the resize edge of
+        // a floating window, which reaches slightly past the window itself.
+        let canvas_has_pointer = response.contains_pointer();
         let over_canvas = |pos: Pos2| {
-            viewport.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
+            canvas_has_pointer
+                && viewport.contains(pos)
+                && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
         };
 
         // --- Navigation -----------------------------------------------------
@@ -1508,6 +1988,7 @@ impl SharkPaintApp {
             }
         }
 
+        self.doc.symmetry = self.symmetry;
         self.sync_transform();
         let free = ctx.input(|i| i.modifiers.shift);
         let mut transform_changed = false;
@@ -1592,6 +2073,7 @@ impl SharkPaintApp {
                     match self.tool {
                         Tool::Relleno => {
                             let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
+                            self.note_color();
                             self.doc.flood_fill(x, y, self.color, self.fill_tolerance, self.fill_all_layers);
                             continue;
                         }
@@ -1738,6 +2220,14 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
+        // The symmetry axis, as a guide.
+        if self.symmetry {
+            let top = self.view.to_screen(Pos2::new(doc_size.x * 0.5, 0.0), viewport, doc_size);
+            let bottom = self.view.to_screen(Pos2::new(doc_size.x * 0.5, doc_size.y), viewport, doc_size);
+            let guide = Stroke::new(1.0, Color32::from_rgb(111, 227, 240));
+            painter.extend(Shape::dashed_line(&[top, bottom], guide, 8.0, 6.0));
+        }
+
         // The selection, and the one being dragged out, as a dashed outline.
         let dashed = |outline: &[(f32, f32)]| {
             let mut points: Vec<Pos2> =
@@ -1865,6 +2355,7 @@ impl SharkPaintApp {
             Command::Open => self.discarding(Discarding::Open, ctx),
             Command::InsertImage => self.pick_image_file(),
             Command::PasteImage => self.paste_clipboard_image(),
+            Command::Copy(cut) => self.copy(cut),
             Command::Save => {
                 self.save_project(false);
             }
@@ -1904,6 +2395,9 @@ impl SharkPaintApp {
             }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
+            Command::ToggleReferences => self.refs_open = !self.refs_open,
+            Command::ToggleSymmetry => self.symmetry = !self.symmetry,
+            Command::Preferences => self.prefs_open = true,
             Command::FinishTransform(apply) => self.finish_transform(apply),
             Command::SelectAll => self.doc.select_all(),
             Command::Deselect => self.doc.deselect(),
@@ -1919,7 +2413,19 @@ impl SharkPaintApp {
 }
 
 impl eframe::App for SharkPaintApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn on_exit(&mut self) {
+        self.store_settings();
+        // Closing normally leaves nothing to recover.
+        if !self.modified() || self.allow_close {
+            self.drop_recovery();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !self.window_hooked {
+            self.window_hooked = true;
+            crate::dpi_fix::install(frame);
+        }
         let ctx = ui.ctx().clone();
         let mut commands = Vec::new();
         self.keyboard_commands(&ctx, &mut commands);
@@ -1952,10 +2458,22 @@ impl eframe::App for SharkPaintApp {
         if self.brush_window_open {
             self.brush_window(&ctx);
         }
+        if self.refs_open {
+            self.references_window(&ctx);
+        } else {
+            self.refs_rect = None;
+        }
+        if self.prefs_open {
+            self.preferences_window(&ctx);
+        }
+        self.recovery_window(&ctx);
+        self.autosave(&ctx);
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.store_settings();
+        }
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
-        self.keep_size_across_monitors(&ctx);
         for command in commands {
             self.run(command, &ctx);
         }

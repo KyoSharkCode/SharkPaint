@@ -12,14 +12,22 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
+- Máscaras de recorte: una capa puede mostrarse solo donde la de debajo tiene dibujo.
+- Copiar, cortar y pegar la selección o la capa (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`).
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
   caja sobre el lienzo).
 - Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
   transformar y voltear afectan solo a lo seleccionado.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
+  propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
+- Simetría: los trazos se repiten en espejo respecto al centro del lienzo.
+- Paleta de colores guardados e historial de colores recientes.
+- Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
+- Atajos de herramientas configurables (Editar → Preferencias).
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
 - Gestos táctiles con dos dedos: mover, rotar y hacer zoom.
 - Proyectos en formato propio (`.spaint`) que conservan la precisión completa del
@@ -28,11 +36,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
-- Máscaras de recorte y grupos de capas.
+- Grupos de capas.
 - Sumar y restar selecciones, y deshacer los cambios de selección.
-- Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
-  de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
-  referencia. No se incluyen al exportar.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
@@ -40,7 +45,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 | Atajo | Acción |
 |---|---|
-| `B` / `E` / `D` | Pincel / Borrador / Difuminar |
+| `B` / `E` / `D` | Pincel / Borrador / Difuminar (configurables) |
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
@@ -57,12 +62,13 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Ctrl+Mayús+N` / `Ctrl+J` | Nueva capa / Duplicar capa |
 | `5` | Restablecer la rotación |
 | `F` | Voltear horizontalmente |
+| `F6` | Mostrar u ocultar las referencias |
 | `F11` | Pantalla completa |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
 | `Ctrl+O` | Abrir proyecto |
 | `Ctrl+S` / `Ctrl+Mayús+S` | Guardar / Guardar como |
 | `Ctrl+E` | Exportar PNG |
-| `Ctrl+V` | Pegar una imagen del portapapeles |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copiar / Cortar / Pegar (también imágenes de otras aplicaciones) |
 | `Ctrl+N` | Nuevo lienzo |
 
 ## Tableta gráfica
@@ -101,6 +107,7 @@ cargo test
 - `src/engine/`: motor de pintura (capas en mosaicos, pincel, historial), sin
   dependencias de interfaz.
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
+- `src/settings.rs`: preferencias guardadas entre sesiones y archivo de recuperación.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
 - `src/engine/selection.rs`: máscara de selección.

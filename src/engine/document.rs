@@ -23,6 +23,29 @@ enum HistoryEntry {
     Props { layer: usize, props: LayerProps },
 }
 
+/// A reference image kept alongside the drawing: shown in its own panel,
+/// never part of the picture or of exports.
+#[derive(Clone)]
+pub struct Reference {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    /// 8-bit RGBA, not premultiplied, row-major.
+    pub rgba: Arc<Vec<u8>>,
+}
+
+/// Everything a project file holds, detached from the live document so it
+/// can be written on another thread. Layers share their pixels with the
+/// document, so taking one is cheap.
+pub struct ProjectSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub paper: [u8; 3],
+    pub layers: Vec<Layer>,
+    pub active_layer: usize,
+    pub references: Vec<Reference>,
+}
+
 pub struct Document {
     pub width: usize,
     pub height: usize,
@@ -31,6 +54,9 @@ pub struct Document {
     pub(super) active_layer: usize,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
+    /// Brush and eraser strokes are mirrored across the canvas's vertical
+    /// centre line.
+    pub symmetry: bool,
     stroke: Option<ActiveStroke>,
     pub(super) smudge: Option<SmudgeStroke>,
     pub(super) moving: Option<MoveSession>,
@@ -44,6 +70,7 @@ pub struct Document {
     next_layer_number: usize,
     /// Source of layer ids and versions; never repeats.
     next_stamp: u64,
+    references: Vec<Reference>,
     pub(super) selection: Option<Arc<Selection>>,
     /// Changes whenever the selection does.
     pub(super) selection_stamp: u64,
@@ -71,6 +98,7 @@ impl Document {
             layers,
             active_layer: active,
             paper: [255, 255, 255],
+            symmetry: false,
             stroke: None,
             smudge: None,
             moving: None,
@@ -79,6 +107,7 @@ impl Document {
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
             revision: 0,
+            references: Vec::new(),
             selection: None,
             selection_stamp: 0,
         }
@@ -181,12 +210,17 @@ impl Document {
         let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
         below.version = version;
-        let (opacity, mode) = (top.props.opacity15(), top.props.blend);
+        let (opacity, mode, clipped) = (top.props.opacity15(), top.props.blend, top.props.clip);
         for (idx, src) in top.tiles.iter().enumerate() {
             let Some(src) = src else { continue };
+            if clipped && below.tiles[idx].is_none() {
+                continue; // clipped to nothing here
+            }
             let dst = Arc::make_mut(below.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())));
             for (d, s) in dst.0.iter_mut().zip(src.0.iter()) {
                 let mut px = d.map(u32::from);
+                // A clipped layer only counts where the layer beneath has pixels.
+                let opacity = if clipped { (opacity * d[3] as u32) >> 15 } else { opacity };
                 blend_over(&mut px, *s, opacity, mode);
                 *d = px.map(|c| c as u16);
             }
@@ -229,6 +263,46 @@ impl Document {
             self.push_undo(HistoryEntry::Tiles { layer: li, tiles });
             self.mark_dirty(self.bounds());
         }
+    }
+
+    // --- References -----------------------------------------------------------
+
+    pub fn references(&self) -> &[Reference] {
+        &self.references
+    }
+
+    /// Adds a reference image. Not part of the undo history, but it does count
+    /// as an unsaved change.
+    pub fn add_reference(&mut self, reference: Reference) {
+        self.references.push(reference);
+        self.revision += 1;
+    }
+
+    pub fn remove_reference(&mut self, index: usize) {
+        if index < self.references.len() {
+            self.references.remove(index);
+            self.revision += 1;
+        }
+    }
+
+    /// The document's contents as they are now, for saving.
+    pub fn snapshot(&self) -> ProjectSnapshot {
+        ProjectSnapshot {
+            width: self.width,
+            height: self.height,
+            paper: self.paper,
+            layers: self.layers.clone(),
+            active_layer: self.active_layer,
+            references: self.references.clone(),
+        }
+    }
+
+    /// Builds a document from loaded contents, with a clean history.
+    pub fn from_snapshot(snapshot: ProjectSnapshot) -> Self {
+        let mut doc = Document::from_layers(snapshot.width, snapshot.height, snapshot.layers, snapshot.active_layer);
+        doc.paper = snapshot.paper;
+        doc.references = snapshot.references;
+        doc
     }
 
     // --- Selection ------------------------------------------------------------
@@ -275,7 +349,9 @@ impl Document {
         }
         let li = self.active_layer;
         let selection = self.selection.clone();
-        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, p);
+        let mirror_x = self.symmetry.then_some(self.width as f32 * 0.5);
+        let (stroke, rect) =
+            ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, mirror_x, p);
         self.stroke = Some(stroke);
         self.mark_dirty(rect);
     }
@@ -389,12 +465,26 @@ impl Document {
                 let x1 = rect.x1.min(ox + TILE as i32);
                 let y0 = rect.y0.max(oy);
                 let y1 = rect.y1.min(oy + TILE as i32);
-                let tiles: Vec<(&Tile, &LayerProps)> = self
-                    .layers
-                    .iter()
-                    .filter(|l| l.props.visible && l.props.opacity > 0.0)
-                    .filter_map(|l| l.tiles[l.tile_index(tx, ty)].as_deref().map(|t| (t, &l.props)))
-                    .collect();
+                // Each drawable layer's tile, with the tile and opacity of the
+                // layer it is clipped to, if any.
+                let mut tiles: Vec<(&Tile, &LayerProps, Option<(&Tile, u32)>)> = Vec::new();
+                let mut clip_base: Option<(&Tile, u32)> = None;
+                for (index, layer) in self.layers.iter().enumerate() {
+                    let props = &layer.props;
+                    let shown = props.visible && props.opacity > 0.0;
+                    let tile = layer.tiles[layer.tile_index(tx, ty)].as_deref();
+                    if props.clip && index > 0 {
+                        if let (true, Some(tile), Some(base)) = (shown, tile, clip_base) {
+                            tiles.push((tile, props, Some(base)));
+                        }
+                    } else {
+                        // A hidden or empty base hides everything clipped to it.
+                        clip_base = tile.filter(|_| shown).map(|t| (t, props.opacity15()));
+                        if let (true, Some(tile)) = (shown, tile) {
+                            tiles.push((tile, props, None));
+                        }
+                    }
+                }
                 for y in y0..y1 {
                     let row = (y - oy) as usize * TILE;
                     let out_row = (y - rect.y0) as usize * w;
@@ -406,8 +496,12 @@ impl Document {
                         }
                         let i = row + (x - ox) as usize;
                         let mut c = [paper[0], paper[1], paper[2], ONE];
-                        for (tile, props) in &tiles {
-                            blend_over(&mut c, tile.0[i], props.opacity15(), props.blend);
+                        for (tile, props, base) in &tiles {
+                            let mut opacity = props.opacity15();
+                            if let Some((base, base_opacity)) = base {
+                                opacity = (opacity * ((base.0[i][3] as u32 * base_opacity) >> 15)) >> 15;
+                            }
+                            blend_over(&mut c, tile.0[i], opacity, props.blend);
                         }
                         out[o] = to8(c[0]);
                         out[o + 1] = to8(c[1]);

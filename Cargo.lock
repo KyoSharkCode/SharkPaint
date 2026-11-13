@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "sharkpaint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "eframe",
@@ -3124,7 +3124,9 @@ dependencies = [
  "flate2",
  "image",
  "png 0.18.1",
+ "raw-window-handle",
  "rfd",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

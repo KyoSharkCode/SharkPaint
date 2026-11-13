@@ -1,5 +1,5 @@
 use sharkpaint::engine::{
-    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
+    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -744,4 +744,117 @@ fn deleting_clears_only_the_selection() {
     assert!(!red(&doc, 40, 50) && red(&doc, 60, 50));
     doc.undo();
     assert!(red(&doc, 40, 50));
+}
+
+#[test]
+fn clipped_layers_show_only_over_their_base() {
+    let mut doc = Document::new(200, 200);
+    line(&mut doc, &hard_brush(60.0), [255, 0, 0], false, (40.0, 100.0), (160.0, 100.0)); // base: red bar
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [0, 0, 255], false, (100.0, 20.0), (100.0, 180.0)); // blue stripe across it
+    assert_eq!(pixel(&doc, 100, 30), [0, 0, 255, 255]);
+
+    let mut props = doc.active().props.clone();
+    props.clip = true;
+    doc.set_layer_props(1, props, false);
+    assert_eq!(pixel(&doc, 100, 100), [0, 0, 255, 255]); // over the bar: visible
+    assert_eq!(pixel(&doc, 100, 30), [255, 255, 255, 255]); // outside it: clipped away
+    assert_eq!(pixel(&doc, 60, 100), [255, 0, 0, 255]);
+
+    // Hiding the base hides what is clipped to it.
+    let mut base = doc.layers()[0].props.clone();
+    base.visible = false;
+    doc.set_layer_props(0, base, false);
+    assert_eq!(pixel(&doc, 100, 100), [255, 255, 255, 255]);
+    doc.undo();
+
+    // The flag survives saving, and merging down keeps the clipped look.
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert!(loaded.layers()[1].props.clip && !loaded.layers()[0].props.clip);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    let stacked = doc.render_rgba8(doc.bounds());
+    assert!(doc.merge_down());
+    assert_eq!(doc.render_rgba8(doc.bounds()), stacked);
+}
+
+#[test]
+fn copying_takes_the_selected_pixels() {
+    let mut doc = doc_with_block(); // red block x 30..70, y 40..60
+    let (rect, rgba) = doc.copy_pixels().unwrap();
+    assert_eq!(rect, IRect::new(30, 40, 70, 60));
+    assert_eq!(rgba.len(), 40 * 20 * 4);
+    assert!(rgba.chunks(4).all(|p| p == [255, 0, 0, 255]));
+
+    doc.select_polygon(&rect_points(60.0, 30.0, 90.0, 70.0)); // overlaps its right end
+    let (rect, rgba) = doc.copy_pixels().unwrap();
+    assert_eq!(rect, IRect::new(60, 30, 90, 70));
+    let at = |x: i32, y: i32| { let i = ((y - 30) * 30 + (x - 60)) as usize * 4; [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]] };
+    assert_eq!(at(65, 50), [255, 0, 0, 255]);
+    assert_eq!(at(80, 50), [0, 0, 0, 0]);
+
+    // Pasting it back in place reproduces those pixels on a new layer.
+    doc.add_image_layer("copia", rect.width(), rect.height(), &rgba, rect.x0, rect.y0);
+    assert_eq!(doc.layers()[2].pixel(65, 50), doc.layers()[1].pixel(65, 50));
+    assert_eq!(doc.layers()[2].pixel(40, 50), [0; 4]);
+
+    doc.select_polygon(&rect_points(120.0, 120.0, 180.0, 180.0)); // nothing there
+    assert!(doc.copy_pixels().is_none());
+}
+
+#[test]
+fn references_are_saved_with_the_project_but_not_drawn() {
+    let mut doc = Document::new(120, 90);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 45.0), (110.0, 45.0));
+    let picture = doc.render_rgba8(doc.bounds());
+    let mut plain = Vec::new();
+    doc.write_to(&mut plain).unwrap();
+
+    let revision = doc.revision();
+    let pixels: Vec<u8> = (0..5 * 3).flat_map(|i| [i as u8 * 10, 200, 30, 255]).collect();
+    doc.add_reference(Reference { name: "pose ✦".into(), width: 5, height: 3, rgba: std::sync::Arc::new(pixels.clone()) });
+    doc.add_reference(Reference { name: "manos".into(), width: 1, height: 1, rgba: std::sync::Arc::new(vec![1, 2, 3, 4]) });
+    assert_ne!(doc.revision(), revision); // counts as an unsaved change
+    assert_eq!(doc.render_rgba8(doc.bounds()), picture); // but never shows in the picture
+
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(loaded.references().len(), 2);
+    let first = &loaded.references()[0];
+    assert_eq!((first.name.as_str(), first.width, first.height), ("pose ✦", 5, 3));
+    assert_eq!(*first.rgba, pixels);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), picture);
+
+    // Files without references still load, and a file with references starts
+    // with the same bytes as one without, so older versions can read it.
+    assert!(Document::read_from(&mut plain.as_slice()).unwrap().references().is_empty());
+    assert_eq!(&bytes[..plain.len()], &plain[..]);
+
+    doc.remove_reference(0);
+    assert_eq!(doc.references()[0].name, "manos");
+    // A damaged trailer is rejected rather than half-read.
+    assert!(Document::read_from(&mut &bytes[..bytes.len() - 3]).is_err());
+}
+
+#[test]
+fn symmetry_mirrors_strokes_across_the_centre() {
+    let mut doc = Document::new(200, 100);
+    doc.symmetry = true;
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (20.0, 30.0), (60.0, 70.0));
+    for (x, y) in [(20, 30), (40, 50), (60, 70)] {
+        assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255]);
+        assert_eq!(pixel(&doc, 199 - x, y), [0, 0, 0, 255], "mirror of ({x}, {y})");
+    }
+    // The whole picture is its own mirror image, and it is one undo step.
+    let rgba = doc.render_rgba8(doc.bounds());
+    for y in 0..100 {
+        for x in 0..100 {
+            assert_eq!(rgba[(y * 200 + x) * 4], rgba[(y * 200 + 199 - x) * 4]);
+        }
+    }
+    doc.undo();
+    assert_eq!(pixel(&doc, 160, 50), [255, 255, 255, 255]);
+    assert!(!doc.can_undo());
 }

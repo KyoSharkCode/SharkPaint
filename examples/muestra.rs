@@ -1,8 +1,9 @@
 //! Renders a sample sheet of every brush preset to a PNG, without opening a window.
 //! A path ending in the project extension saves a project file instead.
-//! Usage: cargo run --example muestra -- salida.png
+//! Any further arguments are image files stored in the project as references.
+//! Usage: cargo run --example muestra -- salida.png [referencia.png ...]
 
-use sharkpaint::engine::{write_png, BrushPreset, Document, StrokePoint, PROJECT_EXTENSION};
+use sharkpaint::engine::{write_png, BrushPreset, Document, Reference, StrokePoint, PROJECT_EXTENSION};
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "muestra.png".into());
@@ -28,6 +29,16 @@ fn main() {
     doc.begin_stroke(&eraser, [0, 0, 0], true, StrokePoint::new(650.0, 20.0, 1.0));
     doc.stroke_to(StrokePoint::new(760.0, 620.0, 1.0));
     doc.end_stroke();
+
+    for file in std::env::args().skip(2) {
+        let image = image::open(&file).expect("open reference").into_rgba8();
+        doc.add_reference(Reference {
+            name: file,
+            width: image.width() as usize,
+            height: image.height() as usize,
+            rgba: std::sync::Arc::new(image.into_raw()),
+        });
+    }
 
     if std::path::Path::new(&path).extension().is_some_and(|e| e == PROJECT_EXTENSION) {
         doc.save(path.as_ref()).expect("save project");

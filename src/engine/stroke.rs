@@ -42,6 +42,8 @@ pub(crate) struct ActiveStroke {
     opacity: u32,
     /// Painting is confined to this selection, if there is one.
     selection: Option<Arc<Selection>>,
+    /// Every dab is repeated mirrored across the vertical line at this x.
+    mirror_x: Option<f32>,
     tiles: Vec<Option<StrokeTile>>,
     /// Last point actually drawn to (after smoothing).
     pen: StrokePoint,
@@ -59,6 +61,7 @@ impl ActiveStroke {
         color: [u8; 3],
         erase: bool,
         selection: Option<Arc<Selection>>,
+        mirror_x: Option<f32>,
         p: StrokePoint,
     ) -> (Self, IRect) {
         let to15 = |v: u8| (v as u32 * ONE + 127) / 255;
@@ -70,6 +73,7 @@ impl ActiveStroke {
             alpha_lock: layer.props.alpha_lock,
             opacity: (brush.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
             selection,
+            mirror_x,
             tiles: (0..layer.tiles.len()).map(|_| None).collect(),
             pen: p,
             raw: p,
@@ -153,8 +157,17 @@ impl ActiveStroke {
         rect
     }
 
-    /// Stamps one round tip into the coverage mask.
+    /// Stamps the tip at `p` and, with symmetry on, at its mirror image.
     fn dab(&mut self, layer: &Layer, p: StrokePoint) -> IRect {
+        let rect = self.stamp(layer, p);
+        match self.mirror_x {
+            Some(axis) => rect.union(&self.stamp(layer, StrokePoint { x: 2.0 * axis - p.x, ..p })),
+            None => rect,
+        }
+    }
+
+    /// Stamps one round tip into the coverage mask.
+    fn stamp(&mut self, layer: &Layer, p: StrokePoint) -> IRect {
         let mut radius = self.brush.diameter_at(p.pressure) * 0.5;
         let mut flow = self.brush.flow_at(p.pressure);
         // Sub-pixel tips keep a half-pixel footprint and fade instead of vanishing.
