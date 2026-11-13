@@ -1,19 +1,10 @@
 use sharkpaint::engine::{
-    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference, StrokePoint,
+    builtin_tips, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect, LayerTransform,
+    Reference, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
-    BrushSettings {
-        size,
-        opacity: 1.0,
-        flow: 1.0,
-        hardness: 1.0,
-        spacing: 0.1,
-        smoothing: 0.0,
-        pressure_size: false,
-        pressure_flow: false,
-        min_size: 1.0,
-    }
+    BrushSettings { hardness: 1.0, spacing: 0.1, smoothing: 0.0, ..BrushSettings::round(size) }
 }
 
 fn pixel(doc: &Document, x: i32, y: i32) -> [u8; 4] {
@@ -857,4 +848,93 @@ fn symmetry_mirrors_strokes_across_the_centre() {
     doc.undo();
     assert_eq!(pixel(&doc, 160, 50), [255, 255, 255, 255]);
     assert!(!doc.can_undo());
+}
+
+/// Darkness (0..=1) of the picture summed over a rectangle.
+fn ink(doc: &Document, x0: i32, y0: i32, x1: i32, y1: i32) -> f64 {
+    let rgba = doc.render_rgba8(IRect::new(x0, y0, x1, y1));
+    rgba.chunks(4).map(|p| 1.0 - p[0] as f64 / 255.0).sum()
+}
+
+#[test]
+fn flat_tips_follow_their_angle() {
+    // A flat calligraphy tip: wide along its angle, thin across it.
+    let flat = |angle: f32| BrushSettings { roundness: 0.2, angle, ..hard_brush(60.0) };
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&flat(0.0), [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 125, 100), [0, 0, 0, 255]); // reaches far sideways
+    assert_eq!(pixel(&doc, 100, 115), [255, 255, 255, 255]); // but not up and down
+    assert_eq!(pixel(&doc, 100, 103), [0, 0, 0, 255]);
+
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&flat(90.0), [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 125), [0, 0, 0, 255]); // a quarter turn swaps them
+    assert_eq!(pixel(&doc, 115, 100), [255, 255, 255, 255]);
+}
+
+#[test]
+fn image_tips_stamp_their_shape() {
+    let tips = builtin_tips();
+    assert!(tips.len() >= 6);
+    let star = tips.iter().find(|t| t.id == "estrella").unwrap().clone();
+    let brush = BrushSettings { tip: BrushTip::Image(star), spacing: 1.0, ..hard_brush(120.0) };
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 100), [0, 0, 0, 255]); // the centre is solid
+    assert_eq!(pixel(&doc, 100, 52), [0, 0, 0, 255]); // the upper point
+    assert_eq!(pixel(&doc, 142, 58), [255, 255, 255, 255]); // the gap between two points
+    // The star covers clearly less than the disc of the same size would.
+    let covered = ink(&doc, 0, 0, 200, 200);
+    assert!(covered > 2500.0 && covered < 0.6 * std::f64::consts::PI * 3600.0, "covered {covered}");
+
+    // Grainy tips leave gaps even with a continuous stroke.
+    let carbon = tips.iter().find(|t| t.id == "carbon").unwrap().clone();
+    let brush = BrushSettings { tip: BrushTip::Image(carbon), flow: 0.5, ..hard_brush(40.0) };
+    let mut doc = Document::new(300, 100);
+    line(&mut doc, &brush, [0, 0, 0], false, (30.0, 50.0), (270.0, 50.0));
+    let greys = doc.render_rgba8(IRect::new(60, 40, 240, 60)).chunks(4).filter(|p| p[0] > 20 && p[0] < 235).count();
+    assert!(greys > 200, "expected a grainy texture, found {greys} mid-tone pixels");
+}
+
+#[test]
+fn scatter_and_jitter_vary_but_repeat_exactly() {
+    let brush = BrushSettings {
+        scatter: 1.5,
+        size_jitter: 0.6,
+        angle_jitter: 1.0,
+        roundness: 0.5,
+        spacing: 0.6,
+        ..hard_brush(16.0)
+    };
+    let draw = || {
+        let mut doc = Document::new(400, 200);
+        line(&mut doc, &brush, [0, 0, 0], false, (40.0, 100.0), (360.0, 100.0));
+        doc
+    };
+    let doc = draw();
+    // Paint lands well away from the line itself, on both sides.
+    assert!(ink(&doc, 40, 60, 360, 88) > 30.0 && ink(&doc, 40, 112, 360, 140) > 30.0);
+    // The same stroke drawn again is identical, so undo and redo are exact.
+    assert_eq!(doc.render_rgba8(doc.bounds()), draw().render_rgba8(IRect::new(0, 0, 400, 200)));
+
+    // Without scatter nothing strays.
+    let tidy = BrushSettings { scatter: 0.0, size_jitter: 0.0, angle_jitter: 0.0, roundness: 1.0, ..brush.clone() };
+    let mut doc = Document::new(400, 200);
+    line(&mut doc, &tidy, [0, 0, 0], false, (40.0, 100.0), (360.0, 100.0));
+    assert_eq!(ink(&doc, 40, 60, 360, 88), 0.0);
+}
+
+#[test]
+fn tips_can_follow_the_stroke_direction() {
+    let brush = BrushSettings { roundness: 0.15, follow_direction: true, spacing: 2.0, ..hard_brush(40.0) };
+    // Along a vertical stroke the flat tip lies along the path: tall and thin.
+    let mut doc = Document::new(200, 300);
+    doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(100.0, 40.0, 1.0));
+    doc.stroke_to(StrokePoint::new(100.0, 260.0, 1.0));
+    doc.end_stroke();
+    assert!(ink(&doc, 112, 100, 130, 260) < 1.0, "the tip should not stick out sideways");
+    assert!(ink(&doc, 96, 100, 104, 260) > 300.0);
 }

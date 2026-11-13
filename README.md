@@ -7,8 +7,13 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 - Lienzo con zoom, desplazamiento, rotación y volteo horizontal.
 - Pincel con sensibilidad a la presión del lápiz (tamaño y flujo).
-- Cuatro pinceles iniciales: Lápiz, Tinta, Marcador y Aerógrafo, todos ajustables
-  (tamaño, opacidad, flujo, dureza, espaciado y estabilizador).
+- Once pinceles iniciales, de punta redonda (Lápiz, Tinta, Marcador, Aerógrafo,
+  Caligrafía) y con forma (Carboncillo, Pincel seco, Tiza, Salpicadura, Hojas,
+  Estrellas).
+- Editor de pinceles con muestra del trazo: tamaño, opacidad, flujo, dureza,
+  espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión y
+  variación al azar. Los pinceles propios se guardan en una biblioteca.
+- Puntas importadas: cualquier imagen sirve como punta de pincel.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
@@ -107,12 +112,15 @@ cargo test
 - `src/engine/`: motor de pintura (capas en mosaicos, pincel, historial), sin
   dependencias de interfaz.
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
+- `src/brushes.rs`: biblioteca de pinceles, su guardado e importación de puntas.
+- `src/engine/tips.rs`: puntas incluidas, generadas por código.
 - `src/settings.rs`: preferencias guardadas entre sesiones y archivo de recuperación.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
 - `src/engine/selection.rs`: máscara de selección.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
-- `examples/muestra.rs`: genera una hoja de muestra de los pinceles sin abrir ventana.
+- `examples/muestra.rs`, `examples/puntas.rs`: generan hojas de muestra de los pinceles
+  y de las puntas sin abrir ventana.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
 
 ## Licencia y contribuciones

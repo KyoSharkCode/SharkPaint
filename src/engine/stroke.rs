@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::brush::BrushSettings;
+use super::brush::{BrushSettings, BrushTip};
 use super::layer::{IRect, Layer, Tile, ONE, TILE};
 use super::selection::Selection;
 
@@ -51,6 +51,10 @@ pub(crate) struct ActiveStroke {
     raw: StrokePoint,
     /// Distance left to travel before the next dab.
     gap: f32,
+    /// Direction the stroke is travelling in, in radians.
+    direction: f32,
+    /// State of the generator behind scatter and jitter.
+    random: u32,
 }
 
 impl ActiveStroke {
@@ -78,6 +82,9 @@ impl ActiveStroke {
             pen: p,
             raw: p,
             gap: 0.0,
+            direction: 0.0,
+            // Seeded from where the stroke starts: varied, yet repeatable.
+            random: (p.x.to_bits() ^ p.y.to_bits().rotate_left(13) ^ 0x9E37_79B9) | 1,
         };
         let rect = s.dab(layer, p);
         s.gap = s.spacing_at(p.pressure);
@@ -135,6 +142,9 @@ impl ActiveStroke {
         let from = self.pen;
         let (dx, dy) = (to.x - from.x, to.y - from.y);
         let len = (dx * dx + dy * dy).sqrt();
+        if len > 0.5 {
+            self.direction = dy.atan2(dx);
+        }
         let mut rect = IRect::new(0, 0, 0, 0);
         let mut pos = 0.0;
         while len > 0.0 {
@@ -157,18 +167,50 @@ impl ActiveStroke {
         rect
     }
 
-    /// Stamps the tip at `p` and, with symmetry on, at its mirror image.
+    /// A value in 0..1 from the stroke's own generator.
+    fn random(&mut self) -> f32 {
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 17;
+        self.random ^= self.random << 5;
+        (self.random >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Stamps the tip at `p` and, with symmetry on, at its mirror image. Each
+    /// dab gets its own scatter, rotation and size variation.
     fn dab(&mut self, layer: &Layer, p: StrokePoint) -> IRect {
-        let rect = self.stamp(layer, p);
+        let diameter = self.brush.diameter_at(p.pressure);
+        let mut at = p;
+        if self.brush.scatter > 0.0 {
+            let reach = self.brush.scatter * diameter;
+            at.x += (self.random() * 2.0 - 1.0) * reach;
+            at.y += (self.random() * 2.0 - 1.0) * reach;
+        }
+        let mut angle = self.brush.angle.to_radians();
+        if self.brush.follow_direction {
+            angle += self.direction;
+        }
+        if self.brush.angle_jitter > 0.0 {
+            angle += (self.random() * 2.0 - 1.0) * std::f32::consts::PI * self.brush.angle_jitter;
+        }
+        let scale = if self.brush.size_jitter > 0.0 {
+            1.0 - self.random() * self.brush.size_jitter.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let rect = self.stamp(layer, at, angle, scale, false);
         match self.mirror_x {
-            Some(axis) => rect.union(&self.stamp(layer, StrokePoint { x: 2.0 * axis - p.x, ..p })),
+            Some(axis) => {
+                let mirrored = StrokePoint { x: 2.0 * axis - at.x, ..at };
+                rect.union(&self.stamp(layer, mirrored, angle, scale, true))
+            }
             None => rect,
         }
     }
 
-    /// Stamps one round tip into the coverage mask.
-    fn stamp(&mut self, layer: &Layer, p: StrokePoint) -> IRect {
-        let mut radius = self.brush.diameter_at(p.pressure) * 0.5;
+    /// Stamps one tip into the coverage mask, rotated by `angle` and scaled by
+    /// `scale`; `flip` mirrors it left to right.
+    fn stamp(&mut self, layer: &Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {
+        let mut radius = self.brush.diameter_at(p.pressure) * 0.5 * scale;
         let mut flow = self.brush.flow_at(p.pressure);
         // Sub-pixel tips keep a half-pixel footprint and fade instead of vanishing.
         if radius < 0.5 {
@@ -193,6 +235,12 @@ impl ActiveStroke {
         }
         let flow15 = flow * ONE as f32;
         let outer_sq = outer * outer;
+        let roundness = self.brush.roundness.clamp(0.02, 1.0);
+        // A plain disc needs no rotation; everything else is measured in the
+        // tip's own frame.
+        let plain = matches!(self.brush.tip, BrushTip::Round) && roundness >= 0.999;
+        let (sin, cos) = angle.sin_cos();
+        let tip = self.brush.tip.clone();
 
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
@@ -212,14 +260,31 @@ impl ActiveStroke {
                     let fy = y as f32 + 0.5 - p.y;
                     let row = (y - oy) as usize * TILE;
                     for x in x0..x1 {
-                        let fx = x as f32 + 0.5 - p.x;
-                        let d2 = fx * fx + fy * fy;
-                        if d2 >= outer_sq {
+                        let mut fx = x as f32 + 0.5 - p.x;
+                        if fx * fx + fy * fy >= outer_sq {
                             continue;
                         }
-                        let mut c = ((outer - d2.sqrt()) / falloff).min(1.0);
-                        if soft {
-                            c = c * c * (3.0 - 2.0 * c);
+                        let c = if plain {
+                            let c = ((outer - (fx * fx + fy * fy).sqrt()) / falloff).min(1.0);
+                            if soft { c * c * (3.0 - 2.0 * c) } else { c }
+                        } else {
+                            if flip {
+                                fx = -fx;
+                            }
+                            // Into the tip's frame: undo the rotation, then the squash.
+                            let (lx, ly) = (fx * cos + fy * sin, (-fx * sin + fy * cos) / roundness);
+                            match &tip {
+                                BrushTip::Round => {
+                                    let c = ((outer - (lx * lx + ly * ly).sqrt()) / falloff).clamp(0.0, 1.0);
+                                    if soft { c * c * (3.0 - 2.0 * c) } else { c }
+                                }
+                                BrushTip::Image(image) => {
+                                    image.sample(lx / radius * 0.5 + 0.5, ly / radius * 0.5 + 0.5)
+                                }
+                            }
+                        };
+                        if c <= 0.0 {
+                            continue;
                         }
                         let add = (c * flow15) as u32;
                         let m = &mut tile.mask[row + (x - ox) as usize];

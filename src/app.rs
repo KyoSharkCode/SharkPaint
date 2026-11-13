@@ -9,10 +9,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference,
-    StrokePoint, PROJECT_EXTENSION,
+    brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, StrokePoint, PROJECT_EXTENSION,
 };
 
+use crate::brushes::{Brush, BrushLibrary};
 use crate::icons::icon;
 use crate::settings::{self, Settings};
 use crate::view::View;
@@ -287,7 +288,16 @@ pub struct SharkPaintApp {
     select_drag: Option<SelectDrag>,
     /// What Copy or Cut last took: where it was on the canvas and its pixels.
     clip: Option<(IRect, Vec<u8>)>,
-    preset: Option<BrushPreset>,
+    /// The brushes on offer and the tip shapes they use.
+    library: BrushLibrary,
+    /// Library brush the current settings came from, while they still match.
+    brush_index: Option<usize>,
+    /// Library brush the current settings started from, even after tweaking.
+    brush_source: Option<usize>,
+    /// The library as last written to disk.
+    saved_brushes: String,
+    /// Sample stroke for the brush on screen, with the settings it was drawn from.
+    preview: Option<(BrushSettings, TextureHandle)>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
     pen_pressure: Option<f32>,
@@ -378,15 +388,12 @@ impl SharkPaintApp {
             brush: BrushPreset::Tinta.settings(),
             eraser,
             smudge: BrushSettings {
-                size: 60.0,
-                opacity: 1.0,
                 flow: 0.7,
                 hardness: 0.3,
                 spacing: 0.1,
                 smoothing: 0.0,
-                pressure_size: false,
                 pressure_flow: true,
-                min_size: 1.0,
+                ..BrushSettings::round(60.0)
             },
             fill_tolerance: 0.15,
             fill_all_layers: true,
@@ -397,7 +404,11 @@ impl SharkPaintApp {
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
             clip: None,
-            preset: Some(BrushPreset::Tinta),
+            library: BrushLibrary { brushes: Vec::new(), tips: Vec::new() },
+            brush_index: Some(1),
+            brush_source: None,
+            saved_brushes: String::new(),
+            preview: None,
             color: [24, 24, 32],
             pen_pressure: None,
             last_pressure: 1.0,
@@ -438,6 +449,10 @@ impl SharkPaintApp {
             autosave_thread: None,
             recovery_prompt: None,
         };
+        app.library = BrushLibrary::load();
+        app.saved_brushes = app.library.to_text();
+        app.brush_index = app.library.brushes.iter().position(|b| b.settings == app.brush);
+        app.brush_source = app.brush_index;
         let stored = Settings::load();
         app.palette = stored.palette.clone();
         app.recent = stored.recent.clone();
@@ -484,6 +499,11 @@ impl SharkPaintApp {
         if current != self.saved_settings {
             current.save();
             self.saved_settings = current;
+        }
+        let brushes = self.library.to_text();
+        if brushes != self.saved_brushes {
+            self.library.save();
+            self.saved_brushes = brushes;
         }
     }
 
@@ -1416,20 +1436,147 @@ impl SharkPaintApp {
         }
     }
 
-    fn brush_panel(&mut self, ui: &mut egui::Ui) {
+    /// The library of brushes: pick one, save the current settings as a new
+    /// one, update, rename or delete.
+    fn brush_library(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Pinceles");
+        egui::ScrollArea::vertical().id_salt("biblioteca").max_height(132.0).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, brush) in self.library.brushes.iter().enumerate() {
+                    if ui.selectable_label(self.brush_index == Some(i), &brush.name).clicked() {
+                        self.brush = brush.settings.clone();
+                        self.brush_index = Some(i);
+                    }
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.small_button("Guardar nuevo").on_hover_text("Añade los ajustes actuales como un pincel nuevo").clicked() {
+                let name = format!("Pincel {}", self.library.brushes.len() + 1);
+                self.library.brushes.push(Brush { name, settings: self.brush.clone() });
+                self.brush_index = Some(self.library.brushes.len() - 1);
+            }
+            let stored = self.brush_index.filter(|&i| i < self.library.brushes.len());
+            // The settings on screen have drifted from the brush they came from.
+            let source = self.brush_source.filter(|&i| i < self.library.brushes.len());
+            let update = egui::Button::new("Actualizar").small();
+            if ui.add_enabled(source.is_some() && stored.is_none(), update)
+                .on_hover_text("Guarda los cambios en el pincel elegido")
+                .clicked()
+            {
+                if let Some(i) = source {
+                    self.library.brushes[i].settings = self.brush.clone();
+                    self.brush_index = Some(i);
+                }
+            }
+            let delete = egui::Button::new("Eliminar").small();
+            if ui.add_enabled(source.is_some() && self.library.brushes.len() > 1, delete).clicked() {
+                if let Some(i) = source {
+                    self.library.brushes.remove(i);
+                    self.brush_index = None;
+                    self.brush_source = None;
+                }
+            }
+        });
+        if let Some(i) = self.brush_source.filter(|&i| i < self.library.brushes.len()) {
+            ui.horizontal(|ui| {
+                ui.label("Nombre");
+                ui.add(egui::TextEdit::singleline(&mut self.library.brushes[i].name).desired_width(150.0));
+            });
+        }
+        if ui.small_button("Restaurar los pinceles iniciales").clicked() {
+            self.library.brushes = self.library.default_brushes();
+            self.brush_index = self.library.brushes.iter().position(|b| b.settings == self.brush);
+            self.brush_source = self.brush_index;
+        }
+    }
+
+    /// A sample stroke of the brush on screen.
+    fn brush_sample(&mut self, ui: &mut egui::Ui) {
+        const SIZE: [usize; 2] = [248, 64];
+        let brush = self.active_brush().clone();
+        if self.preview.as_ref().is_none_or(|(drawn, _)| *drawn != brush) {
+            let rgba = brush_preview(&brush, SIZE[0] * 2, SIZE[1] * 2, [230, 232, 238], [20, 22, 28]);
+            let image = ColorImage::from_rgba_unmultiplied([SIZE[0] * 2, SIZE[1] * 2], &rgba);
+            let texture = ui.ctx().load_texture("muestra_pincel", image, TextureOptions::LINEAR);
+            self.preview = Some((brush, texture));
+        }
+        if let Some((_, texture)) = &self.preview {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(SIZE[0] as f32, SIZE[1] as f32), Sense::hover());
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+            ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(60)), egui::StrokeKind::Inside);
+        }
+    }
+
+    /// The shape of the tip and how each dab varies.
+    fn tip_settings(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
-        match self.tool {
-            Tool::Pincel => {
-                ui.strong("Pinceles");
-                ui.horizontal_wrapped(|ui| {
-                    for preset in BrushPreset::ALL {
-                        if ui.selectable_label(self.preset == Some(preset), preset.name()).clicked() {
-                            self.brush = preset.settings();
-                            self.preset = Some(preset);
+        let tips = self.library.tips.clone();
+        let mut import = false;
+        let b = self.active_brush();
+        egui::Grid::new("punta").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Forma");
+            ui.horizontal(|ui| {
+                let current = match &b.tip {
+                    BrushTip::Round => "Redonda".to_owned(),
+                    BrushTip::Image(tip) => tip.name.clone(),
+                };
+                egui::ComboBox::from_id_salt("forma_punta").selected_text(current).width(120.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(b.tip == BrushTip::Round, "Redonda").clicked() {
+                        b.tip = BrushTip::Round;
+                    }
+                    for tip in &tips {
+                        let this = BrushTip::Image(tip.clone());
+                        if ui.selectable_label(b.tip == this, &tip.name).clicked() {
+                            b.tip = this;
                         }
                     }
                 });
+                import = ui.small_button("Importar…").on_hover_text(
+                    "Usa una imagen como punta: lo oscuro pinta.\nSi la imagen tiene transparencia, pinta lo opaco.",
+                ).clicked();
+            });
+            ui.end_row();
+            ui.label("Ángulo");
+            ui.add(egui::Slider::new(&mut b.angle, -180.0..=180.0).fixed_decimals(0).suffix("°"));
+            ui.end_row();
+            ui.label("Redondez");
+            ui.add(egui::Slider::new(&mut b.roundness, 0.05..=1.0).custom_formatter(percent));
+            ui.end_row();
+            ui.label("Giro al azar");
+            ui.add(egui::Slider::new(&mut b.angle_jitter, 0.0..=1.0).custom_formatter(percent));
+            ui.end_row();
+            ui.label("Dispersión");
+            ui.add(egui::Slider::new(&mut b.scatter, 0.0..=3.0).custom_formatter(percent));
+            ui.end_row();
+            ui.label("Tamaño al azar");
+            ui.add(egui::Slider::new(&mut b.size_jitter, 0.0..=1.0).custom_formatter(percent));
+            ui.end_row();
+        });
+        ui.checkbox(&mut b.follow_direction, "Girar con la dirección del trazo");
+        if import {
+            let picked = rfd::FileDialog::new()
+                .set_title("Importar punta")
+                .add_filter("Imágenes", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+                .pick_file();
+            if let Some(path) = picked {
+                match self.library.import_tip(&path) {
+                    Ok(tip) => {
+                        self.status = format!("Punta «{}» importada.", tip.name);
+                        self.active_brush().tip = BrushTip::Image(tip);
+                    }
+                    Err(e) => self.status = format!("No se pudo importar la punta: {e}"),
+                }
             }
+        }
+    }
+
+    fn brush_panel(&mut self, ui: &mut egui::Ui) {
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        match self.tool {
+            Tool::Pincel => self.brush_library(ui),
             Tool::Borrador | Tool::Difuminar => {}
             Tool::Relleno => {
                 ui.horizontal(|ui| {
@@ -1469,54 +1616,62 @@ impl SharkPaintApp {
         }
 
         if self.tool != Tool::Difuminar {
+            self.brush_sample(ui);
             ui.checkbox(&mut self.symmetry, "Simetría")
                 .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
         }
-        ui.add_space(4.0);
-        let before = self.active_brush().clone();
         let smudging = self.tool == Tool::Difuminar;
-        let b = self.active_brush();
-        egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Tamaño");
-            ui.add(
-                egui::Slider::new(&mut b.size, 1.0..=MAX_BRUSH_SIZE)
-                    .logarithmic(true)
-                    .fixed_decimals(0)
-                    .suffix(" px"),
-            );
-            ui.end_row();
-            let rows: Vec<(&str, &mut f32, f32, f32)> = if smudging {
-                vec![("Intensidad", &mut b.flow, 0.01, 1.0), ("Dureza", &mut b.hardness, 0.0, 1.0)]
-            } else {
-                vec![
-                    ("Opacidad", &mut b.opacity, 0.01, 1.0),
-                    ("Flujo", &mut b.flow, 0.01, 1.0),
-                    ("Dureza", &mut b.hardness, 0.0, 1.0),
-                    ("Espaciado", &mut b.spacing, 0.01, 1.0),
-                    ("Estabilizador", &mut b.smoothing, 0.0, 0.95),
-                ]
-            };
-            for (label, value, min, max) in rows {
-                ui.label(label);
-                ui.add(egui::Slider::new(value, min..=max).custom_formatter(percent));
+        egui::CollapsingHeader::new("Trazo").default_open(true).show(ui, |ui| {
+            let b = self.active_brush();
+            egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Tamaño");
+                ui.add(
+                    egui::Slider::new(&mut b.size, 1.0..=MAX_BRUSH_SIZE)
+                        .logarithmic(true)
+                        .fixed_decimals(0)
+                        .suffix(" px"),
+                );
                 ui.end_row();
-            }
-        });
-        ui.add_space(4.0);
-        ui.strong("Presión del lápiz");
-        ui.checkbox(&mut b.pressure_size, "Controla el tamaño");
-        ui.add_enabled_ui(b.pressure_size, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Tamaño mínimo");
-                ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
+                let rows: Vec<(&str, &mut f32, f32, f32)> = if smudging {
+                    vec![("Intensidad", &mut b.flow, 0.01, 1.0), ("Dureza", &mut b.hardness, 0.0, 1.0)]
+                } else {
+                    vec![
+                        ("Opacidad", &mut b.opacity, 0.01, 1.0),
+                        ("Flujo", &mut b.flow, 0.01, 1.0),
+                        ("Dureza", &mut b.hardness, 0.0, 1.0),
+                        ("Espaciado", &mut b.spacing, 0.01, 2.0),
+                        ("Estabilizador", &mut b.smoothing, 0.0, 0.95),
+                    ]
+                };
+                for (label, value, min, max) in rows {
+                    ui.label(label);
+                    ui.add(egui::Slider::new(value, min..=max).custom_formatter(percent));
+                    ui.end_row();
+                }
             });
         });
-        ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
-        if self.tool == Tool::Pincel && self.brush != before {
-            // Hand-tuned settings no longer match the preset they started from.
-            if self.preset.map(|p| p.settings()) != Some(self.brush.clone()) {
-                self.preset = None;
+        if !smudging {
+            egui::CollapsingHeader::new("Punta").default_open(false).show(ui, |ui| self.tip_settings(ui));
+        }
+        egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
+            let b = self.active_brush();
+            ui.checkbox(&mut b.pressure_size, "Controla el tamaño");
+            ui.add_enabled_ui(b.pressure_size, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Tamaño mínimo");
+                    ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
+                });
+            });
+            ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
+        });
+        if self.tool == Tool::Pincel {
+            // Remember which brush these settings started from, and whether
+            // they still match it.
+            if let Some(i) = self.brush_index {
+                self.brush_source = Some(i);
             }
+            let source = self.brush_source.filter(|&i| i < self.library.brushes.len());
+            self.brush_index = source.filter(|&i| self.library.brushes[i].settings == self.brush);
         }
     }
 

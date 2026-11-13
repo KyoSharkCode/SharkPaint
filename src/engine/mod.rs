@@ -7,13 +7,15 @@ mod layer;
 mod project;
 mod selection;
 mod stroke;
+mod tips;
 mod tools;
 
-pub use brush::{BrushPreset, BrushSettings};
+pub use brush::{BrushPreset, BrushSettings, BrushTip, TipImage};
+pub use tips::builtin_tips;
 pub use document::{Document, ProjectSnapshot, Reference};
 pub use export::write_png;
 pub use project::PROJECT_EXTENSION;
 pub use layer::{BlendMode, IRect, Layer, LayerProps, Px, Tile, ONE, TILE};
 pub use selection::Selection;
 pub use stroke::StrokePoint;
-pub use tools::LayerTransform;
+pub use tools::{brush_preview, LayerTransform};
