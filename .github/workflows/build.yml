@@ -1,22 +1,84 @@
-name: Build
+name: Compilación
 
 on:
   push:
+    branches: [main, "claude/**"]
+    # Una etiqueta vX.Y.Z publica esa versión (GitHub Releases): instalador y .zip.
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   windows:
+    name: Windows
     runs-on: windows-latest
+    permissions:
+      contents: write # publicar la versión (solo con una etiqueta v*)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
       - name: Tests
         run: cargo test --release
-      - name: Build
+
+      - name: Compilar
         run: cargo build --release
-      - uses: actions/upload-artifact@v4
+
+      # La carpeta que se reparte: el ejecutable y sus textos legales.
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\SharkPaint | Out-Null
+          Copy-Item target\release\SharkPaint.exe, LICENSE, MARCA.md dist\SharkPaint\
+
+      - name: Subir ejecutable
+        uses: actions/upload-artifact@v4
         with:
           name: SharkPaint-windows-x64
-          path: target/release/SharkPaint.exe
+          path: dist/SharkPaint
           if-no-files-found: error
+
+      # Versión del proyecto (Cargo.toml). Con una etiqueta, debe coincidir con ella.
+      - name: Versión
+        id: version
+        shell: pwsh
+        run: |
+          $linea = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+          $version = $linea.Matches[0].Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$version") {
+            throw "La etiqueta ${{ github.ref_name }} no coincide con la versión del proyecto ($version)"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Instalador
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /Qp "/DAppVersion=${{ steps.version.outputs.version }}" `
+            "/DSourceDir=${{ github.workspace }}\dist\SharkPaint" `
+            "/DOutputDir=${{ github.workspace }}\dist" installer\SharkPaint.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup falló ($LASTEXITCODE)" }
+          Compress-Archive -Path dist\SharkPaint -DestinationPath "dist\SharkPaint-${{ steps.version.outputs.version }}-Windows.zip"
+
+      - name: Subir instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: SharkPaint-instalador
+          path: dist/SharkPaint-*-Setup.exe
+          if-no-files-found: error
+
+      # Solo con una etiqueta v*: la versión en GitHub Releases, con sus novedades
+      # (docs/novedades/<versión>.md). La página de descarga la busca ahí.
+      - name: Publicar la versión
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SharkPaint ${{ steps.version.outputs.version }}
+          body_path: docs/novedades/${{ steps.version.outputs.version }}.md
+          files: |
+            dist/SharkPaint-${{ steps.version.outputs.version }}-Setup.exe
+            dist/SharkPaint-${{ steps.version.outputs.version }}-Windows.zip

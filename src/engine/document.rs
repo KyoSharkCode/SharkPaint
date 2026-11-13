@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use super::brush::BrushSettings;
 use super::layer::{blend_over, IRect, Layer, LayerProps, Tile, ONE, TILE};
+use super::selection::Selection;
 use super::stroke::{ActiveStroke, StrokePoint};
+use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
 const MAX_UNDO_STEPS: usize = 200;
 const EMPTY: IRect = IRect { x0: 0, y0: 0, x1: 0, y1: 0 };
@@ -25,11 +27,14 @@ pub struct Document {
     pub width: usize,
     pub height: usize,
     /// Bottom layer first.
-    layers: Vec<Layer>,
-    active_layer: usize,
+    pub(super) layers: Vec<Layer>,
+    pub(super) active_layer: usize,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
     stroke: Option<ActiveStroke>,
+    pub(super) smudge: Option<SmudgeStroke>,
+    pub(super) moving: Option<MoveSession>,
+    pub(super) transforming: Option<TransformSession>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     dirty: IRect,
@@ -39,6 +44,9 @@ pub struct Document {
     next_layer_number: usize,
     /// Source of layer ids and versions; never repeats.
     next_stamp: u64,
+    pub(super) selection: Option<Arc<Selection>>,
+    /// Changes whenever the selection does.
+    pub(super) selection_stamp: u64,
 }
 
 impl Document {
@@ -64,10 +72,15 @@ impl Document {
             active_layer: active,
             paper: [255, 255, 255],
             stroke: None,
+            smudge: None,
+            moving: None,
+            transforming: None,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
             revision: 0,
+            selection: None,
+            selection_stamp: 0,
         }
     }
 
@@ -218,10 +231,42 @@ impl Document {
         }
     }
 
+    // --- Selection ------------------------------------------------------------
+
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_deref()
+    }
+
+    /// A counter that changes whenever the selection changes.
+    pub fn selection_stamp(&self) -> u64 {
+        self.selection_stamp
+    }
+
+    /// Selects the inside of a closed polygon given in canvas coordinates.
+    /// A polygon that covers nothing clears the selection.
+    pub fn select_polygon(&mut self, points: &[(f32, f32)]) {
+        self.end_stroke();
+        self.selection = Selection::from_polygon(self.width, self.height, points).map(Arc::new);
+        self.selection_stamp += 1;
+    }
+
+    pub fn select_all(&mut self) {
+        let (w, h) = (self.width as f32, self.height as f32);
+        self.select_polygon(&[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]);
+    }
+
+    pub fn deselect(&mut self) {
+        self.end_stroke();
+        if self.selection.take().is_some() {
+            self.selection_stamp += 1;
+        }
+    }
+
     // --- Strokes --------------------------------------------------------------
 
+    /// A brush stroke, smudge or layer move is in progress.
     pub fn is_stroking(&self) -> bool {
-        self.stroke.is_some()
+        self.stroke.is_some() || self.smudge.is_some() || self.moving.is_some() || self.transforming.is_some()
     }
 
     pub fn begin_stroke(&mut self, brush: &BrushSettings, color: [u8; 3], erase: bool, p: StrokePoint) {
@@ -229,33 +274,50 @@ impl Document {
             self.end_stroke();
         }
         let li = self.active_layer;
-        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, p);
+        let selection = self.selection.clone();
+        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, p);
         self.stroke = Some(stroke);
         self.mark_dirty(rect);
     }
 
     pub fn stroke_to(&mut self, p: StrokePoint) {
+        if self.smudge.is_some() {
+            self.smudge_to(p);
+        }
         if let Some(stroke) = &mut self.stroke {
             let rect = stroke.line_to(&mut self.layers[stroke.layer], p);
             self.mark_dirty(rect);
         }
     }
 
+    /// Finishes whatever is in progress (stroke, smudge or layer move) as one
+    /// undoable step.
     pub fn end_stroke(&mut self) {
+        self.end_smudge();
+        self.end_layer_move();
+        self.end_transform();
         if let Some(mut stroke) = self.stroke.take() {
             let rect = stroke.finish(&mut self.layers[stroke.layer]);
             self.mark_dirty(rect);
             let layer = stroke.layer;
             let tiles = stroke.into_saved();
-            if !tiles.is_empty() {
-                self.layers[layer].version = self.stamp();
-                self.push_undo(HistoryEntry::Tiles { layer, tiles });
-            }
+            self.commit_tiles(layer, tiles);
+        }
+    }
+
+    /// Records changed tiles of a layer as one undoable step.
+    pub(super) fn commit_tiles(&mut self, layer: usize, tiles: Vec<(usize, Option<Arc<Tile>>)>) {
+        if !tiles.is_empty() {
+            self.layers[layer].version = self.stamp();
+            self.push_undo(HistoryEntry::Tiles { layer, tiles });
         }
     }
 
     /// Abandons the stroke in progress, leaving no trace and no undo step.
     pub fn cancel_stroke(&mut self) {
+        self.cancel_smudge();
+        self.cancel_layer_move();
+        self.cancel_transform();
         if let Some(stroke) = self.stroke.take() {
             let layer = stroke.layer;
             let rect = stroke.revert(&mut self.layers[layer]);
@@ -403,7 +465,7 @@ impl Document {
         }
     }
 
-    fn mark_dirty(&mut self, rect: IRect) {
+    pub(super) fn mark_dirty(&mut self, rect: IRect) {
         self.dirty = self.dirty.union(&rect.intersect(&self.bounds()));
     }
 }

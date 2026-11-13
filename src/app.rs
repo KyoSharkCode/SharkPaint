@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, StrokePoint,
+    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
     PROJECT_EXTENSION,
 };
 
@@ -26,6 +26,171 @@ const ROW_HEIGHT: f32 = 46.0;
 enum Tool {
     Pincel,
     Borrador,
+    Difuminar,
+    Relleno,
+    Cuentagotas,
+    Mover,
+    Transformar,
+    Seleccion,
+}
+
+impl Tool {
+    /// (tool, icon, name, shortcut letter) in tool bar order.
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 8] = [
+        (Tool::Pincel, "pincel", "Pincel", "B"),
+        (Tool::Borrador, "borrador", "Borrador", "E"),
+        (Tool::Difuminar, "difuminar", "Difuminar", "D"),
+        (Tool::Relleno, "relleno", "Relleno", "G"),
+        (Tool::Cuentagotas, "cuentagotas", "Cuentagotas", "I"),
+        (Tool::Mover, "mover", "Mover capa", "V"),
+        (Tool::Transformar, "transformar", "Transformar", "T"),
+        (Tool::Seleccion, "seleccion", "Selección", "S"),
+    ];
+
+    fn name(self) -> &'static str {
+        Tool::ALL.iter().find(|t| t.0 == self).map_or("", |t| t.2)
+    }
+
+    /// The tool paints with a round tip whose size the cursor shows.
+    fn has_tip(self) -> bool {
+        matches!(self, Tool::Pincel | Tool::Borrador | Tool::Difuminar)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectShape {
+    Rectangulo,
+    Elipse,
+    Libre,
+}
+
+impl SelectShape {
+    const ALL: [(SelectShape, &'static str); 3] = [
+        (SelectShape::Rectangulo, "Rectángulo"),
+        (SelectShape::Elipse, "Elipse"),
+        (SelectShape::Libre, "Forma libre"),
+    ];
+
+    /// The outline of a selection dragged from `from` to `to`, in canvas
+    /// coordinates. `trail` is the path of a freehand drag; `regular` makes
+    /// rectangles square and ellipses round.
+    fn outline(self, from: Pos2, to: Pos2, trail: &[Pos2], regular: bool) -> Vec<(f32, f32)> {
+        let mut to = to;
+        if regular && self != SelectShape::Libre {
+            let side = (to.x - from.x).abs().max((to.y - from.y).abs());
+            to = Pos2::new(from.x + side * (to.x - from.x).signum(), from.y + side * (to.y - from.y).signum());
+        }
+        let rect = Rect::from_two_pos(from, to);
+        match self {
+            SelectShape::Rectangulo => {
+                vec![(rect.min.x, rect.min.y), (rect.max.x, rect.min.y), (rect.max.x, rect.max.y), (rect.min.x, rect.max.y)]
+            }
+            SelectShape::Elipse => (0..96)
+                .map(|i| {
+                    let a = i as f32 / 96.0 * std::f32::consts::TAU;
+                    (rect.center().x + rect.width() * 0.5 * a.cos(), rect.center().y + rect.height() * 0.5 * a.sin())
+                })
+                .collect(),
+            SelectShape::Libre => trail.iter().map(|p| (p.x, p.y)).collect(),
+        }
+    }
+}
+
+/// A selection being dragged out.
+struct SelectDrag {
+    from: Pos2,
+    to: Pos2,
+    /// Path of the pointer, for freehand selections.
+    trail: Vec<Pos2>,
+    /// Screen position of the press, to tell a click from a drag.
+    pressed_at: Pos2,
+    moved: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TransformDrag {
+    Move,
+    Rotate,
+    /// Dragging the corner with these signs (-1 or 1 on each axis).
+    Scale(f32, f32),
+}
+
+/// The on-canvas box of the transform tool.
+struct TransformBox {
+    /// Bounding box of the layer's contents before the transform, in canvas pixels.
+    bounds: Rect,
+    transform: LayerTransform,
+    /// What is being dragged, where the drag began and the transform at that moment.
+    drag: Option<(TransformDrag, Pos2, LayerTransform)>,
+}
+
+impl TransformBox {
+    fn rotate(v: Vec2, angle: f32) -> Vec2 {
+        let (s, c) = angle.sin_cos();
+        Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    }
+
+    fn center_of(&self, t: &LayerTransform) -> Pos2 {
+        self.bounds.center() + Vec2::new(t.offset.0, t.offset.1)
+    }
+
+    /// Canvas position of the corner with the given signs.
+    fn corner_of(&self, t: &LayerTransform, sx: f32, sy: f32) -> Pos2 {
+        let half = self.bounds.size() * 0.5;
+        self.center_of(t) + Self::rotate(Vec2::new(sx * half.x * t.scale.0, sy * half.y * t.scale.1), t.rotation)
+    }
+
+    fn corners(&self) -> [Pos2; 4] {
+        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| self.corner_of(&self.transform, x, y))
+    }
+
+    fn contains(&self, canvas: Pos2) -> bool {
+        let t = &self.transform;
+        let local = Self::rotate(canvas - self.center_of(t), -t.rotation);
+        let half = self.bounds.size() * 0.5;
+        local.x.abs() <= half.x * t.scale.0 && local.y.abs() <= half.y * t.scale.1
+    }
+
+    /// Updates the transform for a drag that has reached `canvas`.
+    fn drag_to(&mut self, canvas: Pos2, free: bool) {
+        let Some((kind, from, start)) = self.drag else { return };
+        let half = self.bounds.size() * 0.5;
+        let mut t = start;
+        match kind {
+            TransformDrag::Move => {
+                let d = canvas - from;
+                t.offset = (start.offset.0 + d.x, start.offset.1 + d.y);
+            }
+            TransformDrag::Rotate => {
+                let center = self.center_of(&start);
+                let turned = (canvas - center).angle() - (from - center).angle();
+                t.rotation = start.rotation + turned;
+                if free {
+                    // Shift snaps to steps of 15°.
+                    let step = 15f32.to_radians();
+                    t.rotation = (t.rotation / step).round() * step;
+                }
+            }
+            TransformDrag::Scale(sx, sy) => {
+                // The opposite corner stays where it is.
+                let anchor = self.corner_of(&start, -sx, -sy);
+                let reach = Self::rotate(canvas - anchor, -start.rotation);
+                let mut scale_x = (reach.x * sx / (2.0 * half.x)).max(0.01);
+                let mut scale_y = (reach.y * sy / (2.0 * half.y)).max(0.01);
+                if !free {
+                    // Keep the proportions unless Shift is held.
+                    let ratio = (scale_x / start.scale.0).max(scale_y / start.scale.1);
+                    scale_x = start.scale.0 * ratio;
+                    scale_y = start.scale.1 * ratio;
+                }
+                t.scale = (scale_x, scale_y);
+                let center = anchor + Self::rotate(Vec2::new(sx * half.x * scale_x, sy * half.y * scale_y), start.rotation);
+                let moved = center - self.bounds.center();
+                t.offset = (moved.x, moved.y);
+            }
+        }
+        self.transform = t;
+    }
 }
 
 /// Menu and keyboard commands, applied once per frame after the UI is built.
@@ -33,6 +198,8 @@ enum Tool {
 enum Command {
     NewDialog,
     Open,
+    InsertImage,
+    PasteImage,
     Save,
     SaveAs,
     ExportPng,
@@ -51,6 +218,12 @@ enum Command {
     ResetRotation,
     Flip,
     ToggleBrushWindow,
+    Fullscreen,
+    FinishTransform(bool),
+    SelectAll,
+    Deselect,
+    DeleteSelected,
+    FlipContents(bool),
     Quit,
 }
 
@@ -80,6 +253,22 @@ pub struct SharkPaintApp {
     tool: Tool,
     brush: BrushSettings,
     eraser: BrushSettings,
+    smudge: BrushSettings,
+    /// How different a pixel may be and still be filled (0..=1).
+    fill_tolerance: f32,
+    /// The fill looks at the whole picture rather than only the active layer.
+    fill_all_layers: bool,
+    /// Canvas position where a layer move began.
+    move_origin: Option<Pos2>,
+    /// The eyedropper is being dragged.
+    picking: bool,
+    /// The transform tool's box, while a transform is open.
+    xform: Option<TransformBox>,
+    /// Layer (id, version) and selection found empty, so the transform tool
+    /// does not rescan them.
+    xform_empty: Option<(u64, u64, u64)>,
+    select_shape: SelectShape,
+    select_drag: Option<SelectDrag>,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -118,6 +307,12 @@ pub struct SharkPaintApp {
     /// The window may close even with unsaved changes (the user chose to).
     allow_close: bool,
     window_title: String,
+    /// Display scale of the monitor the window is on.
+    display_scale: f32,
+    /// Window size in points while the display scale was last steady.
+    steady_size: Option<Vec2>,
+    /// When the display scale last changed (the window crossed to another monitor).
+    scale_changed_at: Option<f64>,
     /// The floating brush settings window is showing.
     brush_window_open: bool,
 }
@@ -140,6 +335,25 @@ impl SharkPaintApp {
             tool: Tool::Pincel,
             brush: BrushPreset::Tinta.settings(),
             eraser,
+            smudge: BrushSettings {
+                size: 60.0,
+                opacity: 1.0,
+                flow: 0.7,
+                hardness: 0.3,
+                spacing: 0.1,
+                smoothing: 0.0,
+                pressure_size: false,
+                pressure_flow: true,
+                min_size: 1.0,
+            },
+            fill_tolerance: 0.15,
+            fill_all_layers: true,
+            move_origin: None,
+            picking: false,
+            xform: None,
+            xform_empty: None,
+            select_shape: SelectShape::Rectangulo,
+            select_drag: None,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -162,10 +376,19 @@ impl SharkPaintApp {
             confirm: None,
             allow_close: false,
             window_title: String::new(),
+            display_scale: 0.0,
+            steady_size: None,
+            scale_changed_at: None,
             brush_window_open: true,
         };
+        // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
-            app.load_project(path);
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+                app.load_project(path);
+            } else {
+                app.insert_image_file(&path);
+                app.saved_revision = app.doc.revision();
+            }
         }
         app
     }
@@ -303,6 +526,44 @@ impl SharkPaintApp {
         }
     }
 
+    /// Keeps the window the same apparent size when it moves to a monitor with a
+    /// different display scale. Dragging a window across such monitors can leave
+    /// it shrunken on Windows; once the scale settles, the size from before the
+    /// move is restored.
+    fn keep_size_across_monitors(&mut self, ctx: &egui::Context) {
+        let (scale, size, fixed, now) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.native_pixels_per_point.unwrap_or(1.0),
+                v.inner_rect.map(|r| r.size()),
+                v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false) || v.minimized.unwrap_or(false),
+                i.time,
+            )
+        });
+        if self.display_scale == 0.0 {
+            self.display_scale = scale;
+        }
+        if scale != self.display_scale {
+            self.display_scale = scale;
+            self.scale_changed_at = Some(now);
+        }
+        match self.scale_changed_at {
+            Some(changed) if now - changed < 0.6 => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Some(_) => {
+                self.scale_changed_at = None;
+                if let (Some(want), Some(have), false) = (self.steady_size, size, fixed) {
+                    if (have - want).abs().max_elem() > 8.0 {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+                    }
+                }
+            }
+            None if !fixed => self.steady_size = size,
+            None => {}
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let name = self
             .path
@@ -324,8 +585,9 @@ impl SharkPaintApp {
 
     fn active_brush(&mut self) -> &mut BrushSettings {
         match self.tool {
-            Tool::Pincel => &mut self.brush,
             Tool::Borrador => &mut self.eraser,
+            Tool::Difuminar => &mut self.smudge,
+            _ => &mut self.brush,
         }
     }
 
@@ -364,6 +626,15 @@ impl SharkPaintApp {
             if hit(cmd, Key::J) {
                 commands.push(Command::LayerDuplicate);
             }
+            if hit(cmd, Key::A) {
+                commands.push(Command::SelectAll);
+            }
+            if hit(cmd, Key::D) {
+                commands.push(Command::Deselect);
+            }
+            if hit(none, Key::Delete) {
+                commands.push(Command::DeleteSelected);
+            }
             if hit(cmd, Key::Num0) {
                 commands.push(Command::Fit);
             }
@@ -385,21 +656,41 @@ impl SharkPaintApp {
             if hit(none, Key::Num5) {
                 commands.push(Command::ResetRotation);
             }
-            if hit(none, Key::M) {
+            if hit(none, Key::F) {
                 commands.push(Command::Flip);
+            }
+            if self.tool == Tool::Transformar && self.xform.is_some() {
+                if hit(none, Key::Enter) {
+                    commands.push(Command::FinishTransform(true));
+                }
+                if hit(none, Key::Escape) {
+                    commands.push(Command::FinishTransform(false));
+                }
+            }
+            if hit(none, Key::F11) {
+                commands.push(Command::Fullscreen);
             }
             if hit(none, Key::F5) {
                 commands.push(Command::ToggleBrushWindow);
             }
-            if hit(none, Key::B) {
-                self.tool = Tool::Pincel;
-            }
-            if hit(none, Key::E) {
-                self.tool = Tool::Borrador;
+            for (tool, key) in [
+                (Tool::Pincel, Key::B),
+                (Tool::Borrador, Key::E),
+                (Tool::Difuminar, Key::D),
+                (Tool::Relleno, Key::G),
+                (Tool::Cuentagotas, Key::I),
+                (Tool::Mover, Key::V),
+                (Tool::Transformar, Key::T),
+                (Tool::Seleccion, Key::S),
+            ] {
+                if hit(none, key) {
+                    self.tool = tool;
+                }
             }
             let brush = match self.tool {
-                Tool::Pincel => &mut self.brush,
                 Tool::Borrador => &mut self.eraser,
+                Tool::Difuminar => &mut self.smudge,
+                _ => &mut self.brush,
             };
             if hit(none, Key::OpenBracket) {
                 brush.size = (brush.size / 1.15).max(1.0);
@@ -426,6 +717,9 @@ impl SharkPaintApp {
                 if ui.add(egui::Button::new("Guardar como…").shortcut_text("Ctrl+Mayús+S")).clicked() {
                     commands.push(Command::SaveAs);
                 }
+                if ui.button("Insertar imagen…").clicked() {
+                    commands.push(Command::InsertImage);
+                }
                 if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+E")).clicked() {
                     commands.push(Command::ExportPng);
                 }
@@ -442,6 +736,10 @@ impl SharkPaintApp {
                 let redo = egui::Button::new("Rehacer").shortcut_text("Ctrl+Mayús+Z");
                 if ui.add_enabled(self.doc.can_redo(), redo).clicked() {
                     commands.push(Command::Redo);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Pegar imagen").shortcut_text("Ctrl+V")).clicked() {
+                    commands.push(Command::PasteImage);
                 }
             });
             ui.menu_button("Capa", |ui| {
@@ -464,11 +762,39 @@ impl SharkPaintApp {
                     commands.push(Command::LayerMove(false));
                 }
                 ui.separator();
+                if ui.button("Voltear horizontalmente").clicked() {
+                    commands.push(Command::FlipContents(true));
+                }
+                if ui.button("Voltear verticalmente").clicked() {
+                    commands.push(Command::FlipContents(false));
+                }
+                ui.separator();
                 if ui.button("Limpiar capa").clicked() {
                     commands.push(Command::ClearLayer);
                 }
                 if ui.add_enabled(many, egui::Button::new("Eliminar capa")).clicked() {
                     commands.push(Command::LayerDelete);
+                }
+            });
+            ui.menu_button("Selección", |ui| {
+                let selected = self.doc.selection().is_some();
+                if ui.add(egui::Button::new("Seleccionar todo").shortcut_text("Ctrl+A")).clicked() {
+                    commands.push(Command::SelectAll);
+                }
+                if ui.add_enabled(selected, egui::Button::new("Deseleccionar").shortcut_text("Ctrl+D")).clicked() {
+                    commands.push(Command::Deselect);
+                }
+                ui.separator();
+                if ui.add_enabled(selected, egui::Button::new("Borrar lo seleccionado").shortcut_text("Supr")).clicked() {
+                    commands.push(Command::DeleteSelected);
+                }
+                ui.separator();
+                let what = if selected { "la selección" } else { "la capa" };
+                if ui.button(format!("Voltear {what} horizontalmente")).clicked() {
+                    commands.push(Command::FlipContents(true));
+                }
+                if ui.button(format!("Voltear {what} verticalmente")).clicked() {
+                    commands.push(Command::FlipContents(false));
                 }
             });
             ui.menu_button("Ver", |ui| {
@@ -497,28 +823,39 @@ impl SharkPaintApp {
                 if item(ui, "Restablecer rotación", "5") {
                     commands.push(Command::ResetRotation);
                 }
-                if item(ui, "Voltear horizontalmente", "M") {
+                if item(ui, "Voltear horizontalmente", "F") {
                     commands.push(Command::Flip);
                 }
                 ui.separator();
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
                 }
+                if item(ui, "Pantalla completa", "F11") {
+                    commands.push(Command::Fullscreen);
+                }
             });
             ui.menu_button("Ayuda", |ui| {
+                ui.strong(concat!("SharkPaint ", env!("CARGO_PKG_VERSION")));
+                ui.label("Software libre bajo la licencia GPL 3.0");
+                ui.separator();
                 ui.label("Atajos del lienzo");
                 ui.separator();
                 egui::Grid::new("atajos").num_columns(2).show(ui, |ui| {
                     for (keys, what) in [
-                        ("B / E", "Pincel / Borrador"),
+                        ("B / E / D", "Pincel / Borrador / Difuminar"),
+                        ("G / I / V", "Relleno / Cuentagotas / Mover capa"),
+                        ("T", "Transformar (Intro aplica, Esc cancela)"),
+                        ("S", "Selección (Ctrl+A todo, Ctrl+D ninguna)"),
+                        ("Supr", "Borrar lo seleccionado"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
-                        ("R + arrastrar", "Mover el lienzo"),
+                        ("M + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
                         ("Botón central", "Mover el lienzo"),
                         ("Rueda del ratón", "Zoom"),
-                        ("Mayús + R + arrastrar", "Rotar el lienzo"),
+                        ("R + arrastrar", "Rotar el lienzo"),
+                        ("F", "Voltear horizontalmente"),
                         ("Dos dedos", "Mover, rotar y hacer zoom"),
                     ] {
                         ui.label(keys);
@@ -536,10 +873,8 @@ impl SharkPaintApp {
         ui.add_space(4.0);
         let text = ui.visuals().strong_text_color();
         let size = Vec2::splat(ui.available_width());
-        for (tool, name, tip) in [
-            (Tool::Pincel, "pincel", "Pincel (B)\nClic de nuevo: ajustes"),
-            (Tool::Borrador, "borrador", "Borrador (E)\nClic de nuevo: ajustes"),
-        ] {
+        for (tool, name, label, key) in Tool::ALL {
+            let tip = format!("{label} ({key})\nClic de nuevo: ajustes");
             let button = egui::Button::image(icon(name, 20.0, text)).selected(self.tool == tool).min_size(size);
             if ui.add(button).on_hover_text(tip).clicked() {
                 if self.tool == tool {
@@ -573,11 +908,7 @@ impl SharkPaintApp {
     /// Floating, movable window with the settings of the current tool.
     fn brush_window(&mut self, ctx: &egui::Context) {
         let mut open = self.brush_window_open;
-        let title = match self.tool {
-            Tool::Pincel => "Pincel",
-            Tool::Borrador => "Borrador",
-        };
-        egui::Window::new(title)
+        egui::Window::new(self.tool.name())
             .id(egui::Id::unique("ajustes_herramienta"))
             .open(&mut open)
             .collapsible(true)
@@ -601,7 +932,91 @@ impl SharkPaintApp {
         });
     }
 
+    fn transform_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(xform) = &mut self.xform else {
+            ui.label("La capa activa está vacía u oculta: no hay nada que transformar.");
+            return;
+        };
+        let mut t = xform.transform;
+        let (mut width, mut height) = (t.scale.0 * 100.0, t.scale.1 * 100.0);
+        let mut degrees = t.rotation.to_degrees();
+        egui::Grid::new("transformar").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Ancho");
+            ui.add(egui::DragValue::new(&mut width).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" %"));
+            ui.end_row();
+            ui.label("Alto");
+            ui.add(egui::DragValue::new(&mut height).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" %"));
+            ui.end_row();
+            ui.label("Rotación");
+            ui.add(egui::DragValue::new(&mut degrees).speed(0.5).fixed_decimals(1).suffix("°"));
+            ui.end_row();
+        });
+        t.scale = (width / 100.0, height / 100.0);
+        t.rotation = degrees.to_radians();
+        let mut apply = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            apply = ui.button("Aplicar").on_hover_text("Intro").clicked();
+            cancel = ui.button("Cancelar").on_hover_text("Esc").clicked();
+            if ui.button("Restablecer").clicked() {
+                t = LayerTransform::IDENTITY;
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("Esquinas: cambiar tamaño (Mayús: sin mantener proporción).");
+        ui.label("Dentro de la caja: mover. Fuera: rotar (Mayús: de 15° en 15°).");
+        if t != xform.transform {
+            xform.transform = t;
+            self.doc.set_transform(t);
+        }
+        if apply {
+            self.finish_transform(true);
+        } else if cancel {
+            self.finish_transform(false);
+        }
+    }
+
+    /// Applies or discards the open transform.
+    fn finish_transform(&mut self, apply: bool) {
+        if self.xform.take().is_some() {
+            if apply {
+                self.doc.end_stroke();
+            } else {
+                self.doc.cancel_stroke();
+            }
+        }
+    }
+
+    /// Opens a transform on the active layer while the transform tool is
+    /// selected, and applies it when the tool is put away.
+    fn sync_transform(&mut self) {
+        if self.tool != Tool::Transformar {
+            self.finish_transform(true);
+            return;
+        }
+        if self.xform.is_some() && !self.doc.is_transforming() {
+            self.xform = None; // something else (undo, saving…) closed it
+        }
+        if self.xform.is_none() && self.doc.active().props.visible {
+            let key = (self.doc.active().id, self.doc.active().version, self.doc.selection_stamp());
+            if self.xform_empty == Some(key) {
+                return;
+            }
+            match self.doc.begin_transform() {
+                Some(b) => {
+                    let bounds = Rect::from_min_max(
+                        Pos2::new(b.x0 as f32, b.y0 as f32),
+                        Pos2::new(b.x1 as f32, b.y1 as f32),
+                    );
+                    self.xform = Some(TransformBox { bounds, transform: LayerTransform::IDENTITY, drag: None });
+                }
+                None => self.xform_empty = Some(key),
+            }
+        }
+    }
+
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
             Tool::Pincel => {
                 ui.strong("Pinceles");
@@ -614,15 +1029,48 @@ impl SharkPaintApp {
                     }
                 });
             }
-            Tool::Borrador => {
-                ui.strong("Borrador");
+            Tool::Borrador | Tool::Difuminar => {}
+            Tool::Relleno => {
+                ui.horizontal(|ui| {
+                    ui.label("Tolerancia");
+                    ui.add(egui::Slider::new(&mut self.fill_tolerance, 0.0..=1.0).custom_formatter(percent));
+                });
+                ui.checkbox(&mut self.fill_all_layers, "Tener en cuenta todas las capas")
+                    .on_hover_text("El relleno se detiene en las líneas de cualquier capa visible,\nno solo en las de la capa activa");
+                ui.label("Rellena la capa activa con el color elegido.");
+                return;
+            }
+            Tool::Cuentagotas => {
+                ui.label("Haz clic o arrastra sobre el lienzo para tomar un color.");
+                ui.label("Con cualquier otra herramienta: Alt + clic.");
+                return;
+            }
+            Tool::Mover => {
+                ui.label("Arrastra sobre el lienzo para mover el contenido de la capa activa.");
+                return;
+            }
+            Tool::Transformar => {
+                self.transform_panel(ui);
+                return;
+            }
+            Tool::Seleccion => {
+                ui.horizontal_wrapped(|ui| {
+                    for (shape, name) in SelectShape::ALL {
+                        ui.selectable_value(&mut self.select_shape, shape, name);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
+                ui.label("Un clic sin arrastrar quita la selección.");
+                ui.label("Pintar, borrar, rellenar, transformar y voltear afectan solo a lo seleccionado.");
+                return;
             }
         }
 
         ui.add_space(4.0);
         let before = self.active_brush().clone();
+        let smudging = self.tool == Tool::Difuminar;
         let b = self.active_brush();
-        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Tamaño");
             ui.add(
@@ -632,19 +1080,19 @@ impl SharkPaintApp {
                     .suffix(" px"),
             );
             ui.end_row();
-            for (label, value, max) in [
-                ("Opacidad", &mut b.opacity, 1.0),
-                ("Flujo", &mut b.flow, 1.0),
-                ("Dureza", &mut b.hardness, 1.0),
-                ("Espaciado", &mut b.spacing, 1.0),
-                ("Estabilizador", &mut b.smoothing, 0.95),
-            ] {
+            let rows: Vec<(&str, &mut f32, f32, f32)> = if smudging {
+                vec![("Intensidad", &mut b.flow, 0.01, 1.0), ("Dureza", &mut b.hardness, 0.0, 1.0)]
+            } else {
+                vec![
+                    ("Opacidad", &mut b.opacity, 0.01, 1.0),
+                    ("Flujo", &mut b.flow, 0.01, 1.0),
+                    ("Dureza", &mut b.hardness, 0.0, 1.0),
+                    ("Espaciado", &mut b.spacing, 0.01, 1.0),
+                    ("Estabilizador", &mut b.smoothing, 0.0, 0.95),
+                ]
+            };
+            for (label, value, min, max) in rows {
                 ui.label(label);
-                let min = if label == "Espaciado" || label == "Flujo" || label == "Opacidad" {
-                    0.01
-                } else {
-                    0.0
-                };
                 ui.add(egui::Slider::new(value, min..=max).custom_formatter(percent));
                 ui.end_row();
             }
@@ -658,7 +1106,7 @@ impl SharkPaintApp {
                 ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
             });
         });
-        ui.checkbox(&mut b.pressure_flow, "Controla el flujo");
+        ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
         if self.tool == Tool::Pincel && self.brush != before {
             // Hand-tuned settings no longer match the preset they started from.
             if self.preset.map(|p| p.settings()) != Some(self.brush.clone()) {
@@ -896,9 +1344,104 @@ impl SharkPaintApp {
     }
 
     fn begin_stroke(&mut self, at: Pos2, pressure: f32) {
-        let erase = self.tool == Tool::Borrador;
         let brush = self.active_brush().clone();
-        self.doc.begin_stroke(&brush, self.color, erase, StrokePoint::new(at.x, at.y, pressure));
+        let point = StrokePoint::new(at.x, at.y, pressure);
+        match self.tool {
+            Tool::Difuminar => self.doc.begin_smudge(&brush, point),
+            tool => self.doc.begin_stroke(&brush, self.color, tool == Tool::Borrador, point),
+        }
+    }
+
+    /// Puts an image on a new layer, centred, shrunk to fit if it is larger
+    /// than the canvas. `rgba` is 8-bit and not premultiplied.
+    fn insert_image(&mut self, name: &str, width: usize, height: usize, rgba: Vec<u8>) {
+        if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+            self.status = "La imagen no se pudo leer.".into();
+            return;
+        }
+        let fit = (self.doc.width as f64 / width as f64).min(self.doc.height as f64 / height as f64);
+        let (mut width, mut height, mut rgba) = (width, height, rgba);
+        let mut note = String::new();
+        if fit < 1.0 {
+            let (w, h) = (
+                ((width as f64 * fit).round() as u32).max(1),
+                ((height as f64 * fit).round() as u32).max(1),
+            );
+            let Some(source) = image::RgbaImage::from_raw(width as u32, height as u32, rgba) else { return };
+            let scaled = image::imageops::resize(&source, w, h, image::imageops::FilterType::Lanczos3);
+            (width, height, rgba) = (w as usize, h as usize, scaled.into_raw());
+            note = format!(" (reducida al {:.0} % para caber en el lienzo)", fit * 100.0);
+        }
+        let x = (self.doc.width as i32 - width as i32) / 2;
+        let y = (self.doc.height as i32 - height as i32) / 2;
+        self.doc.add_image_layer(name, width, height, &rgba, x, y);
+        // The move tool is what comes next: placing the image.
+        self.tool = Tool::Mover;
+        self.status = format!("Imagen insertada en una capa nueva{note}. Arrástrala para colocarla.");
+    }
+
+    fn insert_image_file(&mut self, path: &std::path::Path) {
+        match image::open(path) {
+            Ok(decoded) => {
+                let rgba = decoded.into_rgba8();
+                let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Imagen".into());
+                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                self.insert_image(&name, w, h, rgba.into_raw());
+            }
+            Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+        }
+    }
+
+    fn pick_image_file(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Insertar imagen")
+            .add_filter("Imágenes", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.insert_image_file(&path);
+        }
+    }
+
+    /// Pastes the image on the system clipboard, if there is one.
+    fn paste_clipboard_image(&mut self) {
+        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+        match image {
+            Ok(image) => self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned()),
+            Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+        }
+    }
+
+    /// Images arriving by Ctrl+V or by dropping files on the window.
+    fn incoming_images(&mut self, ctx: &egui::Context) {
+        let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
+        for event in events {
+            match event {
+                Event::PasteImage(image) => {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                    self.insert_image("Imagen pegada", image.size[0], image.size[1], rgba);
+                }
+                // The clipboard also had text, which wins; look for an image anyway
+                // unless the text is headed for a text field.
+                Event::Paste(_) if !ctx.text_edit_focused() => {
+                    let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+                    if let Ok(image) = image {
+                        self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for file in dropped {
+            let path = file.path().to_path_buf();
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+                self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            } else {
+                self.insert_image_file(&path);
+            }
+        }
     }
 
     fn pick_color(&mut self, canvas: Pos2) {
@@ -921,11 +1464,11 @@ impl SharkPaintApp {
         }
 
         let ctx = ui.ctx().clone();
-        let (space, nav_key, shift, alt, events, hover, now) = ctx.input(|i| {
+        let (space, move_key, rotate_key, alt, events, hover, now) = ctx.input(|i| {
             (
                 i.key_down(Key::Space),
+                i.key_down(Key::M),
                 i.key_down(Key::R),
-                i.modifiers.shift,
                 i.modifiers.alt,
                 i.events.clone(),
                 i.pointer.hover_pos(),
@@ -933,8 +1476,8 @@ impl SharkPaintApp {
             )
         });
         let typing = ctx.text_edit_focused();
-        let navigating = !typing && (space || nav_key);
-        let rotating = nav_key && shift;
+        let navigating = !typing && (space || move_key || rotate_key);
+        let rotating = rotate_key && !space && !move_key;
         // The pointer is over the canvas itself, not a menu or window on top of it.
         let over_canvas = |pos: Pos2| {
             viewport.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
@@ -965,6 +1508,10 @@ impl SharkPaintApp {
             }
         }
 
+        self.sync_transform();
+        let free = ctx.input(|i| i.modifiers.shift);
+        let mut transform_changed = false;
+
         // --- Painting -------------------------------------------------------
         // Every input sample of the frame is replayed in order so fast strokes
         // keep all their points, each with the pressure that arrived with it.
@@ -988,6 +1535,9 @@ impl SharkPaintApp {
                                 if !drawing || now - self.press_time < 0.25 {
                                     self.gesture_active = true;
                                     self.pending_start = None;
+                                    self.move_origin = None;
+                                    self.picking = false;
+                                    self.select_drag = None;
                                     self.doc.cancel_stroke();
                                 }
                             }
@@ -1026,13 +1576,50 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
-                    if alt {
+                    if self.tool == Tool::Seleccion && !alt {
+                        self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
+                        continue;
+                    }
+                    if alt || self.tool == Tool::Cuentagotas {
                         self.pick_color(c);
+                        self.picking = self.tool == Tool::Cuentagotas;
                         continue;
                     }
                     if !self.doc.active().props.visible {
                         self.status = "La capa activa está oculta: muéstrala para pintar en ella.".into();
                         continue;
+                    }
+                    match self.tool {
+                        Tool::Relleno => {
+                            let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
+                            self.doc.flood_fill(x, y, self.color, self.fill_tolerance, self.fill_all_layers);
+                            continue;
+                        }
+                        Tool::Mover => {
+                            self.doc.begin_layer_move();
+                            self.move_origin = Some(c);
+                            continue;
+                        }
+                        Tool::Transformar => {
+                            if let Some(xform) = &mut self.xform {
+                                // A corner scales, inside the box moves, outside rotates.
+                                let near = |sx: f32, sy: f32| {
+                                    let corner = xform.corner_of(&xform.transform, sx, sy);
+                                    (view.to_screen(corner, viewport, doc_size) - *pos).length() < 12.0
+                                };
+                                let corner = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                                    .into_iter()
+                                    .find(|&(sx, sy)| near(sx, sy));
+                                let kind = match corner {
+                                    Some((sx, sy)) => TransformDrag::Scale(sx, sy),
+                                    None if xform.contains(c) => TransformDrag::Move,
+                                    None => TransformDrag::Rotate,
+                                };
+                                xform.drag = Some((kind, c, xform.transform));
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                     // The first dab waits for a real pressure reading: a pen touching
                     // down reports no pressure at first, and assuming full pressure
@@ -1042,6 +1629,25 @@ impl SharkPaintApp {
                     self.press_is_touch = self.touch_active;
                     self.press_time = now;
                     self.contact_pressure = self.pen_pressure;
+                }
+                Event::PointerMoved(pos) if self.xform.as_ref().is_some_and(|x| x.drag.is_some()) => {
+                    if let Some(xform) = &mut self.xform {
+                        xform.drag_to(to_canvas(*pos), free);
+                        transform_changed = true;
+                    }
+                }
+                Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
+                Event::PointerMoved(pos) if self.select_drag.is_some() => {
+                    if let Some(drag) = &mut self.select_drag {
+                        drag.to = to_canvas(*pos);
+                        drag.trail.push(drag.to);
+                        drag.moved |= (*pos - drag.pressed_at).length() > 3.0;
+                    }
+                }
+                Event::PointerMoved(pos) if self.picking => self.pick_color(to_canvas(*pos)),
+                Event::PointerMoved(pos) if self.move_origin.is_some() => {
+                    let delta = to_canvas(*pos) - self.move_origin.unwrap_or_default();
+                    self.doc.move_layer_to(delta.x.round() as i32, delta.y.round() as i32);
                 }
                 Event::PointerMoved(pos) if self.pending_start.is_some() || self.doc.is_stroking() => {
                     let c = to_canvas(*pos);
@@ -1064,6 +1670,24 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
+                    if self.tool == Tool::Transformar {
+                        // The transform stays open between drags; only the drag ends.
+                        if let Some(xform) = &mut self.xform {
+                            xform.drag = None;
+                        }
+                        continue;
+                    }
+                    if let Some(drag) = self.select_drag.take() {
+                        if drag.moved {
+                            let outline = self.select_shape.outline(drag.from, drag.to, &drag.trail, free);
+                            self.doc.select_polygon(&outline);
+                        } else {
+                            self.doc.deselect();
+                        }
+                        continue;
+                    }
+                    self.picking = false;
+                    self.move_origin = None;
                     // A tap without movement still leaves one dab.
                     if let Some(start) = self.pending_start.take() {
                         let fallback = if self.press_is_touch { 0.0 } else { 1.0 };
@@ -1074,6 +1698,12 @@ impl SharkPaintApp {
                     self.doc.end_stroke();
                 }
                 _ => {}
+            }
+        }
+
+        if transform_changed {
+            if let Some(xform) = &self.xform {
+                self.doc.set_transform(xform.transform);
             }
         }
 
@@ -1108,13 +1738,46 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
+        // The selection, and the one being dragged out, as a dashed outline.
+        let dashed = |outline: &[(f32, f32)]| {
+            let mut points: Vec<Pos2> =
+                outline.iter().map(|&(x, y)| self.view.to_screen(Pos2::new(x, y), viewport, doc_size)).collect();
+            if let Some(first) = points.first().copied() {
+                points.push(first);
+            }
+            painter.add(Shape::line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
+            painter.extend(Shape::dashed_line(&points, Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
+        };
+        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
+            dashed(&self.select_shape.outline(drag.from, drag.to, &drag.trail, free));
+        } else if let Some(selection) = self.doc.selection() {
+            dashed(&selection.outline);
+        }
+
+        // The transform box: outline and corner handles.
+        if let Some(xform) = &self.xform {
+            let points: Vec<Pos2> = xform.corners().iter().map(|c| self.view.to_screen(*c, viewport, doc_size)).collect();
+            painter.add(Shape::closed_line(points.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
+            painter.add(Shape::closed_line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
+            for p in points {
+                let handle = Rect::from_center_size(p, Vec2::splat(9.0));
+                painter.rect_filled(handle, 1.0, Color32::WHITE);
+                painter.rect_stroke(handle, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
+            }
+        }
+
         // Brush outline in place of the system cursor.
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
+            } else if self.tool == Tool::Mover {
+                ctx.set_cursor_icon(CursorIcon::Move);
+            } else if self.tool == Tool::Transformar {
+                ctx.set_cursor_icon(CursorIcon::Default);
             } else {
+                debug_assert!(self.tool.has_tip());
                 let radius = self.active_brush().size * 0.5 * self.view.zoom;
                 if radius >= 4.0 {
                     ctx.set_cursor_icon(CursorIcon::None);
@@ -1200,6 +1863,8 @@ impl SharkPaintApp {
         match command {
             Command::NewDialog => self.discarding(Discarding::New, ctx),
             Command::Open => self.discarding(Discarding::Open, ctx),
+            Command::InsertImage => self.pick_image_file(),
+            Command::PasteImage => self.paste_clipboard_image(),
             Command::Save => {
                 self.save_project(false);
             }
@@ -1239,6 +1904,15 @@ impl SharkPaintApp {
             }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
+            Command::FinishTransform(apply) => self.finish_transform(apply),
+            Command::SelectAll => self.doc.select_all(),
+            Command::Deselect => self.doc.deselect(),
+            Command::DeleteSelected => self.doc.clear_selection_contents(),
+            Command::FlipContents(horizontal) => self.doc.flip(horizontal),
+            Command::Fullscreen => {
+                let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+            }
             Command::Quit => self.discarding(Discarding::Quit, ctx),
         }
     }
@@ -1249,6 +1923,7 @@ impl eframe::App for SharkPaintApp {
         let ctx = ui.ctx().clone();
         let mut commands = Vec::new();
         self.keyboard_commands(&ctx, &mut commands);
+        self.incoming_images(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut commands));
         egui::Panel::bottom("estado").show(ui, |ui| self.status_bar(ui));
@@ -1280,6 +1955,7 @@ impl eframe::App for SharkPaintApp {
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
+        self.keep_size_across_monitors(&ctx);
         for command in commands {
             self.run(command, &ctx);
         }

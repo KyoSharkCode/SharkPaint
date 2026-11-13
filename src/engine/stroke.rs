@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::brush::BrushSettings;
 use super::layer::{IRect, Layer, Tile, ONE, TILE};
+use super::selection::Selection;
 
 /// One input sample in canvas coordinates. `pressure` is 0..=1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +40,8 @@ pub(crate) struct ActiveStroke {
     /// Keep the layer's existing alpha; paint only where it already has pixels.
     alpha_lock: bool,
     opacity: u32,
+    /// Painting is confined to this selection, if there is one.
+    selection: Option<Arc<Selection>>,
     tiles: Vec<Option<StrokeTile>>,
     /// Last point actually drawn to (after smoothing).
     pen: StrokePoint,
@@ -55,6 +58,7 @@ impl ActiveStroke {
         brush: &BrushSettings,
         color: [u8; 3],
         erase: bool,
+        selection: Option<Arc<Selection>>,
         p: StrokePoint,
     ) -> (Self, IRect) {
         let to15 = |v: u8| (v as u32 * ONE + 127) / 255;
@@ -65,6 +69,7 @@ impl ActiveStroke {
             erase,
             alpha_lock: layer.props.alpha_lock,
             opacity: (brush.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
+            selection,
             tiles: (0..layer.tiles.len()).map(|_| None).collect(),
             pen: p,
             raw: p,
@@ -248,7 +253,10 @@ impl ActiveStroke {
                             Some(t) => t.0[i],
                             None => [0; 4],
                         };
-                        let a = (st.mask[i] as u32 * self.opacity) >> 15;
+                        let mut a = (st.mask[i] as u32 * self.opacity) >> 15;
+                        if let Some(selection) = &self.selection {
+                            a = a * selection.coverage(x, y) as u32 / 255;
+                        }
                         let keep = ONE - a;
                         let mix = |under: u16, paint: u32| -> u16 {
                             ((paint * a + under as u32 * keep + ONE / 2) >> 15) as u16
