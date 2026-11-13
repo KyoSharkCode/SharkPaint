@@ -902,3 +902,40 @@ impl Document {
         any.then_some((rect, out))
     }
 }
+
+// --- Brush preview ----------------------------------------------------------
+
+/// A sample stroke drawn with `brush`, as opaque 8-bit RGBA: a wave whose
+/// pressure rises and falls, the way a quick pen stroke does. Large brushes
+/// are shown smaller so they fit.
+pub fn brush_preview(brush: &BrushSettings, width: usize, height: usize, ink: [u8; 3], paper: [u8; 3]) -> Vec<u8> {
+    let mut doc = Document::new(width, height);
+    doc.paper = paper;
+    let limit = height as f32 * 0.45;
+    let sample = BrushSettings { size: brush.size.min(limit), smoothing: 0.0, ..brush.clone() };
+    let (w, h) = (width as f32, height as f32);
+    let margin = limit * 0.5 + 6.0;
+    let point = |t: f32| {
+        StrokePoint::new(
+            margin + t * (w - 2.0 * margin),
+            h * 0.5 + (t * std::f32::consts::TAU).sin() * (h * 0.5 - margin).max(0.0) * 0.8,
+            (t * std::f32::consts::PI).sin().powf(0.6),
+        )
+    };
+    if brush.mix > 0.0 {
+        // A mixing brush shows what it does by crossing bands of colour.
+        let band = BrushSettings { hardness: 1.0, spacing: 0.1, ..BrushSettings::round(w / 5.0) };
+        for (i, color) in [[214, 72, 96], [240, 190, 70], [70, 150, 220]].into_iter().enumerate() {
+            let x = w * (0.28 + 0.22 * i as f32);
+            doc.begin_stroke(&band, color, false, StrokePoint::new(x, -w, 1.0));
+            doc.stroke_to(StrokePoint::new(x, h + w, 1.0));
+            doc.end_stroke();
+        }
+    }
+    doc.begin_stroke(&sample, ink, false, point(0.0));
+    for step in 1..=160 {
+        doc.stroke_to(point(step as f32 / 160.0));
+    }
+    doc.end_stroke();
+    doc.render_rgba8(doc.bounds())
+}

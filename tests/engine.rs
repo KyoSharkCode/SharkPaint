@@ -1,19 +1,10 @@
 use sharkpaint::engine::{
-    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference, StrokePoint,
+    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
-    BrushSettings {
-        size,
-        opacity: 1.0,
-        flow: 1.0,
-        hardness: 1.0,
-        spacing: 0.1,
-        smoothing: 0.0,
-        pressure_size: false,
-        pressure_flow: false,
-        min_size: 1.0,
-    }
+    BrushSettings { hardness: 1.0, spacing: 0.1, smoothing: 0.0, ..BrushSettings::round(size) }
 }
 
 fn pixel(doc: &Document, x: i32, y: i32) -> [u8; 4] {
@@ -857,4 +848,380 @@ fn symmetry_mirrors_strokes_across_the_centre() {
     doc.undo();
     assert_eq!(pixel(&doc, 160, 50), [255, 255, 255, 255]);
     assert!(!doc.can_undo());
+}
+
+/// Darkness (0..=1) of the picture summed over a rectangle.
+fn ink(doc: &Document, x0: i32, y0: i32, x1: i32, y1: i32) -> f64 {
+    let rgba = doc.render_rgba8(IRect::new(x0, y0, x1, y1));
+    rgba.chunks(4).map(|p| 1.0 - p[0] as f64 / 255.0).sum()
+}
+
+#[test]
+fn flat_tips_follow_their_angle() {
+    // A flat calligraphy tip: wide along its angle, thin across it.
+    let flat = |angle: f32| BrushSettings { roundness: 0.2, angle, ..hard_brush(60.0) };
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&flat(0.0), [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 125, 100), [0, 0, 0, 255]); // reaches far sideways
+    assert_eq!(pixel(&doc, 100, 115), [255, 255, 255, 255]); // but not up and down
+    assert_eq!(pixel(&doc, 100, 103), [0, 0, 0, 255]);
+
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&flat(90.0), [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 125), [0, 0, 0, 255]); // a quarter turn swaps them
+    assert_eq!(pixel(&doc, 115, 100), [255, 255, 255, 255]);
+}
+
+#[test]
+fn image_tips_stamp_their_shape() {
+    let tips = builtin_tips();
+    assert!(tips.len() >= 6);
+    let star = tips.iter().find(|t| t.id == "estrella").unwrap().clone();
+    let brush = BrushSettings { tip: BrushTip::Image(star), spacing: 1.0, ..hard_brush(120.0) };
+    let mut doc = Document::new(200, 200);
+    doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(100.0, 100.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 100), [0, 0, 0, 255]); // the centre is solid
+    assert_eq!(pixel(&doc, 100, 52), [0, 0, 0, 255]); // the upper point
+    assert_eq!(pixel(&doc, 130, 62), [255, 255, 255, 255]); // the gap between two points
+    // The star covers clearly less than the disc of the same size would.
+    let covered = ink(&doc, 0, 0, 200, 200);
+    assert!(covered > 2500.0 && covered < 0.6 * std::f64::consts::PI * 3600.0, "covered {covered}");
+
+    // Grainy tips leave gaps even with a continuous stroke.
+    let carbon = tips.iter().find(|t| t.id == "carbon").unwrap().clone();
+    let brush = BrushSettings { tip: BrushTip::Image(carbon), flow: 0.5, ..hard_brush(40.0) };
+    let mut doc = Document::new(300, 100);
+    line(&mut doc, &brush, [0, 0, 0], false, (30.0, 50.0), (270.0, 50.0));
+    let greys = doc.render_rgba8(IRect::new(60, 40, 240, 60)).chunks(4).filter(|p| p[0] > 20 && p[0] < 235).count();
+    assert!(greys > 60, "expected a grainy texture, found {greys} mid-tone pixels");
+}
+
+#[test]
+fn scatter_and_jitter_vary_but_repeat_exactly() {
+    let brush = BrushSettings {
+        scatter: 1.5,
+        size_jitter: 0.6,
+        angle_jitter: 1.0,
+        roundness: 0.5,
+        spacing: 0.6,
+        ..hard_brush(16.0)
+    };
+    let draw = || {
+        let mut doc = Document::new(400, 200);
+        line(&mut doc, &brush, [0, 0, 0], false, (40.0, 100.0), (360.0, 100.0));
+        doc
+    };
+    let doc = draw();
+    // Paint lands well away from the line itself, on both sides.
+    assert!(ink(&doc, 40, 60, 360, 88) > 30.0 && ink(&doc, 40, 112, 360, 140) > 30.0);
+    // The same stroke drawn again is identical, so undo and redo are exact.
+    assert_eq!(doc.render_rgba8(doc.bounds()), draw().render_rgba8(IRect::new(0, 0, 400, 200)));
+
+    // Without scatter nothing strays.
+    let tidy = BrushSettings { scatter: 0.0, size_jitter: 0.0, angle_jitter: 0.0, roundness: 1.0, ..brush.clone() };
+    let mut doc = Document::new(400, 200);
+    line(&mut doc, &tidy, [0, 0, 0], false, (40.0, 100.0), (360.0, 100.0));
+    assert_eq!(ink(&doc, 40, 60, 360, 88), 0.0);
+}
+
+#[test]
+fn tips_can_follow_the_stroke_direction() {
+    let brush = BrushSettings { roundness: 0.15, follow_direction: true, spacing: 2.0, ..hard_brush(40.0) };
+    // Along a vertical stroke the flat tip lies along the path: tall and thin.
+    let mut doc = Document::new(200, 300);
+    doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(100.0, 40.0, 1.0));
+    doc.stroke_to(StrokePoint::new(100.0, 260.0, 1.0));
+    doc.end_stroke();
+    assert!(ink(&doc, 112, 100, 130, 260) < 1.0, "the tip should not stick out sideways");
+    assert!(ink(&doc, 96, 100, 104, 260) > 300.0);
+}
+
+#[test]
+fn shrunken_tips_are_averaged_not_speckled() {
+    // A tip of alternating one-pixel stripes: sampled naively at a small size it
+    // would give pure black or white at random; averaged, it gives an even grey.
+    let stripes: Vec<u8> = (0..256 * 256).map(|i| if (i / 256) % 2 == 0 { 255 } else { 0 }).collect();
+    let tip = sharkpaint::engine::TipImage::new("rayas", "Rayas", 256, stripes);
+    for i in 0..40 {
+        let (u, v) = (0.1 + i as f32 * 0.02, 0.13 + i as f32 * 0.019);
+        let small = tip.sample(u, v, 16.0);
+        assert!((small - 0.5).abs() < 0.08, "at ({u}, {v}) got {small}");
+    }
+    // At full size the stripes are still there.
+    let (dark, light) = (tip.sample(0.5, 1.5 / 256.0, 1.0), tip.sample(0.5, 0.5 / 256.0, 1.0));
+    assert!(light > 0.95 && dark < 0.05, "light {light}, dark {dark}");
+}
+
+#[test]
+fn built_in_tips_have_clean_edges() {
+    // Shapes meant to be crisp are almost entirely black or white: few
+    // in-between pixels, all of them along the outline.
+    for id in ["estrella", "hoja", "salpicadura", "cerdas"] {
+        let tips = builtin_tips();
+        let tip = tips.iter().find(|t| t.id == id).unwrap();
+        let soft = tip.alpha.iter().filter(|&&a| a > 20 && a < 235).count();
+        let solid = tip.alpha.iter().filter(|&&a| a >= 235).count();
+        assert!(solid > 1500, "{id} is nearly empty");
+        assert!((soft as f64) < 0.35 * solid as f64, "{id} is blurry: {soft} soft pixels against {solid} solid");
+    }
+}
+
+fn grainy(pressure_flow: bool) -> BrushSettings {
+    let paper = builtin_papers().into_iter().find(|p| p.id == "rugoso").unwrap();
+    BrushSettings { paper: Some(paper), grain: 1.0, pressure_flow, ..hard_brush(40.0) }
+}
+
+/// Draws a line at a fixed pressure and returns how much of its core is covered.
+fn core_coverage(brush: &BrushSettings, pressure: f32, passes: usize) -> (f64, Document) {
+    let mut doc = Document::new(400, 120);
+    doc.begin_stroke(brush, [0, 0, 0], false, StrokePoint::new(40.0, 60.0, pressure));
+    for pass in 0..passes {
+        let x = if pass % 2 == 0 { 360.0 } else { 40.0 };
+        doc.stroke_to(StrokePoint::new(x, 60.0, pressure));
+    }
+    doc.end_stroke();
+    (ink(&doc, 80, 50, 320, 70) / (240.0 * 20.0), doc)
+}
+
+#[test]
+fn paper_grain_shows_under_light_pressure_and_fills_under_firm() {
+    let brush = grainy(false);
+    let (light, _) = core_coverage(&brush, 0.15, 1);
+    let (medium, _) = core_coverage(&brush, 0.5, 1);
+    let (firm, _) = core_coverage(&brush, 1.0, 1);
+    assert!(light < 0.45, "light pressure should leave much paper bare: {light}");
+    assert!(light + 0.15 < medium && medium + 0.1 < firm, "coverage should grow: {light} {medium} {firm}");
+    assert!(firm > 0.9, "firm pressure should fill almost everything: {firm}");
+    // Without a paper the same strokes are solid at any pressure.
+    let plain = BrushSettings { paper: None, ..brush.clone() };
+    assert!(core_coverage(&plain, 0.15, 1).0 > 0.99);
+    // With the strength at zero the paper has no effect either.
+    let off = BrushSettings { grain: 0.0, ..brush };
+    assert!(core_coverage(&off, 0.15, 1).0 > 0.99);
+}
+
+#[test]
+fn going_over_a_stroke_does_not_fill_the_grain_in() {
+    let brush = grainy(false);
+    let (once, _) = core_coverage(&brush, 0.3, 1);
+    let (many, _) = core_coverage(&brush, 0.3, 6);
+    assert!((many - once).abs() < 0.02, "one pass {once}, six passes {many}");
+}
+
+#[test]
+fn paper_grain_is_fixed_to_the_canvas() {
+    // Two strokes over the same place leave the same pattern, wherever they start.
+    let brush = grainy(false);
+    let draw = |from: f32| {
+        let mut doc = Document::new(400, 120);
+        doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(from, 60.0, 0.3));
+        doc.stroke_to(StrokePoint::new(380.0, 60.0, 0.3));
+        doc.end_stroke();
+        doc.render_rgba8(IRect::new(150, 50, 300, 70))
+    };
+    assert_eq!(draw(20.0), draw(47.0));
+    // A coarser grain gives a different pattern.
+    let coarse = BrushSettings { grain_scale: 3.0, ..brush.clone() };
+    let mut doc = Document::new(400, 120);
+    doc.begin_stroke(&coarse, [0, 0, 0], false, StrokePoint::new(20.0, 60.0, 0.3));
+    doc.stroke_to(StrokePoint::new(380.0, 60.0, 0.3));
+    doc.end_stroke();
+    assert_ne!(doc.render_rgba8(IRect::new(150, 50, 300, 70)), draw(20.0));
+}
+
+#[test]
+fn papers_tile_without_a_seam() {
+    for paper in builtin_papers() {
+        assert_eq!(paper.data.len(), paper.size * paper.size);
+        let n = paper.size as f32;
+        // The same height one whole tile away, and no jump across the edge.
+        for i in 0..40 {
+            let (x, y) = (i as f32 * 6.3, i as f32 * 4.1);
+            assert!((paper.height(x, y) - paper.height(x + n, y - n)).abs() < 1e-4, "{} does not repeat", paper.id);
+        }
+        let across: f32 = (0..paper.size).map(|y| (paper.height(n - 0.5, y as f32) - paper.height(n + 0.5, y as f32)).abs()).sum::<f32>() / n;
+        let inside: f32 = (0..paper.size).map(|y| (paper.height(100.5, y as f32) - paper.height(101.5, y as f32)).abs()).sum::<f32>() / n;
+        assert!(across < inside * 3.0 + 0.02, "{} has a seam: {across} against {inside}", paper.id);
+        // It uses the whole range, so it responds across all pressures.
+        assert!(paper.data.iter().any(|&h| h < 30) && paper.data.iter().any(|&h| h > 225), "{} is flat", paper.id);
+    }
+}
+
+fn blender(size: f32) -> BrushSettings {
+    BrushSettings { mix: 1.0, drag: 0.9, hardness: 1.0, spacing: 0.05, smoothing: 0.0, ..BrushSettings::round(size) }
+}
+
+#[test]
+fn a_blender_adds_no_colour_of_its_own() {
+    let mut doc = Document::new(128, 128);
+    line(&mut doc, &blender(20.0), [255, 0, 0], false, (20.0, 64.0), (108.0, 64.0));
+    for x in (0..128).step_by(4) {
+        assert_eq!(pixel(&doc, x, 64), [255, 255, 255, 255], "empty canvas stays empty at {x}");
+    }
+}
+
+#[test]
+fn a_blender_drags_colour_across_an_edge() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(60.0), [255, 0, 0], false, (40.0, 50.0), (60.0, 50.0));
+    assert_eq!(pixel(&doc, 110, 50), [255, 255, 255, 255]);
+    // The stroke's own colour is blue, but only the red it picked up may show.
+    line(&mut doc, &blender(24.0), [0, 0, 255], false, (50.0, 50.0), (130.0, 50.0));
+    let dragged = pixel(&doc, 110, 50);
+    assert!(dragged[1] < 235, "red was pulled past the edge: {dragged:?}");
+    assert!(dragged[0] == 255 && dragged[2].abs_diff(dragged[1]) <= 1, "no blue was added: {dragged:?}");
+    // One stroke, one undo step.
+    doc.undo();
+    assert_eq!(pixel(&doc, 110, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 50, 50), [255, 0, 0, 255]);
+    doc.redo();
+    assert_eq!(pixel(&doc, 110, 50), dragged);
+}
+
+#[test]
+fn a_mixing_brush_blends_its_colour_with_the_canvas() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(90.0), [255, 0, 0], false, (20.0, 50.0), (180.0, 50.0));
+    let oil = BrushSettings { mix: 0.5, drag: 0.5, ..blender(24.0) };
+    line(&mut doc, &oil, [0, 0, 255], false, (40.0, 50.0), (160.0, 50.0));
+    let mixed = pixel(&doc, 120, 50);
+    assert!(mixed[0] > 40 && mixed[2] > 40, "both colours show: {mixed:?}");
+    assert_eq!(mixed[3], 255);
+    // On a bare canvas the same brush lays down its own colour.
+    let mut bare = Document::new(200, 100);
+    line(&mut bare, &oil, [0, 0, 255], false, (40.0, 50.0), (160.0, 50.0));
+    let own = pixel(&bare, 120, 50);
+    assert!(own[0] < 25 && own[2] == 255, "{own:?}");
+}
+
+#[test]
+fn mixing_respects_alpha_lock_and_cancel() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (40.0, 50.0), (60.0, 50.0));
+    let before = doc.render_rgba8(doc.bounds());
+    doc.begin_stroke(&blender(24.0), [0, 0, 255], false, StrokePoint::new(50.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(140.0, 50.0, 1.0));
+    doc.cancel_stroke();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before, "a cancelled stroke leaves nothing behind");
+
+    let mut props = doc.layers()[doc.active_layer()].props.clone();
+    props.alpha_lock = true;
+    doc.set_layer_props(doc.active_layer(), props, false);
+    line(&mut doc, &blender(24.0), [0, 0, 255], false, (50.0, 50.0), (140.0, 50.0));
+    assert_eq!(pixel(&doc, 120, 50), [255, 255, 255, 255], "locked transparency stays transparent");
+}
+
+/// A descriptor entry of the kind Photoshop writes for one brush.
+fn abr_preset(name: &str, key: &str, diameter: f64, spacing: f64) -> Vec<u8> {
+    let text = |s: &str| -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
+        let mut out = (units.len() as u32).to_be_bytes().to_vec();
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    };
+    let mut out = b"\0\0\0\0Nm  TEXT".to_vec();
+    out.extend(text(name));
+    out.extend(b"\0\0\0\0DmtrUntF#Pxl");
+    out.extend(diameter.to_be_bytes());
+    out.extend(b"\0\0\0\0SpcnUntF#Prc");
+    out.extend(spacing.to_be_bytes());
+    out.extend(b"\0\0\0\x0bsampledDataTEXT");
+    out.extend(text(key));
+    out
+}
+
+/// One entry of the picture block: identifier, filler, bounds and the picture.
+fn abr_sample(key: &str, width: u32, height: u32, depth: u16, compressed: bool, body: &[u8]) -> Vec<u8> {
+    let mut entry = vec![key.len() as u8];
+    entry.extend(key.bytes());
+    entry.resize(47, 0);
+    for bound in [0, 0, height, width] {
+        entry.extend(bound.to_be_bytes());
+    }
+    entry.extend(depth.to_be_bytes());
+    entry.push(compressed as u8);
+    entry.extend(body);
+    let mut out = (entry.len() as u32).to_be_bytes().to_vec();
+    out.extend(&entry);
+    out.resize(4 + entry.len().div_ceil(4) * 4, 0);
+    out
+}
+
+fn abr_block(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = b"8BIM".to_vec();
+    out.extend(name);
+    out.extend((body.len() as u32).to_be_bytes());
+    out.extend(body);
+    out
+}
+
+#[test]
+fn photoshop_brush_files_are_read() {
+    // A 4x2 picture, packed row by row: a run of four, then four literal bytes.
+    let packed = [0u8, 2, 0, 5, 0xFD, 200, 3, 10, 20, 30, 40];
+    // The same size at sixteen bits, unpacked, high byte first.
+    // The low bytes carry fine detail, which looks like noise on its own.
+    let low = [7u8, 201, 66, 250, 13, 180, 99, 31];
+    let wide: Vec<u8> = [0u8, 64, 128, 255, 255, 128, 64, 0].iter().zip(low).flat_map(|(&v, l)| [v, l]).collect();
+    let mut samples = abr_sample("uno-1111", 4, 2, 8, true, &packed);
+    samples.extend(abr_sample("dos-2222", 4, 2, 16, false, &wide));
+    let mut settings = abr_preset("Hojas secas", "dos-2222", 80.0, 12.0);
+    settings.extend(abr_preset("Tiza", "uno-1111", 30.0, 25.0));
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"patt", &[1, 2, 3, 4]));
+    file.extend(abr_block(b"samp", &samples));
+    file.extend(abr_block(b"desc", &settings));
+
+    let brushes = read_abr(&file).expect("a well-formed file");
+    assert_eq!(brushes.len(), 2);
+    assert_eq!((brushes[0].width, brushes[0].height), (4, 2));
+    assert_eq!(brushes[0].coverage, [200, 200, 200, 200, 10, 20, 30, 40]);
+    // Settings follow the identifier, not the order they are written in.
+    assert_eq!(brushes[0].name.as_deref(), Some("Tiza"));
+    assert_eq!(brushes[0].diameter, Some(30.0));
+    assert_eq!(brushes[0].spacing, Some(0.25));
+    assert_eq!(brushes[1].name.as_deref(), Some("Hojas secas"));
+    assert_eq!(brushes[1].coverage, [0, 64, 128, 255, 255, 128, 64, 0]);
+    assert_eq!(brushes[1].spacing, Some(0.12));
+
+    // The old layout: a computed brush to skip, then a named sampled one.
+    let mut old = vec![0, 2, 0, 2];
+    old.extend([0, 1, 0, 0, 0, 3, 9, 9, 9]);
+    let mut body = vec![0, 0, 0, 0, 0, 40]; // unused, spacing 40 %
+    body.extend([0, 0, 0, 2, 0, b'O', 0, b'k']);
+    body.push(1);
+    body.extend([0; 8]);
+    for bound in [0u32, 0, 2, 3] {
+        body.extend(bound.to_be_bytes());
+    }
+    body.extend([0, 8, 0]);
+    body.extend([1, 2, 3, 4, 5, 6]);
+    old.extend([0, 2]);
+    old.extend((body.len() as u32).to_be_bytes());
+    old.extend(&body);
+    let brushes = read_abr(&old).expect("an old-style file");
+    assert_eq!(brushes.len(), 1);
+    assert_eq!(brushes[0].name.as_deref(), Some("Ok"));
+    assert_eq!((brushes[0].width, brushes[0].height, brushes[0].spacing), (3, 2, Some(0.4)));
+    assert_eq!(brushes[0].coverage, [1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn damaged_brush_files_are_rejected_without_panicking() {
+    assert!(read_abr(b"").is_err());
+    assert!(read_abr(b"not a brush file at all").is_err());
+    let mut file = vec![0, 6, 0, 2];
+    file.extend(abr_block(b"samp", &abr_sample("x", 4, 2, 8, false, &[1, 2, 3, 4, 5, 6, 7, 8])));
+    // Version 6.2 skips further than this entry is long, and every cut is safe.
+    for cut in 0..file.len() {
+        let _ = read_abr(&file[..cut]);
+    }
+    // Absurd sizes are refused rather than allocated.
+    let huge = abr_sample("x", 4_000_000, 4_000_000, 8, false, &[]);
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"samp", &huge));
+    assert!(read_abr(&file).is_err());
 }
