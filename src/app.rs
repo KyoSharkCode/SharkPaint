@@ -5,7 +5,11 @@ use eframe::egui::{
     Shape, Stroke, TextureFilter, TextureHandle, TextureOptions, TouchPhase, Vec2,
 };
 
-use sharkpaint::engine::{write_png, BrushPreset, BrushSettings, Document, IRect, StrokePoint};
+use std::path::PathBuf;
+
+use sharkpaint::engine::{
+    write_png, BrushPreset, BrushSettings, Document, IRect, StrokePoint, PROJECT_EXTENSION,
+};
 
 use crate::view::View;
 
@@ -22,6 +26,9 @@ enum Tool {
 #[derive(Clone, Copy, PartialEq)]
 enum Command {
     NewDialog,
+    Open,
+    Save,
+    SaveAs,
     ExportPng,
     Undo,
     Redo,
@@ -32,6 +39,15 @@ enum Command {
     Rotate(f32),
     ResetRotation,
     Flip,
+    Quit,
+}
+
+/// An action that discards the current drawing, held until unsaved changes
+/// are saved or explicitly dropped.
+#[derive(Clone, Copy, PartialEq)]
+enum Discarding {
+    New,
+    Open,
     Quit,
 }
 
@@ -68,16 +84,25 @@ pub struct SharkPaintApp {
     fit_pending: bool,
     new_dialog: Option<NewCanvasDialog>,
     status: String,
+    /// Project file the document was opened from or last saved to.
+    path: Option<PathBuf>,
+    /// Document revision at the last save or load.
+    saved_revision: u64,
+    /// Action waiting on the "unsaved changes" prompt.
+    confirm: Option<Discarding>,
+    /// The window may close even with unsaved changes (the user chose to).
+    allow_close: bool,
+    window_title: String,
 }
 
 impl SharkPaintApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open_path: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         // Ctrl +/- must zoom the canvas, not scale the whole interface.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let mut eraser = BrushPreset::Marcador.settings();
         eraser.opacity = 1.0;
-        SharkPaintApp {
+        let mut app = SharkPaintApp {
             doc: Document::new(DEFAULT_SIZE[0], DEFAULT_SIZE[1]),
             view: View::default(),
             texture: None,
@@ -98,6 +123,163 @@ impl SharkPaintApp {
             fit_pending: true,
             new_dialog: None,
             status: String::new(),
+            path: None,
+            saved_revision: 0,
+            confirm: None,
+            allow_close: false,
+            window_title: String::new(),
+        };
+        if let Some(path) = open_path {
+            app.load_project(path);
+        }
+        app
+    }
+
+    fn modified(&self) -> bool {
+        self.doc.revision() != self.saved_revision
+    }
+
+    fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
+        self.saved_revision = doc.revision();
+        self.doc = doc;
+        self.path = path;
+        self.texture = None;
+        self.view = View::default();
+        self.fit_pending = true;
+        self.pending_start = None;
+    }
+
+    fn load_project(&mut self, path: PathBuf) {
+        match Document::load(&path) {
+            Ok(doc) => {
+                self.status = format!("Abierto: {}", path.display());
+                self.replace_document(doc, Some(path));
+            }
+            Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+        }
+    }
+
+    /// Saves to the current project file, asking for one if there is none.
+    /// Returns whether the document is now saved.
+    fn save_project(&mut self, ask_path: bool) -> bool {
+        self.doc.end_stroke();
+        let path = match (&self.path, ask_path) {
+            (Some(path), false) => path.clone(),
+            _ => {
+                let name = self
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("dibujo.{PROJECT_EXTENSION}"));
+                let Some(mut path) = rfd::FileDialog::new()
+                    .set_title("Guardar proyecto")
+                    .add_filter("Proyecto de SharkPaint", &[PROJECT_EXTENSION])
+                    .set_file_name(name)
+                    .save_file()
+                else {
+                    return false;
+                };
+                if path.extension().is_none() {
+                    path.set_extension(PROJECT_EXTENSION);
+                }
+                path
+            }
+        };
+        match self.doc.save(&path) {
+            Ok(()) => {
+                self.status = format!("Guardado: {}", path.display());
+                self.saved_revision = self.doc.revision();
+                self.path = Some(path);
+                true
+            }
+            Err(e) => {
+                self.status = format!("No se pudo guardar: {e}");
+                false
+            }
+        }
+    }
+
+    /// Runs an action that discards the drawing, asking first if it has unsaved changes.
+    fn discarding(&mut self, action: Discarding, ctx: &egui::Context) {
+        if self.modified() {
+            self.confirm = Some(action);
+        } else {
+            self.discard_and(action, ctx);
+        }
+    }
+
+    fn discard_and(&mut self, action: Discarding, ctx: &egui::Context) {
+        match action {
+            Discarding::New => {
+                self.new_dialog = Some(NewCanvasDialog { width: self.doc.width, height: self.doc.height });
+            }
+            Discarding::Open => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Abrir proyecto")
+                    .add_filter("Proyecto de SharkPaint", &[PROJECT_EXTENSION])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.load_project(path);
+                }
+            }
+            Discarding::Quit => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.confirm else { return };
+        let mut choice = None;
+        egui::Window::new("Cambios sin guardar")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("El dibujo tiene cambios sin guardar. ¿Quieres guardarlos antes de continuar?");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Guardar").clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.button("No guardar").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        choice = Some(2);
+                    }
+                });
+            });
+        match choice {
+            Some(0) => {
+                self.confirm = None;
+                if self.save_project(false) {
+                    self.discard_and(action, ctx);
+                }
+            }
+            Some(1) => {
+                self.confirm = None;
+                self.discard_and(action, ctx);
+            }
+            Some(2) => self.confirm = None,
+            _ => {}
+        }
+    }
+
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Sin título".to_owned());
+        let mark = if self.modified() { "*" } else { "" };
+        let title = format!("{name}{mark} — SharkPaint");
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
         }
     }
 
@@ -126,7 +308,16 @@ impl SharkPaintApp {
             if hit(cmd, Key::Z) {
                 commands.push(Command::Undo);
             }
+            if hit(cmd | egui::Modifiers::SHIFT, Key::S) {
+                commands.push(Command::SaveAs);
+            }
             if hit(cmd, Key::S) {
+                commands.push(Command::Save);
+            }
+            if hit(cmd, Key::O) {
+                commands.push(Command::Open);
+            }
+            if hit(cmd, Key::E) {
                 commands.push(Command::ExportPng);
             }
             if hit(cmd, Key::N) {
@@ -181,7 +372,17 @@ impl SharkPaintApp {
                 if ui.add(egui::Button::new("Nuevo lienzo…").shortcut_text("Ctrl+N")).clicked() {
                     commands.push(Command::NewDialog);
                 }
-                if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+S")).clicked() {
+                if ui.add(egui::Button::new("Abrir…").shortcut_text("Ctrl+O")).clicked() {
+                    commands.push(Command::Open);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Guardar").shortcut_text("Ctrl+S")).clicked() {
+                    commands.push(Command::Save);
+                }
+                if ui.add(egui::Button::new("Guardar como…").shortcut_text("Ctrl+Mayús+S")).clicked() {
+                    commands.push(Command::SaveAs);
+                }
+                if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+E")).clicked() {
                     commands.push(Command::ExportPng);
                 }
                 ui.separator();
@@ -620,18 +821,14 @@ impl SharkPaintApp {
                     }
                 });
                 ui.add_space(4.0);
-                ui.label("El dibujo actual se descartará. Expórtalo antes si quieres conservarlo.");
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     create = ui.button("Crear").clicked();
                     cancel = ui.button("Cancelar").clicked();
                 });
             });
         if create {
-            self.doc = Document::new(dialog.width, dialog.height);
-            self.texture = None;
-            self.view = View::default();
-            self.fit_pending = true;
+            let doc = Document::new(dialog.width, dialog.height);
+            self.replace_document(doc, None);
             self.status.clear();
         }
         if create || cancel {
@@ -663,8 +860,13 @@ impl SharkPaintApp {
         let viewport = self.viewport;
         let doc_size = self.doc_size();
         match command {
-            Command::NewDialog => {
-                self.new_dialog = Some(NewCanvasDialog { width: self.doc.width, height: self.doc.height });
+            Command::NewDialog => self.discarding(Discarding::New, ctx),
+            Command::Open => self.discarding(Discarding::Open, ctx),
+            Command::Save => {
+                self.save_project(false);
+            }
+            Command::SaveAs => {
+                self.save_project(true);
             }
             Command::ExportPng => self.export_png(),
             Command::Undo => {
@@ -683,7 +885,7 @@ impl SharkPaintApp {
             Command::Rotate(degrees) => self.view.rotate_by(degrees.to_radians(), viewport, doc_size),
             Command::ResetRotation => self.view.rotate_by(-self.view.rotation, viewport, doc_size),
             Command::Flip => self.view.flip = !self.view.flip,
-            Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Quit => self.discarding(Discarding::Quit, ctx),
         }
     }
 }
@@ -710,7 +912,14 @@ impl eframe::App for SharkPaintApp {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.canvas(ui));
 
+        // Closing the window with unsaved changes asks first.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.modified() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Discarding::Quit);
+        }
         self.new_canvas_window(&ctx);
+        self.confirm_window(&ctx);
+        self.update_window_title(&ctx);
         for command in commands {
             self.run(command, &ctx);
         }

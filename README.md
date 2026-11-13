@@ -10,7 +10,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Cuatro pinceles iniciales: Lápiz, Tinta, Marcador y Aerógrafo, todos ajustables
   (tamaño, opacidad, flujo, dureza, espaciado y estabilizador).
 - Borrador, cuentagotas, deshacer y rehacer (200 pasos).
-- Exportación a PNG.
+- Proyectos en formato propio (`.shp`) que conservan la precisión completa del
+  dibujo, y exportación a PNG.
+- Aviso antes de descartar cambios sin guardar.
 
 ## Pendiente
 
@@ -18,7 +20,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
   de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
   referencia. No se incluyen al exportar.
-- Guardado de proyecto e instalador.
+- Instalador con asociación de archivos `.shp` y descarga fija (versión 0.1.0).
 
 ## Atajos
 
@@ -34,7 +36,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `5` | Restablecer la rotación |
 | `M` | Voltear horizontalmente |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
-| `Ctrl+S` | Exportar PNG |
+| `Ctrl+O` | Abrir proyecto |
+| `Ctrl+S` / `Ctrl+Mayús+S` | Guardar / Guardar como |
+| `Ctrl+E` | Exportar PNG |
 | `Ctrl+N` | Nuevo lienzo |
 
 ## Tableta gráfica
@@ -63,4 +67,14 @@ cargo test
 - `src/engine/`: motor de pintura (capas en mosaicos, pincel, historial), sin
   dependencias de interfaz.
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
+- `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
 - `examples/muestra.rs`: genera una hoja de muestra de los pinceles sin abrir ventana.
+- `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
+
+## Licencia y contribuciones
+
+SharkPaint es software libre bajo la licencia GPL 3.0 (ver [LICENSE](LICENSE)). El
+nombre y el icono tienen su propia política: ver [MARCA.md](MARCA.md).
+
+No se aceptan *pull requests* externos; los reportes de errores y las ideas son
+bienvenidos como *issues*. Ver [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -3,7 +3,8 @@ name = "sharkpaint"
 version = "0.1.0"
 edition = "2021"
 description = "Aplicación nativa de dibujo y pintura digital"
-license = "MIT"
+license = "GPL-3.0-only"
+build = "build.rs"
 
 [lib]
 name = "sharkpaint"
@@ -15,8 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.37"
+flate2 = "1"
 png = "0.18"
 rfd = "0.18"
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.dev]
 opt-level = 1

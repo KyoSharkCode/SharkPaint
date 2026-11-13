@@ -150,3 +150,50 @@ fn clear_layer_is_undoable() {
     doc.undo();
     assert_eq!(pixel(&doc, 50, 50), [0, 0, 0, 255]);
 }
+
+#[test]
+fn project_round_trips_through_the_file_format() {
+    let mut doc = Document::new(300, 200);
+    doc.paper = [250, 240, 230];
+    line(&mut doc, &BrushPreset::Aerografo.settings(), [200, 30, 90], false, (20.0, 40.0), (280.0, 160.0));
+    line(&mut doc, &hard_brush(12.0), [10, 80, 160], false, (20.0, 160.0), (280.0, 40.0));
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!((loaded.width, loaded.height, loaded.paper), (300, 200, [250, 240, 230]));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    // Full 15-bit precision survives, not just the 8-bit preview.
+    for (x, y) in [(150, 100), (60, 60), (240, 140)] {
+        assert_eq!(loaded.layers[0].pixel(x, y), doc.layers[0].pixel(x, y));
+    }
+    // A loaded project starts with a clean history.
+    assert!(!loaded.can_undo());
+}
+
+#[test]
+fn damaged_project_files_are_rejected() {
+    let mut doc = Document::new(100, 100);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 50.0), (90.0, 50.0));
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+
+    assert!(Document::read_from(&mut &b"esto no es un proyecto"[..]).is_err());
+    assert!(Document::read_from(&mut &bytes[..bytes.len() / 2]).is_err());
+    let mut wrong_version = bytes.clone();
+    wrong_version[8] = 99;
+    assert!(Document::read_from(&mut wrong_version.as_slice()).is_err());
+    let mut huge = bytes.clone();
+    huge[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(Document::read_from(&mut huge.as_slice()).is_err());
+}
+
+#[test]
+fn revision_tracks_pixel_changes() {
+    let mut doc = Document::new(100, 100);
+    let r0 = doc.revision();
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 50.0), (90.0, 50.0));
+    let r1 = doc.revision();
+    assert_ne!(r0, r1);
+    doc.undo();
+    assert_ne!(doc.revision(), r1);
+}

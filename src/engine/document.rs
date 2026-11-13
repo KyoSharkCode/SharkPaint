@@ -26,6 +26,8 @@ pub struct Document {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     dirty: IRect,
+    /// Changes every time the pixels change; lets the UI detect unsaved work.
+    revision: u64,
 }
 
 impl Document {
@@ -41,11 +43,17 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
+            revision: 0,
         }
     }
 
     pub fn bounds(&self) -> IRect {
         IRect::new(0, 0, self.width as i32, self.height as i32)
+    }
+
+    /// A counter that changes whenever the document's pixels change.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn is_stroking(&self) -> bool {
@@ -191,6 +199,7 @@ impl Document {
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
+        self.revision += 1;
         self.undo.push(entry);
         self.redo.clear();
         if self.undo.len() > MAX_UNDO_STEPS {
@@ -199,6 +208,7 @@ impl Document {
     }
 
     fn swap_entry(&mut self, entry: &mut HistoryEntry) {
+        self.revision += 1;
         let layer = &mut self.layers[entry.layer];
         let tiles_x = layer.tiles_x;
         let mut rect = EMPTY;
