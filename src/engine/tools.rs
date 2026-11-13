@@ -463,3 +463,206 @@ impl Document {
         self.mark_dirty(self.bounds());
     }
 }
+
+// --- Scaling and rotating a layer -------------------------------------------
+
+/// Placement of a layer's contents relative to where they were: scaled and
+/// rotated about the centre of their bounding box, then shifted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerTransform {
+    pub scale: (f32, f32),
+    /// Clockwise, in radians.
+    pub rotation: f32,
+    pub offset: (f32, f32),
+}
+
+impl LayerTransform {
+    pub const IDENTITY: LayerTransform = LayerTransform { scale: (1.0, 1.0), rotation: 0.0, offset: (0.0, 0.0) };
+}
+
+pub(super) struct TransformSession {
+    layer: usize,
+    original: Vec<Option<Arc<Tile>>>,
+    bounds: IRect,
+    current: LayerTransform,
+}
+
+impl Document {
+    /// The transform in progress is still open.
+    pub fn is_transforming(&self) -> bool {
+        self.transforming.is_some()
+    }
+
+    /// Starts transforming the active layer. Returns the bounding box of its
+    /// contents, or `None` (and starts nothing) if the layer is empty.
+    pub fn begin_transform(&mut self) -> Option<IRect> {
+        self.end_stroke();
+        let li = self.active_layer;
+        let bounds = content_bounds(&self.layers[li])?;
+        self.transforming = Some(TransformSession {
+            layer: li,
+            original: self.layers[li].tiles.clone(),
+            bounds,
+            current: LayerTransform::IDENTITY,
+        });
+        Some(bounds)
+    }
+
+    /// Redraws the layer from its original contents with `transform` applied.
+    pub fn set_transform(&mut self, transform: LayerTransform) {
+        let Some(session) = &mut self.transforming else { return };
+        if session.current == transform {
+            return;
+        }
+        session.current = transform;
+        let layer = &mut self.layers[session.layer];
+        layer.tiles = if transform == LayerTransform::IDENTITY {
+            session.original.clone()
+        } else {
+            transformed(layer, &session.original, session.bounds, transform)
+        };
+        self.mark_dirty(self.bounds());
+    }
+
+    pub(super) fn end_transform(&mut self) {
+        if let Some(session) = self.transforming.take() {
+            if session.current == LayerTransform::IDENTITY {
+                return;
+            }
+            let now = &self.layers[session.layer].tiles;
+            let saved: Vec<_> = session
+                .original
+                .into_iter()
+                .enumerate()
+                .filter(|(i, orig)| orig.is_some() || now[*i].is_some())
+                .collect();
+            self.commit_tiles(session.layer, saved);
+        }
+    }
+
+    pub(super) fn cancel_transform(&mut self) {
+        if let Some(session) = self.transforming.take() {
+            self.layers[session.layer].tiles = session.original;
+            self.mark_dirty(self.bounds());
+        }
+    }
+}
+
+/// Smallest rectangle containing every non-transparent pixel of the layer.
+fn content_bounds(layer: &Layer) -> Option<IRect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for ty in 0..layer.tiles_y {
+        for tx in 0..layer.tiles_x {
+            let Some(tile) = &layer.tiles[layer.tile_index(tx, ty)] else { continue };
+            for py in 0..TILE {
+                for px in 0..TILE {
+                    if tile.0[py * TILE + px][3] != 0 {
+                        let (x, y) = (tx * TILE + px, ty * TILE + py);
+                        x0 = x0.min(x);
+                        x1 = x1.max(x);
+                        y0 = y0.min(y);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+        }
+    }
+    (x0 != usize::MAX).then(|| IRect::new(x0 as i32, y0 as i32, x1 as i32 + 1, y1 as i32 + 1))
+}
+
+/// The tile table of `layer` with `original` contents scaled, rotated and
+/// shifted. Each destination pixel samples the original with bilinear
+/// filtering; tiles are computed on several threads.
+fn transformed(layer: &Layer, original: &[Option<Arc<Tile>>], bounds: IRect, t: LayerTransform) -> Vec<Option<Arc<Tile>>> {
+    let (sx, sy) = (t.scale.0.abs().max(1e-4), t.scale.1.abs().max(1e-4));
+    let (sin, cos) = t.rotation.sin_cos();
+    let centre = ((bounds.x0 + bounds.x1) as f32 * 0.5, (bounds.y0 + bounds.y1) as f32 * 0.5);
+    let moved = (centre.0 + t.offset.0, centre.1 + t.offset.1);
+    let half = (bounds.width() as f32 * 0.5, bounds.height() as f32 * 0.5);
+
+    // Where the box ends up, to know which tiles can receive pixels.
+    let (mut dx0, mut dy0, mut dx1, mut dy1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (cx, cy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let (lx, ly) = (cx * half.0 * sx, cy * half.1 * sy);
+        let (x, y) = (moved.0 + lx * cos - ly * sin, moved.1 + lx * sin + ly * cos);
+        dx0 = dx0.min(x);
+        dx1 = dx1.max(x);
+        dy0 = dy0.min(y);
+        dy1 = dy1.max(y);
+    }
+    let dest = IRect::new(dx0.floor() as i32 - 1, dy0.floor() as i32 - 1, dx1.ceil() as i32 + 1, dy1.ceil() as i32 + 1)
+        .intersect(&layer.bounds());
+    let mut out: Vec<Option<Arc<Tile>>> = vec![None; original.len()];
+    if dest.is_empty() {
+        return out;
+    }
+
+    let (width, height, tiles_x) = (layer.width as i32, layer.height as i32, layer.tiles_x);
+    let fetch = |x: i32, y: i32| -> Px {
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return [0; 4];
+        }
+        let (x, y) = (x as usize, y as usize);
+        match &original[(y / TILE) * tiles_x + x / TILE] {
+            Some(tile) => tile.0[(y % TILE) * TILE + x % TILE],
+            None => [0; 4],
+        }
+    };
+    let render_tile = |tx: usize, ty: usize| -> Option<Tile> {
+        let mut tile = Tile::empty();
+        let mut any = false;
+        let (ox, oy) = ((tx * TILE) as i32, (ty * TILE) as i32);
+        for py in (dest.y0.max(oy) - oy)..(dest.y1.min(oy + TILE as i32) - oy) {
+            for px in (dest.x0.max(ox) - ox)..(dest.x1.min(ox + TILE as i32) - ox) {
+                // Destination pixel centre, back through the transform.
+                let (rx, ry) = ((ox + px) as f32 + 0.5 - moved.0, (oy + py) as f32 + 0.5 - moved.1);
+                let (lx, ly) = ((rx * cos + ry * sin) / sx, (-rx * sin + ry * cos) / sy);
+                if lx.abs() > half.0 + 1.0 || ly.abs() > half.1 + 1.0 {
+                    continue;
+                }
+                let (fx, fy) = (centre.0 + lx - 0.5, centre.1 + ly - 0.5);
+                let (x0, y0) = (fx.floor(), fy.floor());
+                let (wx, wy) = (fx - x0, fy - y0);
+                let (x0, y0) = (x0 as i32, y0 as i32);
+                let (a, b, c, d) = (fetch(x0, y0), fetch(x0 + 1, y0), fetch(x0, y0 + 1), fetch(x0 + 1, y0 + 1));
+                if a[3] | b[3] | c[3] | d[3] == 0 {
+                    continue;
+                }
+                let px_out: Px = std::array::from_fn(|i| {
+                    let top = a[i] as f32 + (b[i] as f32 - a[i] as f32) * wx;
+                    let bottom = c[i] as f32 + (d[i] as f32 - c[i] as f32) * wx;
+                    (top + (bottom - top) * wy).round().clamp(0.0, ONE as f32) as u16
+                });
+                if px_out[3] != 0 {
+                    tile.0[py as usize * TILE + px as usize] = px_out;
+                    any = true;
+                }
+            }
+        }
+        any.then_some(tile)
+    };
+
+    let targets: Vec<(usize, usize)> = (dest.y0 as usize / TILE..=(dest.y1 as usize - 1) / TILE)
+        .flat_map(|ty| (dest.x0 as usize / TILE..=(dest.x1 as usize - 1) / TILE).map(move |tx| (tx, ty)))
+        .collect();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let chunk = targets.len().div_ceil(workers).max(1);
+    let rendered: Vec<Vec<(usize, Tile)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .chunks(chunk)
+            .map(|part| {
+                let render_tile = &render_tile;
+                scope.spawn(move || {
+                    part.iter()
+                        .filter_map(|&(tx, ty)| render_tile(tx, ty).map(|tile| (ty * tiles_x + tx, tile)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("transform worker panicked")).collect()
+    });
+    for (idx, tile) in rendered.into_iter().flatten() {
+        out[idx] = Some(Arc::new(tile));
+    }
+    out
+}

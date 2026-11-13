@@ -1,4 +1,6 @@
-use sharkpaint::engine::{BlendMode, BrushPreset, BrushSettings, Document, IRect, StrokePoint};
+use sharkpaint::engine::{
+    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
+};
 
 fn hard_brush(size: f32) -> BrushSettings {
     BrushSettings {
@@ -541,4 +543,89 @@ fn inserted_images_become_an_undoable_layer() {
     // An image hanging off the canvas is clipped rather than rejected.
     doc.add_image_layer("borde", 4, 2, &image, 98, -1);
     assert_eq!(pixel(&doc, 98, 0), [255, 0, 0, 255]);
+}
+
+/// A 40 × 20 opaque red block with its top-left corner at (30, 40).
+fn doc_with_block() -> Document {
+    let mut doc = Document::new(200, 200);
+    let block: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(40 * 20).flatten().collect();
+    doc.add_image_layer("bloque", 40, 20, &block, 30, 40);
+    doc
+}
+
+fn red(doc: &Document, x: i32, y: i32) -> bool {
+    pixel(doc, x, y) == [255, 0, 0, 255]
+}
+
+#[test]
+fn transform_scales_rotates_and_moves_a_layer() {
+    let mut doc = doc_with_block();
+    assert_eq!(doc.begin_transform(), Some(IRect::new(30, 40, 70, 60)));
+
+    // Identity leaves every pixel exactly as it was.
+    let before = doc.render_rgba8(doc.bounds());
+    doc.set_transform(LayerTransform { scale: (1.0, 1.0), rotation: 0.0, offset: (0.0, 0.0) });
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // Twice the size about its centre (50, 50): now 80 × 40, from (10, 30).
+    doc.set_transform(LayerTransform { scale: (2.0, 2.0), rotation: 0.0, offset: (0.0, 0.0) });
+    assert!(red(&doc, 12, 32) && red(&doc, 88, 68));
+    assert!(!red(&doc, 8, 50) && !red(&doc, 50, 28) && !red(&doc, 92, 50));
+
+    // A quarter turn makes the wide block tall: 20 × 40 around the same centre.
+    doc.set_transform(LayerTransform { scale: (1.0, 1.0), rotation: std::f32::consts::FRAC_PI_2, offset: (0.0, 0.0) });
+    assert!(red(&doc, 50, 32) && red(&doc, 50, 68) && red(&doc, 42, 50) && red(&doc, 58, 50));
+    assert!(!red(&doc, 35, 50) && !red(&doc, 65, 50));
+
+    // Each setting starts from the original, so nothing accumulates or blurs.
+    doc.set_transform(LayerTransform { scale: (1.0, 1.0), rotation: 0.0, offset: (100.0, 80.0) });
+    assert!(red(&doc, 131, 121) && red(&doc, 168, 138));
+    assert!(!red(&doc, 50, 50));
+    doc.end_stroke();
+    assert!(!doc.is_transforming());
+
+    // The whole transform is one undo step back to the starting picture.
+    assert!(doc.undo());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+}
+
+#[test]
+fn transform_can_be_cancelled_and_needs_content() {
+    let mut doc = doc_with_block();
+    let before = doc.render_rgba8(doc.bounds());
+    let revision = doc.revision();
+    doc.begin_transform();
+    doc.set_transform(LayerTransform { scale: (3.0, 0.5), rotation: 0.7, offset: (20.0, -10.0) });
+    assert_ne!(doc.render_rgba8(doc.bounds()), before);
+    doc.cancel_stroke();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.revision(), revision);
+
+    // Ending without changing anything adds no undo step.
+    doc.begin_transform();
+    doc.end_stroke();
+    assert_eq!(doc.revision(), revision);
+
+    // An empty layer has nothing to transform.
+    doc.add_layer();
+    assert_eq!(doc.begin_transform(), None);
+    assert!(!doc.is_transforming());
+}
+
+#[test]
+fn transform_keeps_soft_edges_when_rotated() {
+    let mut doc = doc_with_block();
+    doc.begin_transform();
+    doc.set_transform(LayerTransform { scale: (1.5, 1.5), rotation: 0.5, offset: (40.0, 40.0) });
+    doc.end_stroke();
+    // Some edge pixels are partly covered rather than all-or-nothing.
+    let layer = &doc.layers()[1];
+    let partial = (0..200).flat_map(|y| (0..200).map(move |x| (x, y)))
+        .filter(|&(x, y)| { let a = layer.pixel(x, y)[3]; a > 2000 && a < 30000 })
+        .count();
+    assert!(partial > 40, "expected anti-aliased edges, found {partial} partial pixels");
+    // The area is close to 1.5² times the original 800 pixels.
+    let area: f64 = (0..200).flat_map(|y| (0..200).map(move |x| (x, y)))
+        .map(|(x, y)| layer.pixel(x, y)[3] as f64 / 32768.0).sum();
+    assert!((area - 1800.0).abs() < 60.0, "area {area}");
 }

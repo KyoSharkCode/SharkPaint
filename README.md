@@ -13,7 +13,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
-  todas las capas), cuentagotas y mover capa.
+  todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
+  caja sobre el lienzo).
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
@@ -37,6 +38,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 |---|---|
 | `B` / `E` / `D` | Pincel / Borrador / Difuminar |
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
+| `T` | Transformar capa (`Intro` aplica, `Esc` cancela) |
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |
 | `F5`, o clic en la herramienta activa | Mostrar u ocultar los ajustes del pincel |
@@ -93,7 +95,7 @@ cargo test
   dependencias de interfaz.
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
-- `src/engine/tools.rs`: relleno, difuminar y mover capa.
+- `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
 - `examples/muestra.rs`: genera una hoja de muestra de los pinceles sin abrir ventana.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).

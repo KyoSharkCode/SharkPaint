@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::brush::BrushSettings;
 use super::layer::{blend_over, IRect, Layer, LayerProps, Tile, ONE, TILE};
 use super::stroke::{ActiveStroke, StrokePoint};
-use super::tools::{MoveSession, SmudgeStroke};
+use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
 const MAX_UNDO_STEPS: usize = 200;
 const EMPTY: IRect = IRect { x0: 0, y0: 0, x1: 0, y1: 0 };
@@ -33,6 +33,7 @@ pub struct Document {
     stroke: Option<ActiveStroke>,
     pub(super) smudge: Option<SmudgeStroke>,
     pub(super) moving: Option<MoveSession>,
+    pub(super) transforming: Option<TransformSession>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     dirty: IRect,
@@ -69,6 +70,7 @@ impl Document {
             stroke: None,
             smudge: None,
             moving: None,
+            transforming: None,
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
@@ -227,7 +229,7 @@ impl Document {
 
     /// A brush stroke, smudge or layer move is in progress.
     pub fn is_stroking(&self) -> bool {
-        self.stroke.is_some() || self.smudge.is_some() || self.moving.is_some()
+        self.stroke.is_some() || self.smudge.is_some() || self.moving.is_some() || self.transforming.is_some()
     }
 
     pub fn begin_stroke(&mut self, brush: &BrushSettings, color: [u8; 3], erase: bool, p: StrokePoint) {
@@ -255,6 +257,7 @@ impl Document {
     pub fn end_stroke(&mut self) {
         self.end_smudge();
         self.end_layer_move();
+        self.end_transform();
         if let Some(mut stroke) = self.stroke.take() {
             let rect = stroke.finish(&mut self.layers[stroke.layer]);
             self.mark_dirty(rect);
@@ -276,6 +279,7 @@ impl Document {
     pub fn cancel_stroke(&mut self) {
         self.cancel_smudge();
         self.cancel_layer_move();
+        self.cancel_transform();
         if let Some(stroke) = self.stroke.take() {
             let layer = stroke.layer;
             let rect = stroke.revert(&mut self.layers[layer]);

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, StrokePoint,
+    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
     PROJECT_EXTENSION,
 };
 
@@ -30,17 +30,19 @@ enum Tool {
     Relleno,
     Cuentagotas,
     Mover,
+    Transformar,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 6] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 7] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
         (Tool::Relleno, "relleno", "Relleno", "G"),
         (Tool::Cuentagotas, "cuentagotas", "Cuentagotas", "I"),
         (Tool::Mover, "mover", "Mover capa", "V"),
+        (Tool::Transformar, "transformar", "Transformar", "T"),
     ];
 
     fn name(self) -> &'static str {
@@ -50,6 +52,92 @@ impl Tool {
     /// The tool paints with a round tip whose size the cursor shows.
     fn has_tip(self) -> bool {
         matches!(self, Tool::Pincel | Tool::Borrador | Tool::Difuminar)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TransformDrag {
+    Move,
+    Rotate,
+    /// Dragging the corner with these signs (-1 or 1 on each axis).
+    Scale(f32, f32),
+}
+
+/// The on-canvas box of the transform tool.
+struct TransformBox {
+    /// Bounding box of the layer's contents before the transform, in canvas pixels.
+    bounds: Rect,
+    transform: LayerTransform,
+    /// What is being dragged, where the drag began and the transform at that moment.
+    drag: Option<(TransformDrag, Pos2, LayerTransform)>,
+}
+
+impl TransformBox {
+    fn rotate(v: Vec2, angle: f32) -> Vec2 {
+        let (s, c) = angle.sin_cos();
+        Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    }
+
+    fn center_of(&self, t: &LayerTransform) -> Pos2 {
+        self.bounds.center() + Vec2::new(t.offset.0, t.offset.1)
+    }
+
+    /// Canvas position of the corner with the given signs.
+    fn corner_of(&self, t: &LayerTransform, sx: f32, sy: f32) -> Pos2 {
+        let half = self.bounds.size() * 0.5;
+        self.center_of(t) + Self::rotate(Vec2::new(sx * half.x * t.scale.0, sy * half.y * t.scale.1), t.rotation)
+    }
+
+    fn corners(&self) -> [Pos2; 4] {
+        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| self.corner_of(&self.transform, x, y))
+    }
+
+    fn contains(&self, canvas: Pos2) -> bool {
+        let t = &self.transform;
+        let local = Self::rotate(canvas - self.center_of(t), -t.rotation);
+        let half = self.bounds.size() * 0.5;
+        local.x.abs() <= half.x * t.scale.0 && local.y.abs() <= half.y * t.scale.1
+    }
+
+    /// Updates the transform for a drag that has reached `canvas`.
+    fn drag_to(&mut self, canvas: Pos2, free: bool) {
+        let Some((kind, from, start)) = self.drag else { return };
+        let half = self.bounds.size() * 0.5;
+        let mut t = start;
+        match kind {
+            TransformDrag::Move => {
+                let d = canvas - from;
+                t.offset = (start.offset.0 + d.x, start.offset.1 + d.y);
+            }
+            TransformDrag::Rotate => {
+                let center = self.center_of(&start);
+                let turned = (canvas - center).angle() - (from - center).angle();
+                t.rotation = start.rotation + turned;
+                if free {
+                    // Shift snaps to steps of 15°.
+                    let step = 15f32.to_radians();
+                    t.rotation = (t.rotation / step).round() * step;
+                }
+            }
+            TransformDrag::Scale(sx, sy) => {
+                // The opposite corner stays where it is.
+                let anchor = self.corner_of(&start, -sx, -sy);
+                let reach = Self::rotate(canvas - anchor, -start.rotation);
+                let mut scale_x = (reach.x * sx / (2.0 * half.x)).max(0.01);
+                let mut scale_y = (reach.y * sy / (2.0 * half.y)).max(0.01);
+                if !free {
+                    // Keep the proportions unless Shift is held.
+                    let ratio = (scale_x / start.scale.0).max(scale_y / start.scale.1);
+                    scale_x = start.scale.0 * ratio;
+                    scale_y = start.scale.1 * ratio;
+                }
+                t.scale = (scale_x, scale_y);
+                let center = anchor + Self::rotate(Vec2::new(sx * half.x * scale_x, sy * half.y * scale_y), start.rotation);
+                let moved = center - self.bounds.center();
+                t.offset = (moved.x, moved.y);
+            }
+        }
+        self.transform = t;
     }
 }
 
@@ -79,6 +167,7 @@ enum Command {
     Flip,
     ToggleBrushWindow,
     Fullscreen,
+    FinishTransform(bool),
     Quit,
 }
 
@@ -117,6 +206,10 @@ pub struct SharkPaintApp {
     move_origin: Option<Pos2>,
     /// The eyedropper is being dragged.
     picking: bool,
+    /// The transform tool's box, while a transform is open.
+    xform: Option<TransformBox>,
+    /// Layer (id, version) found empty, so the transform tool does not rescan it.
+    xform_empty: Option<(u64, u64)>,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -198,6 +291,8 @@ impl SharkPaintApp {
             fill_all_layers: true,
             move_origin: None,
             picking: false,
+            xform: None,
+            xform_empty: None,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -494,6 +589,14 @@ impl SharkPaintApp {
             if hit(none, Key::F) {
                 commands.push(Command::Flip);
             }
+            if self.tool == Tool::Transformar && self.xform.is_some() {
+                if hit(none, Key::Enter) {
+                    commands.push(Command::FinishTransform(true));
+                }
+                if hit(none, Key::Escape) {
+                    commands.push(Command::FinishTransform(false));
+                }
+            }
             if hit(none, Key::F11) {
                 commands.push(Command::Fullscreen);
             }
@@ -507,6 +610,7 @@ impl SharkPaintApp {
                 (Tool::Relleno, Key::G),
                 (Tool::Cuentagotas, Key::I),
                 (Tool::Mover, Key::V),
+                (Tool::Transformar, Key::T),
             ] {
                 if hit(none, key) {
                     self.tool = tool;
@@ -641,6 +745,7 @@ impl SharkPaintApp {
                     for (keys, what) in [
                         ("B / E / D", "Pincel / Borrador / Difuminar"),
                         ("G / I / V", "Relleno / Cuentagotas / Mover capa"),
+                        ("T", "Transformar (Intro aplica, Esc cancela)"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
@@ -726,6 +831,89 @@ impl SharkPaintApp {
         });
     }
 
+    fn transform_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(xform) = &mut self.xform else {
+            ui.label("La capa activa está vacía u oculta: no hay nada que transformar.");
+            return;
+        };
+        let mut t = xform.transform;
+        let (mut width, mut height) = (t.scale.0 * 100.0, t.scale.1 * 100.0);
+        let mut degrees = t.rotation.to_degrees();
+        egui::Grid::new("transformar").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Ancho");
+            ui.add(egui::DragValue::new(&mut width).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" %"));
+            ui.end_row();
+            ui.label("Alto");
+            ui.add(egui::DragValue::new(&mut height).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" %"));
+            ui.end_row();
+            ui.label("Rotación");
+            ui.add(egui::DragValue::new(&mut degrees).speed(0.5).fixed_decimals(1).suffix("°"));
+            ui.end_row();
+        });
+        t.scale = (width / 100.0, height / 100.0);
+        t.rotation = degrees.to_radians();
+        let mut apply = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            apply = ui.button("Aplicar").on_hover_text("Intro").clicked();
+            cancel = ui.button("Cancelar").on_hover_text("Esc").clicked();
+            if ui.button("Restablecer").clicked() {
+                t = LayerTransform::IDENTITY;
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("Esquinas: cambiar tamaño (Mayús: sin mantener proporción).");
+        ui.label("Dentro de la caja: mover. Fuera: rotar (Mayús: de 15° en 15°).");
+        if t != xform.transform {
+            xform.transform = t;
+            self.doc.set_transform(t);
+        }
+        if apply {
+            self.finish_transform(true);
+        } else if cancel {
+            self.finish_transform(false);
+        }
+    }
+
+    /// Applies or discards the open transform.
+    fn finish_transform(&mut self, apply: bool) {
+        if self.xform.take().is_some() {
+            if apply {
+                self.doc.end_stroke();
+            } else {
+                self.doc.cancel_stroke();
+            }
+        }
+    }
+
+    /// Opens a transform on the active layer while the transform tool is
+    /// selected, and applies it when the tool is put away.
+    fn sync_transform(&mut self) {
+        if self.tool != Tool::Transformar {
+            self.finish_transform(true);
+            return;
+        }
+        if self.xform.is_some() && !self.doc.is_transforming() {
+            self.xform = None; // something else (undo, saving…) closed it
+        }
+        if self.xform.is_none() && self.doc.active().props.visible {
+            let key = (self.doc.active().id, self.doc.active().version);
+            if self.xform_empty == Some(key) {
+                return;
+            }
+            match self.doc.begin_transform() {
+                Some(b) => {
+                    let bounds = Rect::from_min_max(
+                        Pos2::new(b.x0 as f32, b.y0 as f32),
+                        Pos2::new(b.x1 as f32, b.y1 as f32),
+                    );
+                    self.xform = Some(TransformBox { bounds, transform: LayerTransform::IDENTITY, drag: None });
+                }
+                None => self.xform_empty = Some(key),
+            }
+        }
+    }
+
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
@@ -758,6 +946,10 @@ impl SharkPaintApp {
             }
             Tool::Mover => {
                 ui.label("Arrastra sobre el lienzo para mover el contenido de la capa activa.");
+                return;
+            }
+            Tool::Transformar => {
+                self.transform_panel(ui);
                 return;
             }
         }
@@ -1203,6 +1395,10 @@ impl SharkPaintApp {
             }
         }
 
+        self.sync_transform();
+        let free = ctx.input(|i| i.modifiers.shift);
+        let mut transform_changed = false;
+
         // --- Painting -------------------------------------------------------
         // Every input sample of the frame is replayed in order so fast strokes
         // keep all their points, each with the pressure that arrived with it.
@@ -1286,6 +1482,25 @@ impl SharkPaintApp {
                             self.move_origin = Some(c);
                             continue;
                         }
+                        Tool::Transformar => {
+                            if let Some(xform) = &mut self.xform {
+                                // A corner scales, inside the box moves, outside rotates.
+                                let near = |sx: f32, sy: f32| {
+                                    let corner = xform.corner_of(&xform.transform, sx, sy);
+                                    (view.to_screen(corner, viewport, doc_size) - *pos).length() < 12.0
+                                };
+                                let corner = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                                    .into_iter()
+                                    .find(|&(sx, sy)| near(sx, sy));
+                                let kind = match corner {
+                                    Some((sx, sy)) => TransformDrag::Scale(sx, sy),
+                                    None if xform.contains(c) => TransformDrag::Move,
+                                    None => TransformDrag::Rotate,
+                                };
+                                xform.drag = Some((kind, c, xform.transform));
+                            }
+                            continue;
+                        }
                         _ => {}
                     }
                     // The first dab waits for a real pressure reading: a pen touching
@@ -1297,6 +1512,13 @@ impl SharkPaintApp {
                     self.press_time = now;
                     self.contact_pressure = self.pen_pressure;
                 }
+                Event::PointerMoved(pos) if self.xform.as_ref().is_some_and(|x| x.drag.is_some()) => {
+                    if let Some(xform) = &mut self.xform {
+                        xform.drag_to(to_canvas(*pos), free);
+                        transform_changed = true;
+                    }
+                }
+                Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
                 Event::PointerMoved(pos) if self.picking => self.pick_color(to_canvas(*pos)),
                 Event::PointerMoved(pos) if self.move_origin.is_some() => {
                     let delta = to_canvas(*pos) - self.move_origin.unwrap_or_default();
@@ -1323,6 +1545,13 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
+                    if self.tool == Tool::Transformar {
+                        // The transform stays open between drags; only the drag ends.
+                        if let Some(xform) = &mut self.xform {
+                            xform.drag = None;
+                        }
+                        continue;
+                    }
                     self.picking = false;
                     self.move_origin = None;
                     // A tap without movement still leaves one dab.
@@ -1335,6 +1564,12 @@ impl SharkPaintApp {
                     self.doc.end_stroke();
                 }
                 _ => {}
+            }
+        }
+
+        if transform_changed {
+            if let Some(xform) = &self.xform {
+                self.doc.set_transform(xform.transform);
             }
         }
 
@@ -1369,6 +1604,18 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
+        // The transform box: outline and corner handles.
+        if let Some(xform) = &self.xform {
+            let points: Vec<Pos2> = xform.corners().iter().map(|c| self.view.to_screen(*c, viewport, doc_size)).collect();
+            painter.add(Shape::closed_line(points.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
+            painter.add(Shape::closed_line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
+            for p in points {
+                let handle = Rect::from_center_size(p, Vec2::splat(9.0));
+                painter.rect_filled(handle, 1.0, Color32::WHITE);
+                painter.rect_stroke(handle, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
+            }
+        }
+
         // Brush outline in place of the system cursor.
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
@@ -1377,6 +1624,8 @@ impl SharkPaintApp {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
+            } else if self.tool == Tool::Transformar {
+                ctx.set_cursor_icon(CursorIcon::Default);
             } else {
                 debug_assert!(self.tool.has_tip());
                 let radius = self.active_brush().size * 0.5 * self.view.zoom;
@@ -1505,6 +1754,7 @@ impl SharkPaintApp {
             }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
+            Command::FinishTransform(apply) => self.finish_transform(apply),
             Command::Fullscreen => {
                 let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
