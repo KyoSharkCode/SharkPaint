@@ -10,7 +10,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Cuatro pinceles iniciales: Lápiz, Tinta, Marcador y Aerógrafo, todos ajustables
   (tamaño, opacidad, flujo, dureza, espaciado y estabilizador).
 - Borrador, cuentagotas, deshacer y rehacer (200 pasos).
-- Proyectos en formato propio (`.shp`) que conservan la precisión completa del
+- Proyectos en formato propio (`.spaint`) que conservan la precisión completa del
   dibujo, y exportación a PNG.
 - Aviso antes de descartar cambios sin guardar.
 
@@ -20,7 +20,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
   de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
   referencia. No se incluyen al exportar.
-- Instalador con asociación de archivos `.shp` y descarga fija (versión 0.1.0).
+- Rediseño del icono (el pincel actual es provisional), junto con la actualización
+  visual de SharkCut (versión 0.2.0).
+- Instalador con asociación de archivos `.spaint` y descarga fija (versión 0.1.0).
 
 ## Atajos
 

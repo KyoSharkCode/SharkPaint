@@ -38,7 +38,7 @@ use super::document::Document;
 use super::layer::{Layer, Tile, ONE, TILE};
 
 /// File extension of SharkPaint projects, without the dot.
-pub const PROJECT_EXTENSION: &str = "shp";
+pub const PROJECT_EXTENSION: &str = "spaint";
 
 const MAGIC: &[u8; 8] = b"SHARKPNT";
 const VERSION: u32 = 1;
