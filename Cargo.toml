@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.37"
+egui_extras = { version = "0.37", features = ["svg"] }
 flate2 = "1"
 png = "0.18"
 rfd = "0.18"

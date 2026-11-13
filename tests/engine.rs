@@ -380,3 +380,41 @@ fn layers_survive_the_file_format() {
     assert!((got.opacity - 0.6).abs() < 1e-4);
     assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
 }
+
+#[test]
+fn thumbnails_keep_proportions_and_thin_lines() {
+    let mut doc = Document::new(3000, 2000);
+    line(&mut doc, &hard_brush(3.0), [0, 0, 0], false, (100.0, 1000.0), (2900.0, 1000.0));
+    let (w, h, px) = doc.layers()[0].thumbnail(56, 36, [255, 255, 255]);
+    assert_eq!((w, h), (54, 36));
+    assert_eq!(px.len(), w * h * 4);
+    // The 3 px line is far thinner than one thumbnail pixel, yet still shows.
+    let middle_row = &px[18 * w * 4..19 * w * 4];
+    assert!(middle_row.chunks(4).filter(|p| p[0] < 215).count() > 40);
+    assert_eq!(&px[..4], &[255, 255, 255, 255]);
+    // A tall canvas is limited by height instead.
+    let (w, h, _) = Document::new(500, 2000).layers()[0].thumbnail(56, 36, [0, 0, 0]);
+    assert_eq!((w, h), (9, 36));
+}
+
+#[test]
+fn layer_versions_track_pixel_changes_and_ids_stay_unique() {
+    let mut doc = Document::new(100, 100);
+    let v0 = doc.active().version;
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 50.0), (90.0, 50.0));
+    let v1 = doc.active().version;
+    assert_ne!(v0, v1);
+    doc.undo();
+    assert_ne!(doc.active().version, v1);
+    doc.add_layer();
+    doc.duplicate_layer();
+    let mut ids: Vec<u64> = doc.layers().iter().map(|l| l.id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), 3);
+    // Changing only properties leaves the pixels' version alone.
+    let v = doc.active().version;
+    let mut props = doc.active().props.clone();
+    props.opacity = 0.5;
+    doc.set_layer_props(doc.active_layer(), props, false);
+    assert_eq!(doc.active().version, v);
+}

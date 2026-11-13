@@ -37,6 +37,8 @@ pub struct Document {
     revision: u64,
     /// Counter behind default layer names.
     next_layer_number: usize,
+    /// Source of layer ids and versions; never repeats.
+    next_stamp: u64,
 }
 
 impl Document {
@@ -48,7 +50,13 @@ impl Document {
     /// Builds a document from an existing stack (bottom layer first).
     pub fn from_layers(width: usize, height: usize, layers: Vec<Layer>, active: usize) -> Self {
         assert!(!layers.is_empty() && active < layers.len());
+        let mut layers = layers;
+        for (i, layer) in layers.iter_mut().enumerate() {
+            layer.id = i as u64 + 1;
+            layer.version = layer.id;
+        }
         Document {
+            next_stamp: layers.len() as u64 + 1,
             width,
             height,
             next_layer_number: layers.len() + 1,
@@ -70,6 +78,11 @@ impl Document {
     /// A counter that changes whenever the document changes.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    fn stamp(&mut self) -> u64 {
+        self.next_stamp += 1;
+        self.next_stamp
     }
 
     // --- Layers ---------------------------------------------------------------
@@ -99,8 +112,11 @@ impl Document {
         self.checkpoint_layers();
         let name = format!("Capa {}", self.next_layer_number);
         self.next_layer_number += 1;
+        let mut layer = Layer::new(self.width, self.height, name);
+        layer.id = self.stamp();
+        layer.version = layer.id;
         self.active_layer += 1;
-        self.layers.insert(self.active_layer, Layer::new(self.width, self.height, name));
+        self.layers.insert(self.active_layer, layer);
     }
 
     /// Copies the active layer above itself and selects the copy.
@@ -108,6 +124,7 @@ impl Document {
         self.checkpoint_layers();
         let mut copy = self.active().clone();
         copy.props.name = format!("{} copia", copy.props.name);
+        copy.id = self.stamp();
         self.active_layer += 1;
         self.layers.insert(self.active_layer, copy);
         self.mark_dirty(self.bounds());
@@ -148,7 +165,9 @@ impl Document {
         self.checkpoint_layers();
         let top = self.layers.remove(self.active_layer);
         self.active_layer -= 1;
+        let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
+        below.version = version;
         let (opacity, mode) = (top.props.opacity15(), top.props.blend);
         for (idx, src) in top.tiles.iter().enumerate() {
             let Some(src) = src else { continue };
@@ -193,6 +212,7 @@ impl Document {
             .filter_map(|(i, t)| t.take().map(|old| (i, Some(old))))
             .collect();
         if !tiles.is_empty() {
+            self.layers[li].version = self.stamp();
             self.push_undo(HistoryEntry::Tiles { layer: li, tiles });
             self.mark_dirty(self.bounds());
         }
@@ -228,6 +248,7 @@ impl Document {
             let layer = stroke.layer;
             let tiles = stroke.into_saved();
             if !tiles.is_empty() {
+                self.layers[layer].version = self.stamp();
                 self.push_undo(HistoryEntry::Tiles { layer, tiles });
             }
         }
@@ -357,7 +378,9 @@ impl Document {
         self.revision += 1;
         match entry {
             HistoryEntry::Tiles { layer, tiles } => {
+                self.next_stamp += 1;
                 let layer = &mut self.layers[*layer];
+                layer.version = self.next_stamp;
                 let tiles_x = layer.tiles_x;
                 let mut rect = EMPTY;
                 for (idx, saved) in tiles.iter_mut() {

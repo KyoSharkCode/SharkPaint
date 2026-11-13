@@ -189,6 +189,10 @@ impl LayerProps {
 
 #[derive(Clone)]
 pub struct Layer {
+    /// Identifies the layer across reordering and undo; unique within a document.
+    pub id: u64,
+    /// Changes whenever the layer's pixels change (used to refresh previews).
+    pub version: u64,
     pub props: LayerProps,
     pub width: usize,
     pub height: usize,
@@ -202,6 +206,8 @@ impl Layer {
         let tiles_x = width.div_ceil(TILE);
         let tiles_y = height.div_ceil(TILE);
         Layer {
+            id: 0,
+            version: 0,
             props: LayerProps::named(name),
             width,
             height,
@@ -217,6 +223,58 @@ impl Layer {
 
     pub fn tile_index(&self, tx: usize, ty: usize) -> usize {
         ty * self.tiles_x + tx
+    }
+
+    /// A small preview of the layer flattened over `paper`, at most `max_w` ×
+    /// `max_h` and keeping the canvas proportions. Every pixel contributes, so
+    /// thin lines stay visible. Returns (width, height, opaque RGBA bytes).
+    pub fn thumbnail(&self, max_w: usize, max_h: usize, paper: [u8; 3]) -> (usize, usize, Vec<u8>) {
+        let scale = (max_w as f64 / self.width as f64).min(max_h as f64 / self.height as f64);
+        let tw = ((self.width as f64 * scale).round() as usize).clamp(1, max_w.max(1));
+        let th = ((self.height as f64 * scale).round() as usize).clamp(1, max_h.max(1));
+        let bin_x: Vec<usize> = (0..self.width).map(|x| x * tw / self.width).collect();
+        let bin_y: Vec<usize> = (0..self.height).map(|y| y * th / self.height).collect();
+        let mut count_x = vec![0u64; tw];
+        let mut count_y = vec![0u64; th];
+        bin_x.iter().for_each(|&b| count_x[b] += 1);
+        bin_y.iter().for_each(|&b| count_y[b] += 1);
+
+        let mut sums = vec![[0u64; 4]; tw * th];
+        for ty in 0..self.tiles_y {
+            for tx in 0..self.tiles_x {
+                let Some(tile) = &self.tiles[self.tile_index(tx, ty)] else { continue };
+                let (ox, oy) = (tx * TILE, ty * TILE);
+                for y in 0..TILE.min(self.height - oy) {
+                    let row = bin_y[oy + y] * tw;
+                    for x in 0..TILE.min(self.width - ox) {
+                        let px = tile.0[y * TILE + x];
+                        if px[3] != 0 {
+                            let sum = &mut sums[row + bin_x[ox + x]];
+                            for ch in 0..4 {
+                                sum[ch] += px[ch] as u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(tw * th * 4);
+        for (i, sum) in sums.iter().enumerate() {
+            let n = (count_x[i % tw] * count_y[i / tw]).max(1) as f64;
+            let one = ONE as f64;
+            let alpha = sum[3] as f64 / n / one;
+            // Averaging turns thin lines faint; boosting coverage keeps line art
+            // readable at preview size.
+            let boost = if alpha > 0.0 { alpha.sqrt() / alpha } else { 0.0 };
+            for ch in 0..3 {
+                let ink = sum[ch] as f64 / n / one * boost;
+                let value = ink + paper[ch] as f64 / 255.0 * (1.0 - alpha * boost);
+                out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            out.push(255);
+        }
+        (tw, th, out)
     }
 
     /// Reads one pixel; out-of-bounds and unallocated areas are transparent.

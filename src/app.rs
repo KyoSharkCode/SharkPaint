@@ -5,7 +5,7 @@ use eframe::egui::{
     Shape, Stroke, TextureFilter, TextureHandle, TextureOptions, TouchPhase, Vec2,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
@@ -13,10 +13,14 @@ use sharkpaint::engine::{
     PROJECT_EXTENSION,
 };
 
+use crate::icons::icon;
 use crate::view::View;
 
 const DEFAULT_SIZE: [usize; 2] = [3000, 2000];
 const MAX_BRUSH_SIZE: f32 = 500.0;
+/// Slot for a layer preview in the layer list, in points.
+const THUMB_SIZE: (usize, usize) = (56, 38);
+const ROW_HEIGHT: f32 = 46.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -68,6 +72,8 @@ pub struct SharkPaintApp {
     view: View,
     texture: Option<TextureHandle>,
     texture_options: TextureOptions,
+    /// Layer previews by layer id, with the layer version they were made from.
+    thumbnails: HashMap<u64, (u64, TextureHandle)>,
     /// Screen area of the canvas viewport on the last frame.
     viewport: Rect,
     tool: Tool,
@@ -116,6 +122,7 @@ pub struct SharkPaintApp {
 impl SharkPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>, open_path: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         // Ctrl +/- must zoom the canvas, not scale the whole interface.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let mut eraser = BrushPreset::Marcador.settings();
@@ -125,6 +132,7 @@ impl SharkPaintApp {
             view: View::default(),
             texture: None,
             texture_options: TextureOptions::default(),
+            thumbnails: HashMap::new(),
             viewport: Rect::ZERO,
             tool: Tool::Pincel,
             brush: BrushPreset::Tinta.settings(),
@@ -512,11 +520,13 @@ impl SharkPaintApp {
 
     fn tool_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        for (tool, label, tip) in [
-            (Tool::Pincel, "Pincel", "Pincel (B)"),
-            (Tool::Borrador, "Borrador", "Borrador (E)"),
+        let text = ui.visuals().text_color();
+        for (tool, name, label, tip) in [
+            (Tool::Pincel, "pincel", "Pincel", "Pincel (B)"),
+            (Tool::Borrador, "borrador", "Borrador", "Borrador (E)"),
         ] {
-            let button = egui::Button::selectable(self.tool == tool, label)
+            let button = egui::Button::image_and_text(icon(name, 18.0, text), label)
+                .selected(self.tool == tool)
                 .min_size(Vec2::new(ui.available_width(), 32.0));
             if ui.add(button).on_hover_text(tip).clicked() {
                 self.tool = tool;
@@ -602,29 +612,52 @@ impl SharkPaintApp {
         }
     }
 
+    /// Keeps one preview texture per layer, redrawn when the layer's pixels change.
+    fn sync_thumbnails(&mut self, ctx: &egui::Context) {
+        let paper = self.doc.paper;
+        for layer in self.doc.layers() {
+            if self.thumbnails.get(&layer.id).is_some_and(|(version, _)| *version == layer.version) {
+                continue;
+            }
+            let (w, h, rgba) = layer.thumbnail(THUMB_SIZE.0 * 2, THUMB_SIZE.1 * 2, paper);
+            let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let texture = ctx.load_texture(format!("capa-{}", layer.id), image, TextureOptions::LINEAR);
+            self.thumbnails.insert(layer.id, (layer.version, texture));
+        }
+        let alive: HashSet<u64> = self.doc.layers().iter().map(|l| l.id).collect();
+        self.thumbnails.retain(|id, _| alive.contains(id));
+    }
+
     fn layers_panel(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+        self.sync_thumbnails(ui.ctx());
         ui.strong("Capas");
         let count = self.doc.layers().len();
         let active = self.doc.active_layer();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.small_button("Nueva").on_hover_text("Nueva capa (Ctrl+Mayús+N)").clicked() {
+        let text = ui.visuals().strong_text_color();
+        let faint = ui.visuals().weak_text_color();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let tool = |ui: &mut egui::Ui, name: &str, enabled: bool, tip: &str| {
+                let color = if enabled { text } else { faint.gamma_multiply(0.5) };
+                let button = egui::Button::image(icon(name, 18.0, color)).min_size(Vec2::splat(28.0));
+                ui.add_enabled(enabled, button).on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+            };
+            if tool(ui, "mas", true, "Nueva capa (Ctrl+Mayús+N)") {
                 commands.push(Command::LayerAdd);
             }
-            if ui.small_button("Duplicar").on_hover_text("Duplicar capa (Ctrl+J)").clicked() {
+            if tool(ui, "duplicar", true, "Duplicar capa (Ctrl+J)") {
                 commands.push(Command::LayerDuplicate);
             }
-            if ui.add_enabled(active + 1 < count, egui::Button::new("Subir").small()).clicked() {
+            if tool(ui, "subir", active + 1 < count, "Subir capa") {
                 commands.push(Command::LayerMove(true));
             }
-            if ui.add_enabled(active > 0, egui::Button::new("Bajar").small()).clicked() {
+            if tool(ui, "bajar", active > 0, "Bajar capa") {
                 commands.push(Command::LayerMove(false));
             }
-            let merge = egui::Button::new("Fusionar").small();
-            if ui.add_enabled(active > 0, merge).on_hover_text("Fusionar con la capa inferior").clicked() {
+            if tool(ui, "fusionar", active > 0, "Fusionar con la capa inferior") {
                 commands.push(Command::LayerMerge);
             }
-            if ui.add_enabled(count > 1, egui::Button::new("Eliminar").small()).clicked() {
+            if tool(ui, "quitar", count > 1, "Eliminar capa") {
                 commands.push(Command::LayerDelete);
             }
         });
@@ -663,28 +696,83 @@ impl SharkPaintApp {
         }
 
         ui.add_space(4.0);
-        // The stack, top layer first.
+        // The stack, top layer first: visibility, preview, name.
         let mut select = None;
         let mut toggle = None;
         egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             for (i, layer) in self.doc.layers().iter().enumerate().rev() {
+                let props = &layer.props;
+                let ink = if props.visible { text } else { faint };
                 ui.horizontal(|ui| {
-                    let eye = if layer.props.visible { "👁" } else { "–" };
-                    let tip = if layer.props.visible { "Ocultar capa" } else { "Mostrar capa" };
-                    if ui.add(egui::Button::new(eye).min_size(Vec2::new(26.0, 22.0))).on_hover_text(tip).clicked() {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let (eye, tip) = if props.visible {
+                        ("ojo", "Ocultar capa")
+                    } else {
+                        ("ojoCerrado", "Mostrar capa")
+                    };
+                    let button = egui::Button::image(icon(eye, 16.0, ink))
+                        .frame(false)
+                        .min_size(Vec2::new(26.0, ROW_HEIGHT));
+                    if ui.add(button).on_hover_text(tip).clicked() {
                         toggle = Some(i);
                     }
-                    let mut label = layer.props.name.clone();
-                    if layer.props.blend != BlendMode::Normal || layer.props.opacity < 1.0 {
-                        label = format!(
-                            "{label}  ·  {} {:.0} %",
-                            layer.props.blend.name(),
-                            layer.props.opacity * 100.0
+
+                    let size = Vec2::new(ui.available_width(), ROW_HEIGHT);
+                    let (row, response) = ui.allocate_exact_size(size, Sense::click());
+                    let painter = ui.painter().with_clip_rect(row);
+                    let selected = i == active;
+                    if selected {
+                        painter.rect_filled(row, 4.0, ui.visuals().selection.bg_fill);
+                    } else if response.hovered() {
+                        painter.rect_filled(row, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                    }
+
+                    // Preview, fitted inside a fixed slot so every row lines up.
+                    let slot = Rect::from_min_size(
+                        row.min + Vec2::new(4.0, (ROW_HEIGHT - THUMB_SIZE.1 as f32) * 0.5),
+                        Vec2::new(THUMB_SIZE.0 as f32, THUMB_SIZE.1 as f32),
+                    );
+                    if let Some((_, texture)) = self.thumbnails.get(&layer.id) {
+                        let [w, h] = texture.size();
+                        let fit = (slot.width() / w as f32).min(slot.height() / h as f32);
+                        let thumb = Rect::from_center_size(slot.center(), Vec2::new(w as f32, h as f32) * fit);
+                        let tint = if props.visible { Color32::WHITE } else { Color32::from_white_alpha(90) };
+                        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                        painter.image(texture.id(), thumb, uv, tint);
+                        let border = if selected { Color32::WHITE } else { Color32::from_gray(90) };
+                        painter.rect_stroke(thumb, 1.0, Stroke::new(1.0, border), egui::StrokeKind::Outside);
+                    }
+
+                    let ink = if selected { ui.visuals().selection.stroke.color } else { ink };
+                    let left = slot.right() + 8.0;
+                    let detail = (props.blend != BlendMode::Normal || props.opacity < 1.0)
+                        .then(|| format!("{} · {:.0} %", props.blend.name(), props.opacity * 100.0));
+                    let name_y = if detail.is_some() { row.center().y - 8.0 } else { row.center().y };
+                    painter.text(
+                        Pos2::new(left, name_y),
+                        egui::Align2::LEFT_CENTER,
+                        &props.name,
+                        egui::FontId::proportional(13.0),
+                        ink,
+                    );
+                    if let Some(detail) = detail {
+                        painter.text(
+                            Pos2::new(left, row.center().y + 9.0),
+                            egui::Align2::LEFT_CENTER,
+                            detail,
+                            egui::FontId::proportional(11.0),
+                            ink.gamma_multiply(0.7),
                         );
                     }
-                    let row = egui::Button::selectable(i == active, label)
-                        .min_size(Vec2::new(ui.available_width(), 22.0));
-                    if ui.add(row).clicked() {
+                    if props.alpha_lock {
+                        let at = Rect::from_center_size(
+                            Pos2::new(row.right() - 14.0, row.center().y),
+                            Vec2::splat(14.0),
+                        );
+                        icon("candado", 14.0, ink).paint_at(ui, at);
+                    }
+                    if response.clicked() {
                         select = Some(i);
                     }
                 });
@@ -1110,7 +1198,7 @@ impl eframe::App for SharkPaintApp {
         egui::Panel::bottom("estado").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("herramientas")
             .resizable(false)
-            .default_size(96.0)
+            .default_size(118.0)
             .show(ui, |ui| self.tool_panel(ui));
         egui::Panel::right("ajustes")
             .resizable(false)
