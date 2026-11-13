@@ -4,10 +4,13 @@
 //! layer. The layer is then rebuilt from its pre-stroke pixels and the mask, so
 //! a stroke never exceeds the brush opacity however often it crosses itself,
 //! while flow still builds up inside the stroke.
+//!
+//! Brushes that mix colour work differently: each dab blends straight into the
+//! layer, carrying colour picked up from the canvas along the way.
 
 use std::sync::Arc;
 
-use super::brush::{BrushSettings, BrushTip};
+use super::brush::{BrushSettings, BrushTip, PaperTexture};
 use super::layer::{IRect, Layer, Tile, ONE, TILE};
 use super::selection::Selection;
 
@@ -55,6 +58,72 @@ pub(crate) struct ActiveStroke {
     direction: f32,
     /// State of the generator behind scatter and jitter.
     random: u32,
+    /// The brush mixes with the canvas: dabs go straight onto the layer.
+    wet: bool,
+    /// Colour the brush is carrying (premultiplied RGBA, 0..=1), once it has
+    /// touched the canvas.
+    carried: Option<[f32; 4]>,
+}
+
+/// The outline of one dab, in the frame of the canvas.
+struct DabShape {
+    radius: f32,
+    outer: f32,
+    falloff: f32,
+    soft: bool,
+    /// A disc needs no rotation or squash.
+    plain: bool,
+    sin: f32,
+    cos: f32,
+    roundness: f32,
+    flip: bool,
+    tip: BrushTip,
+}
+
+impl DabShape {
+    /// Coverage (0..=1) at an offset from the dab's centre.
+    fn coverage(&self, mut fx: f32, fy: f32) -> f32 {
+        if fx * fx + fy * fy >= self.outer * self.outer {
+            return 0.0;
+        }
+        let disc = |lx: f32, ly: f32| {
+            let c = ((self.outer - (lx * lx + ly * ly).sqrt()) / self.falloff).clamp(0.0, 1.0);
+            if self.soft { c * c * (3.0 - 2.0 * c) } else { c }
+        };
+        if self.plain {
+            return disc(fx, fy);
+        }
+        if self.flip {
+            fx = -fx;
+        }
+        // Into the tip's frame: undo the rotation, then the squash.
+        let (lx, ly) = (fx * self.cos + fy * self.sin, (-fx * self.sin + fy * self.cos) / self.roundness);
+        match &self.tip {
+            BrushTip::Round => disc(lx, ly),
+            BrushTip::Image(image) => image.sample(
+                lx / self.radius * 0.5 + 0.5,
+                ly / self.radius * 0.5 + 0.5,
+                image.size as f32 / (2.0 * self.radius),
+            ),
+        }
+    }
+}
+
+/// How much paint the paper holds at a canvas pixel, for a brush with grain.
+struct Grain {
+    paper: Arc<PaperTexture>,
+    strength: f32,
+    inverse_scale: f32,
+    reach: f32,
+}
+
+impl Grain {
+    /// Share (0..=1) of full coverage this spot of paper can hold.
+    fn held(&self, x: i32, y: i32) -> f32 {
+        let height = self.paper.height(x as f32 * self.inverse_scale, y as f32 * self.inverse_scale);
+        let held = ((height - (1.0 - self.reach)) / 0.5 + 0.5).clamp(0.0, 1.0);
+        1.0 - self.strength + self.strength * held * held * (3.0 - 2.0 * held)
+    }
 }
 
 impl ActiveStroke {
@@ -85,6 +154,8 @@ impl ActiveStroke {
             direction: 0.0,
             // Seeded from where the stroke starts: varied, yet repeatable.
             random: (p.x.to_bits() ^ p.y.to_bits().rotate_left(13) ^ 0x9E37_79B9) | 1,
+            wet: brush.mix > 0.0 && !erase,
+            carried: None,
         };
         let rect = s.dab(layer, p);
         s.gap = s.spacing_at(p.pressure);
@@ -177,7 +248,7 @@ impl ActiveStroke {
 
     /// Stamps the tip at `p` and, with symmetry on, at its mirror image. Each
     /// dab gets its own scatter, rotation and size variation.
-    fn dab(&mut self, layer: &Layer, p: StrokePoint) -> IRect {
+    fn dab(&mut self, layer: &mut Layer, p: StrokePoint) -> IRect {
         let diameter = self.brush.diameter_at(p.pressure);
         let mut at = p;
         if self.brush.scatter > 0.0 {
@@ -197,19 +268,29 @@ impl ActiveStroke {
         } else {
             1.0
         };
-        let rect = self.stamp(layer, at, angle, scale, false);
+        if self.wet {
+            self.pick_up(layer, at);
+        }
+        let rect = self.place(layer, at, angle, scale, false);
         match self.mirror_x {
             Some(axis) => {
                 let mirrored = StrokePoint { x: 2.0 * axis - at.x, ..at };
-                rect.union(&self.stamp(layer, mirrored, angle, scale, true))
+                rect.union(&self.place(layer, mirrored, angle, scale, true))
             }
             None => rect,
         }
     }
 
-    /// Stamps one tip into the coverage mask, rotated by `angle` and scaled by
-    /// `scale`; `flip` mirrors it left to right.
-    fn stamp(&mut self, layer: &Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {
+    fn place(&mut self, layer: &mut Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {
+        if self.wet {
+            self.blend(layer, p, angle, scale, flip)
+        } else {
+            self.stamp(layer, p, angle, scale, flip)
+        }
+    }
+
+    /// The outline of a dab at `p`, its flow, and the canvas area it can touch.
+    fn dab_shape(&self, layer: &Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> Option<(DabShape, f32, IRect)> {
         let mut radius = self.brush.diameter_at(p.pressure) * 0.5 * scale;
         let mut flow = self.brush.flow_at(p.pressure);
         // Sub-pixel tips keep a half-pixel footprint and fade instead of vanishing.
@@ -218,10 +299,9 @@ impl ActiveStroke {
             radius = 0.5;
         }
         if flow <= 0.0 {
-            return IRect::new(0, 0, 0, 0);
+            return None;
         }
         let falloff = (radius * (1.0 - self.brush.hardness.clamp(0.0, 1.0))).max(1.0);
-        let soft = falloff > 1.0;
         let outer = radius + 0.5;
         let rect = IRect::new(
             (p.x - outer).floor() as i32,
@@ -231,22 +311,162 @@ impl ActiveStroke {
         )
         .intersect(&layer.bounds());
         if rect.is_empty() {
-            return rect;
+            return None;
         }
-        let flow15 = flow * ONE as f32;
-        let outer_sq = outer * outer;
         let roundness = self.brush.roundness.clamp(0.02, 1.0);
-        // A plain disc needs no rotation; everything else is measured in the
-        // tip's own frame.
-        let plain = matches!(self.brush.tip, BrushTip::Round) && roundness >= 0.999;
         let (sin, cos) = angle.sin_cos();
-        let tip = self.brush.tip.clone();
-        // Paper grain: light pressure only reaches the high points of the paper,
-        // firm pressure fills the hollows too. The paper is fixed to the canvas.
-        let grain = self.brush.paper.clone().filter(|_| self.brush.grain > 0.0).map(|paper| {
-            let reach = 0.25 + 0.7 * p.pressure.clamp(0.0, 1.0);
-            (paper, self.brush.grain.clamp(0.0, 1.0), 1.0 / self.brush.grain_scale.clamp(0.1, 16.0), reach)
+        let shape = DabShape {
+            radius,
+            outer,
+            falloff,
+            soft: falloff > 1.0,
+            plain: matches!(self.brush.tip, BrushTip::Round) && roundness >= 0.999,
+            sin,
+            cos,
+            roundness,
+            flip,
+            tip: self.brush.tip.clone(),
+        };
+        Some((shape, flow, rect))
+    }
+
+    /// Paper grain for a dab at this pressure, if the brush has any: light
+    /// pressure only reaches the high points of the paper, firm pressure fills
+    /// the hollows too. The paper is fixed to the canvas.
+    fn grain(&self, pressure: f32) -> Option<Grain> {
+        self.brush.paper.clone().filter(|_| self.brush.grain > 0.0).map(|paper| Grain {
+            paper,
+            strength: self.brush.grain.clamp(0.0, 1.0),
+            inverse_scale: 1.0 / self.brush.grain_scale.clamp(0.1, 16.0),
+            reach: 0.25 + 0.7 * pressure.clamp(0.0, 1.0),
+        })
+    }
+
+    /// Lets the brush take up the colour under it. The longer the drag, the
+    /// more slowly what it already carries is replaced.
+    ///
+    /// A blender reads partly the canvas as it is now, so going over a spot
+    /// again softens it further. A brush with paint of its own reads mostly the
+    /// canvas as it was before the stroke. Reading only the current canvas would
+    /// make any brush pick up what it has just put down and stop taking colour.
+    fn pick_up(&mut self, layer: &Layer, p: StrokePoint) {
+        let radius = (self.brush.diameter_at(p.pressure) * 0.5).max(1.0);
+        // Average of a grid of samples across the middle of the tip.
+        let reach = radius * 0.6;
+        let steps = ((reach * 2.0) as i32).clamp(1, 7);
+        let live = self.brush.mix.clamp(0.0, 1.0).powi(2) * 0.6;
+        let (mut sum, mut count) = ([0f32; 4], 0f32);
+        for iy in 0..steps {
+            for ix in 0..steps {
+                let offset = |i: i32| if steps == 1 { 0.0 } else { (i as f32 / (steps - 1) as f32 * 2.0 - 1.0) * reach };
+                let (dx, dy) = (offset(ix), offset(iy));
+                if dx * dx + dy * dy > reach * reach + 0.01 {
+                    continue;
+                }
+                let (x, y) = ((p.x + dx).floor() as i32, (p.y + dy).floor() as i32);
+                let now = layer.pixel(x, y);
+                let before = self.before(layer, x, y).unwrap_or(now);
+                for c in 0..4 {
+                    sum[c] += before[c] as f32 + (now[c] as f32 - before[c] as f32) * live;
+                }
+                count += 1.0;
+            }
+        }
+        let under: [f32; 4] = std::array::from_fn(|c| sum[c] / (count.max(1.0) * ONE as f32));
+        let keep = (self.brush.drag.clamp(0.0, 1.0) * 0.97).powf(0.5);
+        self.carried = Some(match self.carried {
+            Some(carried) => std::array::from_fn(|c| under[c] + (carried[c] - under[c]) * keep),
+            None => under,
         });
+    }
+
+    /// The pixel as it was before this stroke, if the stroke has touched its tile.
+    fn before(&self, layer: &Layer, x: i32, y: i32) -> Option<[u16; 4]> {
+        if x < 0 || y < 0 || x >= layer.width as i32 || y >= layer.height as i32 {
+            return None;
+        }
+        let (tx, ty) = (x as usize / TILE, y as usize / TILE);
+        let saved = self.tiles[layer.tile_index(tx, ty)].as_ref()?;
+        Some(saved.orig.as_ref().map_or([0; 4], |tile| tile.0[(y as usize - ty * TILE) * TILE + (x as usize - tx * TILE)]))
+    }
+
+    /// Blends one dab of a mixing brush straight into the layer: each pixel
+    /// moves towards the brush's colour, which is part paint and part what it
+    /// picked up from the canvas.
+    fn blend(&mut self, layer: &mut Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {
+        let Some((shape, flow, rect)) = self.dab_shape(layer, p, angle, scale, flip) else {
+            return IRect::new(0, 0, 0, 0);
+        };
+        let grain = self.grain(p.pressure);
+        let mix = self.brush.mix.clamp(0.0, 1.0);
+        let carried = self.carried.unwrap_or([0.0; 4]);
+        let paint = [self.color[0] as f32 / ONE as f32, self.color[1] as f32 / ONE as f32, self.color[2] as f32 / ONE as f32, 1.0];
+        // A painting brush keeps its own colour where the canvas has none to give;
+        // a pure blender carries the emptiness too.
+        let weight = mix * (carried[3] + (1.0 - carried[3]) * mix.powi(7));
+        let loaded: [f32; 4] = std::array::from_fn(|c| (paint[c] + (carried[c] - paint[c]) * weight) * ONE as f32);
+
+        let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
+        let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                let idx = layer.tile_index(tx, ty);
+                if self.alpha_lock && layer.tiles[idx].is_none() {
+                    continue; // nothing to recolour
+                }
+                // Remember the tile as it was, for undo.
+                if self.tiles[idx].is_none() {
+                    self.tiles[idx] = Some(StrokeTile { mask: Box::default(), orig: layer.tiles[idx].clone() });
+                }
+                let (ox, oy) = ((tx * TILE) as i32, (ty * TILE) as i32);
+                let x0 = rect.x0.max(ox);
+                let x1 = rect.x1.min(ox + TILE as i32);
+                let y0 = rect.y0.max(oy);
+                let y1 = rect.y1.min(oy + TILE as i32);
+                for y in y0..y1 {
+                    let fy = y as f32 + 0.5 - p.y;
+                    for x in x0..x1 {
+                        let mut amount = shape.coverage(x as f32 + 0.5 - p.x, fy) * flow;
+                        if let Some(grain) = &grain {
+                            amount *= grain.held(x, y);
+                        }
+                        if let Some(selection) = &self.selection {
+                            amount *= selection.coverage(x, y) as f32 / 255.0;
+                        }
+                        if amount <= 0.002 {
+                            continue;
+                        }
+                        let i = (y - oy) as usize * TILE + (x - ox) as usize;
+                        let here = layer.tiles[idx].as_ref().map_or([0; 4], |tile| tile.0[i]);
+                        let mut out: [u16; 4] = std::array::from_fn(|c| {
+                            (here[c] as f32 + (loaded[c] - here[c] as f32) * amount).round().clamp(0.0, ONE as f32) as u16
+                        });
+                        if self.alpha_lock {
+                            out[3] = here[3];
+                        }
+                        for c in 0..3 {
+                            out[c] = out[c].min(out[3]);
+                        }
+                        if out == here {
+                            continue;
+                        }
+                        // Only now is the tile needed; empty areas stay empty.
+                        Arc::make_mut(layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty()))).0[i] = out;
+                    }
+                }
+            }
+        }
+        rect
+    }
+
+    /// Stamps one tip into the coverage mask, rotated by `angle` and scaled by
+    /// `scale`; `flip` mirrors it left to right.
+    fn stamp(&mut self, layer: &Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {
+        let Some((shape, flow, rect)) = self.dab_shape(layer, p, angle, scale, flip) else {
+            return IRect::new(0, 0, 0, 0);
+        };
+        let grain = self.grain(p.pressure);
+        let flow15 = flow * ONE as f32;
 
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
@@ -266,31 +486,7 @@ impl ActiveStroke {
                     let fy = y as f32 + 0.5 - p.y;
                     let row = (y - oy) as usize * TILE;
                     for x in x0..x1 {
-                        let mut fx = x as f32 + 0.5 - p.x;
-                        if fx * fx + fy * fy >= outer_sq {
-                            continue;
-                        }
-                        let c = if plain {
-                            let c = ((outer - (fx * fx + fy * fy).sqrt()) / falloff).min(1.0);
-                            if soft { c * c * (3.0 - 2.0 * c) } else { c }
-                        } else {
-                            if flip {
-                                fx = -fx;
-                            }
-                            // Into the tip's frame: undo the rotation, then the squash.
-                            let (lx, ly) = (fx * cos + fy * sin, (-fx * sin + fy * cos) / roundness);
-                            match &tip {
-                                BrushTip::Round => {
-                                    let c = ((outer - (lx * lx + ly * ly).sqrt()) / falloff).clamp(0.0, 1.0);
-                                    if soft { c * c * (3.0 - 2.0 * c) } else { c }
-                                }
-                                BrushTip::Image(image) => image.sample(
-                                    lx / radius * 0.5 + 0.5,
-                                    ly / radius * 0.5 + 0.5,
-                                    image.size as f32 / (2.0 * radius),
-                                ),
-                            }
-                        };
+                        let c = shape.coverage(x as f32 + 0.5 - p.x, fy);
                         if c <= 0.0 {
                             continue;
                         }
@@ -298,14 +494,10 @@ impl ActiveStroke {
                         let m = &mut tile.mask[row + (x - ox) as usize];
                         let cur = *m as u32;
                         let mut value = (cur + (((ONE - cur) * add) >> 15)).min(ONE);
-                        if let Some((paper, strength, inverse_scale, reach)) = &grain {
-                            // How much paint this spot of paper can hold at this
-                            // pressure. It caps the coverage rather than thinning
-                            // each dab, so overlapping dabs do not fill the grain in.
-                            let height = paper.height(x as f32 * inverse_scale, y as f32 * inverse_scale);
-                            let held = ((height - (1.0 - reach)) / 0.5 + 0.5).clamp(0.0, 1.0);
-                            let held = held * held * (3.0 - 2.0 * held);
-                            let limit = ((1.0 - strength + strength * held) * ONE as f32) as u32;
+                        if let Some(grain) = &grain {
+                            // The paper caps the coverage rather than thinning each
+                            // dab, so overlapping dabs do not fill the grain in.
+                            let limit = (grain.held(x, y) * ONE as f32) as u32;
                             value = value.min(limit.max(cur));
                         }
                         *m = value as u16;
@@ -319,8 +511,8 @@ impl ActiveStroke {
     /// Rebuilds the layer inside `rect` from the pre-stroke pixels and the mask.
     fn recomposite(&mut self, layer: &mut Layer, rect: IRect) {
         let rect = rect.intersect(&layer.bounds());
-        if rect.is_empty() {
-            return;
+        if rect.is_empty() || self.wet {
+            return; // mixing brushes have already painted the layer
         }
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);

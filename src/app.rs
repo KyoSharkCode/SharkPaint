@@ -1631,6 +1631,27 @@ impl SharkPaintApp {
         ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
     }
 
+    /// How much the brush mixes with the paint already on the canvas.
+    fn mix_settings(&mut self, ui: &mut egui::Ui) {
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        let b = self.active_brush();
+        egui::Grid::new("mezcla").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Mezcla");
+            ui.add(egui::Slider::new(&mut b.mix, 0.0..=1.0).custom_formatter(percent))
+                .on_hover_text("0 %: pinta solo con su color.\n100 %: no añade color, solo mueve el que ya hay.");
+            ui.end_row();
+            ui.label("Arrastre");
+            ui.add_enabled(b.mix > 0.0, egui::Slider::new(&mut b.drag, 0.0..=1.0).custom_formatter(percent))
+                .on_hover_text("Cuánto tiempo conserva el pincel el color que recoge");
+            ui.end_row();
+        });
+        if b.mix > 0.0 {
+            ui.label("Al mezclar, el pincel pinta directamente: la opacidad no se aplica; usa el flujo.");
+        } else {
+            ui.label("Sube la mezcla para que el pincel recoja el color del lienzo y lo arrastre.");
+        }
+    }
+
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
@@ -1711,6 +1732,7 @@ impl SharkPaintApp {
         if !smudging {
             egui::CollapsingHeader::new("Punta").default_open(false).show(ui, |ui| self.tip_settings(ui));
             egui::CollapsingHeader::new("Textura de papel").default_open(false).show(ui, |ui| self.paper_settings(ui));
+            egui::CollapsingHeader::new("Mezcla de color").default_open(false).show(ui, |ui| self.mix_settings(ui));
         }
         egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
             let b = self.active_brush();

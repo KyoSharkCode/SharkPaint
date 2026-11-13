@@ -7,14 +7,17 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 - Lienzo con zoom, desplazamiento, rotación y volteo horizontal.
 - Pincel con sensibilidad a la presión del lápiz (tamaño y flujo).
-- Quince pinceles iniciales, de punta redonda (Lápiz, Tinta, Pluma, Marcador,
-  Aerógrafo, Caligrafía, Pastel, Crayón) y con forma (Carboncillo, Cabello, Pincel
-  seco, Tiza, Salpicadura, Hojas, Estrellas).
+- Diecinueve pinceles iniciales, de punta redonda (Lápiz, Tinta, Pluma, Marcador,
+  Aerógrafo, Caligrafía, Pastel, Crayón), con forma (Carboncillo, Cabello, Pincel
+  seco, Tiza, Salpicadura, Hojas, Estrellas) y de mezcla (Óleo, Acuarela,
+  Difuminador, Dedo).
+- Mezcla de color: el pincel puede recoger el color del lienzo y arrastrarlo, desde
+  una pintura que se funde con la de debajo hasta un difuminador que no añade color.
 - Textura de papel: cuatro papeles (fino, rugoso, de acuarela y lienzo) cuyo grano
   aparece según la presión del lápiz.
 - Editor de pinceles con muestra del trazo: tamaño, opacidad, flujo, dureza,
-  espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión y
-  variación al azar. Los pinceles propios se guardan en una biblioteca.
+  espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión,
+  variación al azar, textura de papel y mezcla de color. Los pinceles propios se guardan en una biblioteca.
 - Puntas importadas: cualquier imagen sirve como punta de pincel.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
@@ -122,8 +125,9 @@ cargo test
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
 - `src/engine/selection.rs`: máscara de selección.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
-- `examples/muestra.rs`, `examples/puntas.rs`, `examples/papeles.rs`: generan hojas de
-  muestra de los pinceles, las puntas y los papeles sin abrir ventana.
+- `examples/muestra.rs`, `examples/puntas.rs`, `examples/papeles.rs`, `examples/mezcla.rs`:
+  generan hojas de muestra de los pinceles, las puntas, los papeles y la mezcla de
+  color sin abrir ventana.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
 
 ## Licencia y contribuciones

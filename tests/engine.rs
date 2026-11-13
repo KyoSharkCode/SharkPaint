@@ -1049,3 +1049,67 @@ fn papers_tile_without_a_seam() {
         assert!(paper.data.iter().any(|&h| h < 30) && paper.data.iter().any(|&h| h > 225), "{} is flat", paper.id);
     }
 }
+
+fn blender(size: f32) -> BrushSettings {
+    BrushSettings { mix: 1.0, drag: 0.9, hardness: 1.0, spacing: 0.05, smoothing: 0.0, ..BrushSettings::round(size) }
+}
+
+#[test]
+fn a_blender_adds_no_colour_of_its_own() {
+    let mut doc = Document::new(128, 128);
+    line(&mut doc, &blender(20.0), [255, 0, 0], false, (20.0, 64.0), (108.0, 64.0));
+    for x in (0..128).step_by(4) {
+        assert_eq!(pixel(&doc, x, 64), [255, 255, 255, 255], "empty canvas stays empty at {x}");
+    }
+}
+
+#[test]
+fn a_blender_drags_colour_across_an_edge() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(60.0), [255, 0, 0], false, (40.0, 50.0), (60.0, 50.0));
+    assert_eq!(pixel(&doc, 110, 50), [255, 255, 255, 255]);
+    // The stroke's own colour is blue, but only the red it picked up may show.
+    line(&mut doc, &blender(24.0), [0, 0, 255], false, (50.0, 50.0), (130.0, 50.0));
+    let dragged = pixel(&doc, 110, 50);
+    assert!(dragged[1] < 235, "red was pulled past the edge: {dragged:?}");
+    assert!(dragged[0] == 255 && dragged[2].abs_diff(dragged[1]) <= 1, "no blue was added: {dragged:?}");
+    // One stroke, one undo step.
+    doc.undo();
+    assert_eq!(pixel(&doc, 110, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 50, 50), [255, 0, 0, 255]);
+    doc.redo();
+    assert_eq!(pixel(&doc, 110, 50), dragged);
+}
+
+#[test]
+fn a_mixing_brush_blends_its_colour_with_the_canvas() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(90.0), [255, 0, 0], false, (20.0, 50.0), (180.0, 50.0));
+    let oil = BrushSettings { mix: 0.5, drag: 0.5, ..blender(24.0) };
+    line(&mut doc, &oil, [0, 0, 255], false, (40.0, 50.0), (160.0, 50.0));
+    let mixed = pixel(&doc, 120, 50);
+    assert!(mixed[0] > 40 && mixed[2] > 40, "both colours show: {mixed:?}");
+    assert_eq!(mixed[3], 255);
+    // On a bare canvas the same brush lays down its own colour.
+    let mut bare = Document::new(200, 100);
+    line(&mut bare, &oil, [0, 0, 255], false, (40.0, 50.0), (160.0, 50.0));
+    let own = pixel(&bare, 120, 50);
+    assert!(own[0] < 25 && own[2] == 255, "{own:?}");
+}
+
+#[test]
+fn mixing_respects_alpha_lock_and_cancel() {
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (40.0, 50.0), (60.0, 50.0));
+    let before = doc.render_rgba8(doc.bounds());
+    doc.begin_stroke(&blender(24.0), [0, 0, 255], false, StrokePoint::new(50.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(140.0, 50.0, 1.0));
+    doc.cancel_stroke();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before, "a cancelled stroke leaves nothing behind");
+
+    let mut props = doc.layers()[doc.active_layer()].props.clone();
+    props.alpha_lock = true;
+    doc.set_layer_props(doc.active_layer(), props, false);
+    line(&mut doc, &blender(24.0), [0, 0, 255], false, (50.0, 50.0), (140.0, 50.0));
+    assert_eq!(pixel(&doc, 120, 50), [255, 255, 255, 255], "locked transparency stays transparent");
+}

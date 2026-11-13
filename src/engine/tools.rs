@@ -922,6 +922,16 @@ pub fn brush_preview(brush: &BrushSettings, width: usize, height: usize, ink: [u
             (t * std::f32::consts::PI).sin().powf(0.6),
         )
     };
+    if brush.mix > 0.0 {
+        // A mixing brush shows what it does by crossing bands of colour.
+        let band = BrushSettings { hardness: 1.0, spacing: 0.1, ..BrushSettings::round(w / 5.0) };
+        for (i, color) in [[214, 72, 96], [240, 190, 70], [70, 150, 220]].into_iter().enumerate() {
+            let x = w * (0.28 + 0.22 * i as f32);
+            doc.begin_stroke(&band, color, false, StrokePoint::new(x, -w, 1.0));
+            doc.stroke_to(StrokePoint::new(x, h + w, 1.0));
+            doc.end_stroke();
+        }
+    }
     doc.begin_stroke(&sample, ink, false, point(0.0));
     for step in 1..=160 {
         doc.stroke_to(point(step as f32 / 160.0));

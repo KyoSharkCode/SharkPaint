@@ -14,7 +14,7 @@ use sharkpaint::engine::{
 use crate::settings::config_dir;
 
 /// Raised whenever the set of default brushes grows.
-const LIBRARY_VERSION: u32 = 3;
+const LIBRARY_VERSION: u32 = 4;
 
 /// Side of the square an imported tip is stored at, at most.
 const MAX_TIP_SIDE: u32 = 256;
@@ -184,6 +184,50 @@ impl BrushLibrary {
                 pressure_flow: true,
                 ..BrushSettings::round(34.0)
             }),
+            // Thick paint that picks up what is under it and drags it along.
+            shaped("Óleo", "cerdas", BrushSettings {
+                mix: 0.5,
+                drag: 0.75,
+                flow: 0.7,
+                spacing: 0.03,
+                follow_direction: true,
+                pressure_size: true,
+                min_size: 0.5,
+                ..BrushSettings::round(48.0)
+            }),
+            // Thin washes that melt into the colours next to them.
+            shaped("Acuarela", "redonda", BrushSettings {
+                mix: 0.35,
+                drag: 0.4,
+                flow: 0.25,
+                hardness: 0.35,
+                spacing: 0.06,
+                paper: self.paper("acuarela"),
+                grain: 0.35,
+                pressure_flow: true,
+                ..BrushSettings::round(60.0)
+            }),
+            // Adds no colour: softens the boundary between the ones already there.
+            shaped("Difuminador", "redonda", BrushSettings {
+                mix: 1.0,
+                drag: 0.5,
+                flow: 0.6,
+                hardness: 0.2,
+                spacing: 0.06,
+                pressure_flow: true,
+                ..BrushSettings::round(50.0)
+            }),
+            // Adds no colour either, but pulls paint a long way, like a fingertip.
+            shaped("Dedo", "redonda", BrushSettings {
+                mix: 1.0,
+                drag: 0.85,
+                flow: 0.75,
+                hardness: 0.6,
+                spacing: 0.04,
+                pressure_size: true,
+                min_size: 0.5,
+                ..BrushSettings::round(34.0)
+            }),
             shaped("Salpicadura", "salpicadura", BrushSettings {
                 spacing: 0.5,
                 scatter: 0.8,
@@ -238,6 +282,8 @@ impl BrushLibrary {
             put("papel", s.paper.as_ref().map_or("ninguno", |p| p.id.as_str()).to_owned());
             put("grano", s.grain.to_string());
             put("escala_grano", s.grain_scale.to_string());
+            put("mezcla", s.mix.to_string());
+            put("arrastre", s.drag.to_string());
         }
         text
     }
@@ -260,6 +306,8 @@ impl BrushLibrary {
                 ("papel", _) => s.paper = self.paper(value.trim()),
                 ("grano", Some(v)) => s.grain = v.clamp(0.0, 1.0),
                 ("escala_grano", Some(v)) => s.grain_scale = v.clamp(0.1, 16.0),
+                ("mezcla", Some(v)) => s.mix = v.clamp(0.0, 1.0),
+                ("arrastre", Some(v)) => s.drag = v.clamp(0.0, 1.0),
                 ("presion_tamano", _) => s.pressure_size = flag,
                 ("presion_flujo", _) => s.pressure_flow = flag,
                 ("seguir_direccion", _) => s.follow_direction = flag,

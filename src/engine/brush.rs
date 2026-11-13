@@ -195,6 +195,12 @@ pub struct BrushSettings {
     pub grain: f32,
     /// Size of the grain (1 = as drawn, 2 = twice as coarse).
     pub grain_scale: f32,
+    /// How much of the colour already on the canvas the brush carries
+    /// (0 = paints its own colour only, 1 = only moves what is there).
+    pub mix: f32,
+    /// How long picked-up colour stays on the brush (0 = replaced at once,
+    /// 1 = dragged a long way).
+    pub drag: f32,
 }
 
 impl Default for BrushSettings {
@@ -226,6 +232,8 @@ impl BrushSettings {
             paper: None,
             grain: 0.7,
             grain_scale: 1.0,
+            mix: 0.0,
+            drag: 0.5,
         }
     }
 
