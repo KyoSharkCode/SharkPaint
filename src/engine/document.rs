@@ -23,6 +23,29 @@ enum HistoryEntry {
     Props { layer: usize, props: LayerProps },
 }
 
+/// A reference image kept alongside the drawing: shown in its own panel,
+/// never part of the picture or of exports.
+#[derive(Clone)]
+pub struct Reference {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    /// 8-bit RGBA, not premultiplied, row-major.
+    pub rgba: Arc<Vec<u8>>,
+}
+
+/// Everything a project file holds, detached from the live document so it
+/// can be written on another thread. Layers share their pixels with the
+/// document, so taking one is cheap.
+pub struct ProjectSnapshot {
+    pub width: usize,
+    pub height: usize,
+    pub paper: [u8; 3],
+    pub layers: Vec<Layer>,
+    pub active_layer: usize,
+    pub references: Vec<Reference>,
+}
+
 pub struct Document {
     pub width: usize,
     pub height: usize,
@@ -44,6 +67,7 @@ pub struct Document {
     next_layer_number: usize,
     /// Source of layer ids and versions; never repeats.
     next_stamp: u64,
+    references: Vec<Reference>,
     pub(super) selection: Option<Arc<Selection>>,
     /// Changes whenever the selection does.
     pub(super) selection_stamp: u64,
@@ -79,6 +103,7 @@ impl Document {
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
             revision: 0,
+            references: Vec::new(),
             selection: None,
             selection_stamp: 0,
         }
@@ -234,6 +259,46 @@ impl Document {
             self.push_undo(HistoryEntry::Tiles { layer: li, tiles });
             self.mark_dirty(self.bounds());
         }
+    }
+
+    // --- References -----------------------------------------------------------
+
+    pub fn references(&self) -> &[Reference] {
+        &self.references
+    }
+
+    /// Adds a reference image. Not part of the undo history, but it does count
+    /// as an unsaved change.
+    pub fn add_reference(&mut self, reference: Reference) {
+        self.references.push(reference);
+        self.revision += 1;
+    }
+
+    pub fn remove_reference(&mut self, index: usize) {
+        if index < self.references.len() {
+            self.references.remove(index);
+            self.revision += 1;
+        }
+    }
+
+    /// The document's contents as they are now, for saving.
+    pub fn snapshot(&self) -> ProjectSnapshot {
+        ProjectSnapshot {
+            width: self.width,
+            height: self.height,
+            paper: self.paper,
+            layers: self.layers.clone(),
+            active_layer: self.active_layer,
+            references: self.references.clone(),
+        }
+    }
+
+    /// Builds a document from loaded contents, with a clean history.
+    pub fn from_snapshot(snapshot: ProjectSnapshot) -> Self {
+        let mut doc = Document::from_layers(snapshot.width, snapshot.height, snapshot.layers, snapshot.active_layer);
+        doc.paper = snapshot.paper;
+        doc.references = snapshot.references;
+        doc
     }
 
     // --- Selection ------------------------------------------------------------

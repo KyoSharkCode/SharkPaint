@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
-    PROJECT_EXTENSION,
+    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference,
+    StrokePoint, PROJECT_EXTENSION,
 };
 
 use crate::icons::icon;
@@ -18,6 +18,8 @@ use crate::view::View;
 
 const DEFAULT_SIZE: [usize; 2] = [3000, 2000];
 const MAX_BRUSH_SIZE: f32 = 500.0;
+/// Reference images are shrunk to this side at most; they are for looking at.
+const MAX_REFERENCE_SIDE: u32 = 2048;
 /// Slot for a layer preview in the layer list, in points.
 const THUMB_SIZE: (usize, usize) = (56, 38);
 const ROW_HEIGHT: f32 = 46.0;
@@ -219,6 +221,7 @@ enum Command {
     ResetRotation,
     Flip,
     ToggleBrushWindow,
+    ToggleReferences,
     Fullscreen,
     FinishTransform(bool),
     SelectAll,
@@ -314,6 +317,16 @@ pub struct SharkPaintApp {
     window_hooked: bool,
     /// The floating brush settings window is showing.
     brush_window_open: bool,
+    /// The reference panel is showing.
+    refs_open: bool,
+    /// Which reference is on screen.
+    ref_index: usize,
+    /// Pan (points) and extra zoom of the reference on screen.
+    ref_view: (Vec2, f32),
+    /// Texture of the reference on screen, with the pixels it was made from.
+    ref_texture: Option<(usize, TextureHandle)>,
+    /// Where the reference panel was last drawn, to route dropped files.
+    refs_rect: Option<Rect>,
 }
 
 impl SharkPaintApp {
@@ -378,6 +391,11 @@ impl SharkPaintApp {
             window_title: String::new(),
             window_hooked: false,
             brush_window_open: true,
+            refs_open: false,
+            ref_index: 0,
+            ref_view: (Vec2::ZERO, 1.0),
+            ref_texture: None,
+            refs_rect: None,
         };
         // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
@@ -403,6 +421,9 @@ impl SharkPaintApp {
         self.view = View::default();
         self.fit_pending = true;
         self.pending_start = None;
+        self.ref_index = 0;
+        self.ref_view = (Vec2::ZERO, 1.0);
+        self.refs_open = !self.doc.references().is_empty();
     }
 
     fn load_project(&mut self, path: PathBuf) {
@@ -633,6 +654,9 @@ impl SharkPaintApp {
             if hit(none, Key::F5) {
                 commands.push(Command::ToggleBrushWindow);
             }
+            if hit(none, Key::F6) {
+                commands.push(Command::ToggleReferences);
+            }
             for (tool, key) in [
                 (Tool::Pincel, Key::B),
                 (Tool::Borrador, Key::E),
@@ -796,6 +820,9 @@ impl SharkPaintApp {
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
                 }
+                if item(ui, "Referencias", "F6") {
+                    commands.push(Command::ToggleReferences);
+                }
                 if item(ui, "Pantalla completa", "F11") {
                     commands.push(Command::Fullscreen);
                 }
@@ -815,6 +842,7 @@ impl SharkPaintApp {
                         ("Supr", "Borrar lo seleccionado"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
+                        ("F6", "Mostrar u ocultar las referencias"),
                         ("Alt + clic", "Tomar color del lienzo"),
                         ("M + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
@@ -857,6 +885,10 @@ impl SharkPaintApp {
         if ui.add(button).on_hover_text("Ajustes del pincel (F5)").clicked() {
             commands.push(Command::ToggleBrushWindow);
         }
+        let button = egui::Button::image(icon("imagen", 20.0, text)).selected(self.refs_open).min_size(size);
+        if ui.add(button).on_hover_text("Referencias (F6)").clicked() {
+            commands.push(Command::ToggleReferences);
+        }
         ui.separator();
         let faint = ui.visuals().weak_text_color().gamma_multiply(0.5);
         for (name, enabled, tip, command) in [
@@ -868,6 +900,152 @@ impl SharkPaintApp {
             if ui.add_enabled(enabled, button).on_hover_text(tip).clicked() {
                 commands.push(command);
             }
+        }
+    }
+
+    /// Adds an image to the reference panel, shrunk if it is very large.
+    fn add_reference(&mut self, name: &str, width: usize, height: usize, rgba: Vec<u8>) {
+        if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+            self.status = "La imagen no se pudo leer.".into();
+            return;
+        }
+        let (mut width, mut height, mut rgba) = (width as u32, height as u32, rgba);
+        let largest = width.max(height);
+        if largest > MAX_REFERENCE_SIDE {
+            let scale = MAX_REFERENCE_SIDE as f64 / largest as f64;
+            let (w, h) = (((width as f64 * scale) as u32).max(1), ((height as f64 * scale) as u32).max(1));
+            let Some(source) = image::RgbaImage::from_raw(width, height, rgba) else { return };
+            rgba = image::imageops::resize(&source, w, h, image::imageops::FilterType::Triangle).into_raw();
+            (width, height) = (w, h);
+        }
+        self.doc.add_reference(Reference {
+            name: name.to_owned(),
+            width: width as usize,
+            height: height as usize,
+            rgba: std::sync::Arc::new(rgba),
+        });
+        self.ref_index = self.doc.references().len() - 1;
+        self.ref_view = (Vec2::ZERO, 1.0);
+        self.refs_open = true;
+    }
+
+    fn add_reference_file(&mut self, path: &std::path::Path) {
+        match image::open(path) {
+            Ok(decoded) => {
+                let rgba = decoded.into_rgba8();
+                let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Referencia".into());
+                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                self.add_reference(&name, w, h, rgba.into_raw());
+            }
+            Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+        }
+    }
+
+    /// The reference panel: images to look at while drawing. They live beside
+    /// the picture, with their own zoom, and are never exported.
+    fn references_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.refs_open;
+        let mut add_files = false;
+        let mut paste = false;
+        let mut remove = false;
+        let shown = egui::Window::new("Referencias")
+            .open(&mut open)
+            .default_size([340.0, 380.0])
+            .min_size([220.0, 200.0])
+            .default_pos(self.viewport.right_top() + Vec2::new(-360.0, 12.0))
+            .show(ctx, |ui| {
+                let count = self.doc.references().len();
+                self.ref_index = self.ref_index.min(count.saturating_sub(1));
+                ui.horizontal(|ui| {
+                    add_files = ui.button("Añadir…").clicked();
+                    paste = ui.button("Pegar").on_hover_text("Añade la imagen del portapapeles").clicked();
+                    remove = ui.add_enabled(count > 0, egui::Button::new("Quitar")).clicked();
+                    if count > 1 {
+                        ui.separator();
+                        if ui.small_button("◀").clicked() {
+                            self.ref_index = (self.ref_index + count - 1) % count;
+                            self.ref_view = (Vec2::ZERO, 1.0);
+                        }
+                        ui.label(format!("{} / {count}", self.ref_index + 1));
+                        if ui.small_button("▶").clicked() {
+                            self.ref_index = (self.ref_index + 1) % count;
+                            self.ref_view = (Vec2::ZERO, 1.0);
+                        }
+                    }
+                });
+                let Some(reference) = self.doc.references().get(self.ref_index).cloned() else {
+                    ui.add_space(8.0);
+                    ui.label("Añade imágenes de consulta: se quedan aquí, fuera del lienzo y de las capas.");
+                    ui.label("Se guardan con el proyecto y nunca se incluyen al exportar.");
+                    ui.label("También puedes soltar un archivo sobre esta ventana.");
+                    ui.allocate_space(ui.available_size());
+                    return;
+                };
+                // One texture, remade when another image comes on screen.
+                let key = std::sync::Arc::as_ptr(&reference.rgba) as usize;
+                if self.ref_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let image = ColorImage::from_rgba_unmultiplied([reference.width, reference.height], &reference.rgba);
+                    self.ref_texture = Some((key, ui.ctx().load_texture("referencia", image, TextureOptions::LINEAR)));
+                }
+                let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+                let area = response.rect;
+                painter.rect_filled(area, 2.0, Color32::from_gray(24));
+                let size = Vec2::new(reference.width as f32, reference.height as f32);
+                let fit = (area.width() / size.x).min(area.height() / size.y);
+                if response.dragged() {
+                    self.ref_view.0 += response.drag_delta();
+                }
+                if response.double_clicked() {
+                    self.ref_view = (Vec2::ZERO, 1.0);
+                }
+                let hover = response.hover_pos();
+                if let Some(pos) = hover {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        // Zoom around the pointer.
+                        let old = fit * self.ref_view.1;
+                        self.ref_view.1 = (self.ref_view.1 * (scroll * 0.0025).exp()).clamp(0.2, 40.0);
+                        let center = area.center() + self.ref_view.0;
+                        self.ref_view.0 += (pos - center) * (1.0 - fit * self.ref_view.1 / old);
+                    }
+                    ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                }
+                let scale = fit * self.ref_view.1;
+                let shown = Rect::from_center_size(area.center() + self.ref_view.0, size * scale);
+                if let Some((_, texture)) = &self.ref_texture {
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.with_clip_rect(area).image(texture.id(), shown, uv, Color32::WHITE);
+                }
+                // A click takes the colour under the pointer.
+                if let Some(pos) = hover.filter(|_| response.clicked() && !response.double_clicked()) {
+                    let at = (pos - shown.min) / scale;
+                    let (x, y) = (at.x.floor() as i64, at.y.floor() as i64);
+                    if x >= 0 && y >= 0 && (x as usize) < reference.width && (y as usize) < reference.height {
+                        let i = (y as usize * reference.width + x as usize) * 4;
+                        self.color = [reference.rgba[i], reference.rgba[i + 1], reference.rgba[i + 2]];
+                    }
+                }
+            });
+        self.refs_rect = shown.map(|window| window.response.rect);
+        self.refs_open = open;
+        if add_files {
+            let picked = rfd::FileDialog::new()
+                .set_title("Añadir referencias")
+                .add_filter("Imágenes", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+                .pick_files();
+            for path in picked.unwrap_or_default() {
+                self.add_reference_file(&path);
+            }
+        }
+        if paste {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image()) {
+                Ok(image) => self.add_reference("Referencia pegada", image.width, image.height, image.bytes.into_owned()),
+                Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+            }
+        }
+        if remove {
+            self.doc.remove_reference(self.ref_index);
+            self.ref_view = (Vec2::ZERO, 1.0);
         }
     }
 
@@ -1459,8 +1637,13 @@ impl SharkPaintApp {
             if path.as_os_str().is_empty() {
                 continue;
             }
+            let pointer = ctx.input(|i| i.pointer.latest_pos());
+            let on_references = self.refs_rect.zip(pointer).is_some_and(|(rect, pos)| rect.contains(pos));
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
                 self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            } else if on_references {
+                // Dropped on the reference panel: it is for looking at, not drawing on.
+                self.add_reference_file(&path);
             } else {
                 self.insert_image_file(&path);
             }
@@ -1928,6 +2111,7 @@ impl SharkPaintApp {
             }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
+            Command::ToggleReferences => self.refs_open = !self.refs_open,
             Command::FinishTransform(apply) => self.finish_transform(apply),
             Command::SelectAll => self.doc.select_all(),
             Command::Deselect => self.doc.deselect(),
@@ -1979,6 +2163,11 @@ impl eframe::App for SharkPaintApp {
         }
         if self.brush_window_open {
             self.brush_window(&ctx);
+        }
+        if self.refs_open {
+            self.references_window(&ctx);
+        } else {
+            self.refs_rect = None;
         }
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);

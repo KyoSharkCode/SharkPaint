@@ -20,6 +20,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
   transformar y voltear afectan solo a lo seleccionado.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
+  propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
@@ -32,9 +34,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 - Grupos de capas.
 - Sumar y restar selecciones, y deshacer los cambios de selección.
-- Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
-  de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
-  referencia. No se incluyen al exportar.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
@@ -59,6 +58,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Ctrl+Mayús+N` / `Ctrl+J` | Nueva capa / Duplicar capa |
 | `5` | Restablecer la rotación |
 | `F` | Voltear horizontalmente |
+| `F6` | Mostrar u ocultar las referencias |
 | `F11` | Pantalla completa |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
 | `Ctrl+O` | Abrir proyecto |

@@ -1,5 +1,5 @@
 use sharkpaint::engine::{
-    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, StrokePoint,
+    BlendMode, BrushPreset, BrushSettings, Document, IRect, LayerTransform, Reference, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -801,4 +801,39 @@ fn copying_takes_the_selected_pixels() {
 
     doc.select_polygon(&rect_points(120.0, 120.0, 180.0, 180.0)); // nothing there
     assert!(doc.copy_pixels().is_none());
+}
+
+#[test]
+fn references_are_saved_with_the_project_but_not_drawn() {
+    let mut doc = Document::new(120, 90);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 45.0), (110.0, 45.0));
+    let picture = doc.render_rgba8(doc.bounds());
+    let mut plain = Vec::new();
+    doc.write_to(&mut plain).unwrap();
+
+    let revision = doc.revision();
+    let pixels: Vec<u8> = (0..5 * 3).flat_map(|i| [i as u8 * 10, 200, 30, 255]).collect();
+    doc.add_reference(Reference { name: "pose ✦".into(), width: 5, height: 3, rgba: std::sync::Arc::new(pixels.clone()) });
+    doc.add_reference(Reference { name: "manos".into(), width: 1, height: 1, rgba: std::sync::Arc::new(vec![1, 2, 3, 4]) });
+    assert_ne!(doc.revision(), revision); // counts as an unsaved change
+    assert_eq!(doc.render_rgba8(doc.bounds()), picture); // but never shows in the picture
+
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(loaded.references().len(), 2);
+    let first = &loaded.references()[0];
+    assert_eq!((first.name.as_str(), first.width, first.height), ("pose ✦", 5, 3));
+    assert_eq!(*first.rgba, pixels);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), picture);
+
+    // Files without references still load, and a file with references starts
+    // with the same bytes as one without, so older versions can read it.
+    assert!(Document::read_from(&mut plain.as_slice()).unwrap().references().is_empty());
+    assert_eq!(&bytes[..plain.len()], &plain[..]);
+
+    doc.remove_reference(0);
+    assert_eq!(doc.references()[0].name, "manos");
+    // A damaged trailer is rejected rather than half-read.
+    assert!(Document::read_from(&mut &bytes[..bytes.len() - 3]).is_err());
 }
