@@ -34,6 +34,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
   transformar y voltear afectan solo a lo seleccionado.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Navegador (`F7`): vista en miniatura del lienzo completo que marca la zona visible;
+  un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
@@ -77,6 +79,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `5` | Restablecer la rotación |
 | `F` | Voltear horizontalmente |
 | `F6` | Mostrar u ocultar las referencias |
+| `F7` | Mostrar u ocultar el navegador |
 | `F11` | Pantalla completa |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
 | `Ctrl+O` | Abrir proyecto |
