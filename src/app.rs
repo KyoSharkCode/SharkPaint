@@ -521,32 +521,37 @@ impl SharkPaintApp {
     fn tool_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         let text = ui.visuals().text_color();
-        for (tool, name, label, tip) in [
-            (Tool::Pincel, "pincel", "Pincel", "Pincel (B)"),
-            (Tool::Borrador, "borrador", "Borrador", "Borrador (E)"),
-        ] {
-            let button = egui::Button::image_and_text(icon(name, 18.0, text), label)
-                .selected(self.tool == tool)
-                .min_size(Vec2::new(ui.available_width(), 32.0));
-            if ui.add(button).on_hover_text(tip).clicked() {
-                self.tool = tool;
+        ui.columns(2, |columns| {
+            for (column, (tool, name, label, tip)) in columns.iter_mut().zip([
+                (Tool::Pincel, "pincel", "Pincel", "Pincel (B)"),
+                (Tool::Borrador, "borrador", "Borrador", "Borrador (E)"),
+            ]) {
+                let button = egui::Button::image_and_text(icon(name, 18.0, text), label)
+                    .selected(self.tool == tool)
+                    .min_size(Vec2::new(column.available_width(), 32.0));
+                if column.add(button).on_hover_text(tip).clicked() {
+                    self.tool = tool;
+                }
             }
-        }
+        });
+        ui.separator();
+        self.brush_panel(ui);
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+    fn color_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.strong("Color");
         let mut color = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
         ui.scope(|ui| {
             // The picker takes its width from the slider width; make it fill the panel.
-            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(120.0, 190.0);
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(120.0, 230.0);
             if egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque) {
                 self.color = [color.r(), color.g(), color.b()];
             }
         });
+    }
 
-        ui.separator();
+    fn brush_panel(&mut self, ui: &mut egui::Ui) {
         match self.tool {
             Tool::Pincel => {
                 ui.strong("Pinceles");
@@ -1196,21 +1201,21 @@ impl eframe::App for SharkPaintApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut commands));
         egui::Panel::bottom("estado").show(ui, |ui| self.status_bar(ui));
+        // Left: tools and their settings. Right: colour and layers.
         egui::Panel::left("herramientas")
             .resizable(false)
-            .default_size(118.0)
-            .show(ui, |ui| self.tool_panel(ui));
+            .default_size(250.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("ajustes_pincel")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.tool_panel(ui));
+            });
         egui::Panel::right("ajustes")
             .resizable(false)
             .default_size(260.0)
             .show(ui, |ui| {
-                // Brush settings scroll on top; the layer list keeps the bottom.
-                let layers_height = (ui.available_height() * 0.36).clamp(210.0, 340.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("ajustes_pincel")
-                    .max_height(ui.available_height() - layers_height - 8.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.settings_panel(ui));
+                self.color_panel(ui);
                 ui.separator();
                 self.layers_panel(ui, &mut commands);
             });
