@@ -1,5 +1,5 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
     LayerTransform, Reference, StrokePoint,
 };
 
@@ -1112,4 +1112,116 @@ fn mixing_respects_alpha_lock_and_cancel() {
     doc.set_layer_props(doc.active_layer(), props, false);
     line(&mut doc, &blender(24.0), [0, 0, 255], false, (50.0, 50.0), (140.0, 50.0));
     assert_eq!(pixel(&doc, 120, 50), [255, 255, 255, 255], "locked transparency stays transparent");
+}
+
+/// A descriptor entry of the kind Photoshop writes for one brush.
+fn abr_preset(name: &str, key: &str, diameter: f64, spacing: f64) -> Vec<u8> {
+    let text = |s: &str| -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
+        let mut out = (units.len() as u32).to_be_bytes().to_vec();
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    };
+    let mut out = b"\0\0\0\0Nm  TEXT".to_vec();
+    out.extend(text(name));
+    out.extend(b"\0\0\0\0DmtrUntF#Pxl");
+    out.extend(diameter.to_be_bytes());
+    out.extend(b"\0\0\0\0SpcnUntF#Prc");
+    out.extend(spacing.to_be_bytes());
+    out.extend(b"\0\0\0\x0bsampledDataTEXT");
+    out.extend(text(key));
+    out
+}
+
+/// One entry of the picture block: identifier, filler, bounds and the picture.
+fn abr_sample(key: &str, width: u32, height: u32, depth: u16, compressed: bool, body: &[u8]) -> Vec<u8> {
+    let mut entry = vec![key.len() as u8];
+    entry.extend(key.bytes());
+    entry.resize(47, 0);
+    for bound in [0, 0, height, width] {
+        entry.extend(bound.to_be_bytes());
+    }
+    entry.extend(depth.to_be_bytes());
+    entry.push(compressed as u8);
+    entry.extend(body);
+    let mut out = (entry.len() as u32).to_be_bytes().to_vec();
+    out.extend(&entry);
+    out.resize(4 + entry.len().div_ceil(4) * 4, 0);
+    out
+}
+
+fn abr_block(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = b"8BIM".to_vec();
+    out.extend(name);
+    out.extend((body.len() as u32).to_be_bytes());
+    out.extend(body);
+    out
+}
+
+#[test]
+fn photoshop_brush_files_are_read() {
+    // A 4x2 picture, packed row by row: a run of four, then four literal bytes.
+    let packed = [0u8, 2, 0, 5, 0xFD, 200, 3, 10, 20, 30, 40];
+    // The same size at sixteen bits, unpacked, high byte first.
+    // The low bytes carry fine detail, which looks like noise on its own.
+    let low = [7u8, 201, 66, 250, 13, 180, 99, 31];
+    let wide: Vec<u8> = [0u8, 64, 128, 255, 255, 128, 64, 0].iter().zip(low).flat_map(|(&v, l)| [v, l]).collect();
+    let mut samples = abr_sample("uno-1111", 4, 2, 8, true, &packed);
+    samples.extend(abr_sample("dos-2222", 4, 2, 16, false, &wide));
+    let mut settings = abr_preset("Hojas secas", "dos-2222", 80.0, 12.0);
+    settings.extend(abr_preset("Tiza", "uno-1111", 30.0, 25.0));
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"patt", &[1, 2, 3, 4]));
+    file.extend(abr_block(b"samp", &samples));
+    file.extend(abr_block(b"desc", &settings));
+
+    let brushes = read_abr(&file).expect("a well-formed file");
+    assert_eq!(brushes.len(), 2);
+    assert_eq!((brushes[0].width, brushes[0].height), (4, 2));
+    assert_eq!(brushes[0].coverage, [200, 200, 200, 200, 10, 20, 30, 40]);
+    // Settings follow the identifier, not the order they are written in.
+    assert_eq!(brushes[0].name.as_deref(), Some("Tiza"));
+    assert_eq!(brushes[0].diameter, Some(30.0));
+    assert_eq!(brushes[0].spacing, Some(0.25));
+    assert_eq!(brushes[1].name.as_deref(), Some("Hojas secas"));
+    assert_eq!(brushes[1].coverage, [0, 64, 128, 255, 255, 128, 64, 0]);
+    assert_eq!(brushes[1].spacing, Some(0.12));
+
+    // The old layout: a computed brush to skip, then a named sampled one.
+    let mut old = vec![0, 2, 0, 2];
+    old.extend([0, 1, 0, 0, 0, 3, 9, 9, 9]);
+    let mut body = vec![0, 0, 0, 0, 0, 40]; // unused, spacing 40 %
+    body.extend([0, 0, 0, 2, 0, b'O', 0, b'k']);
+    body.push(1);
+    body.extend([0; 8]);
+    for bound in [0u32, 0, 2, 3] {
+        body.extend(bound.to_be_bytes());
+    }
+    body.extend([0, 8, 0]);
+    body.extend([1, 2, 3, 4, 5, 6]);
+    old.extend([0, 2]);
+    old.extend((body.len() as u32).to_be_bytes());
+    old.extend(&body);
+    let brushes = read_abr(&old).expect("an old-style file");
+    assert_eq!(brushes.len(), 1);
+    assert_eq!(brushes[0].name.as_deref(), Some("Ok"));
+    assert_eq!((brushes[0].width, brushes[0].height, brushes[0].spacing), (3, 2, Some(0.4)));
+    assert_eq!(brushes[0].coverage, [1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn damaged_brush_files_are_rejected_without_panicking() {
+    assert!(read_abr(b"").is_err());
+    assert!(read_abr(b"not a brush file at all").is_err());
+    let mut file = vec![0, 6, 0, 2];
+    file.extend(abr_block(b"samp", &abr_sample("x", 4, 2, 8, false, &[1, 2, 3, 4, 5, 6, 7, 8])));
+    // Version 6.2 skips further than this entry is long, and every cut is safe.
+    for cut in 0..file.len() {
+        let _ = read_abr(&file[..cut]);
+    }
+    // Absurd sizes are refused rather than allocated.
+    let huge = abr_sample("x", 4_000_000, 4_000_000, 8, false, &[]);
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"samp", &huge));
+    assert!(read_abr(&file).is_err());
 }

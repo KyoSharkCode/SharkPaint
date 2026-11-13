@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
+    builtin_papers, builtin_tips, read_abr, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
 };
 
 use crate::settings::config_dir;
@@ -346,7 +346,53 @@ impl BrushLibrary {
                 }
             })
             .collect();
-        // Trim the empty margin, then centre the shape in a square.
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "punta".into());
+        self.store_tip(&stem, w, h, &coverage).map(|(tip, _)| tip)
+    }
+
+    /// Reads a Photoshop brush file and adds a brush for each tip drawn in it.
+    /// Returns how many were added. Only the shape, size, spacing, angle and
+    /// roundness carry over; Photoshop's dynamics have no equivalent here.
+    pub fn import_abr(&mut self, path: &Path) -> Result<usize, String> {
+        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        let file = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "abr".into());
+        let mut added = 0;
+        for (i, brush) in read_abr(&data)?.into_iter().enumerate() {
+            let name = match &brush.name {
+                Some(name) => name.clone(),
+                None => format!("{file} {}", i + 1),
+            };
+            // The number keeps tips with the same name in one file apart.
+            let stem = format!("{file} {:03} {name}", i + 1);
+            let Ok((tip, side)) = self.store_tip(&stem, brush.width, brush.height, &brush.coverage) else {
+                continue; // an empty picture
+            };
+            let size = brush.diameter.unwrap_or(side as f32).clamp(4.0, 500.0);
+            let settings = BrushSettings {
+                tip: BrushTip::Image(tip),
+                spacing: brush.spacing.unwrap_or(0.25).clamp(0.02, 5.0),
+                angle: brush.angle.unwrap_or(0.0).clamp(-360.0, 360.0),
+                roundness: brush.roundness.unwrap_or(1.0).clamp(0.02, 1.0),
+                smoothing: 0.2,
+                ..BrushSettings::round(size)
+            };
+            // Importing a file again replaces its brushes rather than doubling them.
+            match self.brushes.iter_mut().find(|b| b.name == name && b.settings.tip == settings.tip) {
+                Some(existing) => existing.settings = settings,
+                None => self.brushes.push(Brush { name, settings }),
+            }
+            added += 1;
+        }
+        if added == 0 {
+            return Err("el archivo no contiene puntas que se puedan usar".into());
+        }
+        Ok(added)
+    }
+
+    /// Trims a coverage picture, centres it in a square, saves it with the
+    /// other imported tips and adds it to the library. Also returns the side
+    /// of the trimmed shape in pixels, before any reduction.
+    fn store_tip(&mut self, name: &str, w: usize, h: usize, coverage: &[u8]) -> Result<(Arc<TipImage>, usize), String> {
         let used: Vec<(usize, usize)> =
             (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| coverage[y * w + x] > 8).collect();
         if used.is_empty() {
@@ -366,23 +412,24 @@ impl BrushLibrary {
             square = image::imageops::resize(&square, MAX_TIP_SIDE, MAX_TIP_SIDE, image::imageops::FilterType::Triangle);
         }
 
-        let stem: String = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "punta".into())
+        let stem: String = name
+            .trim()
             .chars()
+            .take(80)
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
             .collect();
+        // File names cannot end in a space on Windows.
+        let stem = stem.trim().to_owned();
         if let Some(dir) = config_dir().map(|d| d.join("puntas")) {
             let _ = std::fs::create_dir_all(&dir);
             square.save(dir.join(format!("{stem}.png"))).map_err(|e| e.to_string())?;
         }
-        let side = square.width() as usize;
-        let tip = Arc::new(TipImage::new(format!("archivo:{stem}"), stem, side, square.into_raw()));
+        let stored = square.width() as usize;
+        let tip = Arc::new(TipImage::new(format!("archivo:{stem}"), stem, stored, square.into_raw()));
         // Importing the same name again replaces the earlier shape.
         self.tips.retain(|t| t.id != tip.id);
         self.tips.push(tip.clone());
-        Ok(tip)
+        Ok((tip, side))
     }
 }
 

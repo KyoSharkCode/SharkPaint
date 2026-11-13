@@ -1,5 +1,6 @@
 //! CPU raster painting engine: tiled layers, a dab-based brush, and undo history.
 
+mod abr;
 mod brush;
 mod document;
 mod export;
@@ -11,6 +12,7 @@ mod stroke;
 mod tips;
 mod tools;
 
+pub use abr::{read_abr, AbrBrush};
 pub use brush::{BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage};
 pub use papers::builtin_papers;
 pub use tips::builtin_tips;

@@ -497,6 +497,8 @@ impl SharkPaintApp {
         if let Some(path) = open_path {
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
                 app.load_project(path);
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
+                app.import_abr(&path);
             } else {
                 app.insert_image_file(&path);
                 app.saved_revision = app.doc.revision();
@@ -1510,6 +1512,19 @@ impl SharkPaintApp {
                 ui.add(egui::TextEdit::singleline(&mut self.library.brushes[i].name).desired_width(150.0));
             });
         }
+        if ui
+            .small_button("Importar de Photoshop (.abr)…")
+            .on_hover_text("Añade las puntas de un archivo de pinceles de Photoshop.\nSe importan la forma, el tamaño y el espaciado; el resto se ajusta aquí.\nTambién puedes arrastrar el archivo a la ventana.")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Importar pinceles de Photoshop")
+                .add_filter("Pinceles de Photoshop", &["abr"])
+                .pick_file()
+            {
+                self.import_abr(&path);
+            }
+        }
         if ui.small_button("Restaurar los pinceles iniciales").clicked() {
             self.library.brushes = self.library.default_brushes();
             self.brush_index = self.library.brushes.iter().position(|b| b.settings == self.brush);
@@ -2148,6 +2163,25 @@ impl SharkPaintApp {
         }
     }
 
+    /// Adds the brushes of a Photoshop brush file to the library and picks the first.
+    fn import_abr(&mut self, path: &std::path::Path) {
+        let before = self.library.brushes.len();
+        match self.library.import_abr(path) {
+            Ok(count) => {
+                self.status = format!("{count} pinceles importados de «{}».", path.file_name().unwrap_or_default().to_string_lossy());
+                // New brushes are at the end; re-imported ones keep their place.
+                if let Some(brush) = self.library.brushes.get(before) {
+                    self.brush = brush.settings.clone();
+                    self.brush_index = Some(before);
+                    self.brush_source = Some(before);
+                    self.tool = Tool::Pincel;
+                }
+                self.library.save();
+            }
+            Err(e) => self.status = format!("No se pudieron importar los pinceles: {e}"),
+        }
+    }
+
     /// Clipboard shortcuts and files dropped on the window.
     fn incoming_images(&mut self, ctx: &egui::Context) {
         let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
@@ -2176,6 +2210,8 @@ impl SharkPaintApp {
             let on_references = self.pointer_on_references;
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
                 self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
+                self.import_abr(&path);
             } else if on_references {
                 // Dropped on the reference panel: it is for looking at, not drawing on.
                 self.add_reference_file(&path);
