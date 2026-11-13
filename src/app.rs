@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, StrokePoint, PROJECT_EXTENSION,
+    LayerTransform, Reference, SelectMode, StrokePoint, PROJECT_EXTENSION,
 };
 
 use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
@@ -95,13 +95,16 @@ enum SelectShape {
     Rectangulo,
     Elipse,
     Libre,
+    /// A click selects the area of similar colour.
+    Varita,
 }
 
 impl SelectShape {
-    const ALL: [(SelectShape, &'static str); 3] = [
+    const ALL: [(SelectShape, &'static str); 4] = [
         (SelectShape::Rectangulo, "Rectángulo"),
         (SelectShape::Elipse, "Elipse"),
         (SelectShape::Libre, "Forma libre"),
+        (SelectShape::Varita, "Varita mágica"),
     ];
 
     /// The outline of a selection dragged from `from` to `to`, in canvas
@@ -109,7 +112,7 @@ impl SelectShape {
     /// rectangles square and ellipses round.
     fn outline(self, from: Pos2, to: Pos2, trail: &[Pos2], regular: bool) -> Vec<(f32, f32)> {
         let mut to = to;
-        if regular && self != SelectShape::Libre {
+        if regular && matches!(self, SelectShape::Rectangulo | SelectShape::Elipse) {
             let side = (to.x - from.x).abs().max((to.y - from.y).abs());
             to = Pos2::new(from.x + side * (to.x - from.x).signum(), from.y + side * (to.y - from.y).signum());
         }
@@ -124,7 +127,7 @@ impl SelectShape {
                     (rect.center().x + rect.width() * 0.5 * a.cos(), rect.center().y + rect.height() * 0.5 * a.sin())
                 })
                 .collect(),
-            SelectShape::Libre => trail.iter().map(|p| (p.x, p.y)).collect(),
+            SelectShape::Libre | SelectShape::Varita => trail.iter().map(|p| (p.x, p.y)).collect(),
         }
     }
 }
@@ -260,6 +263,7 @@ enum Command {
     FinishTransform(bool),
     SelectAll,
     Deselect,
+    InvertSelection,
     DeleteSelected,
     FlipContents(bool),
     Quit,
@@ -310,6 +314,14 @@ pub struct SharkPaintApp {
     xform_empty: Option<(u64, u64, u64)>,
     select_shape: SelectShape,
     select_drag: Option<SelectDrag>,
+    /// How a new selection combines with the current one.
+    select_mode: SelectMode,
+    /// How far a colour may be from the one clicked for the magic wand to take it.
+    select_tolerance: f32,
+    /// The magic wand stops at the edges of the area clicked.
+    select_contiguous: bool,
+    /// The magic wand looks at the whole picture rather than the active layer.
+    select_all_layers: bool,
     /// What Copy or Cut last took: where it was on the canvas and its pixels.
     clip: Option<(IRect, Vec<u8>)>,
     /// The brushes on offer and the tip shapes they use.
@@ -440,6 +452,10 @@ impl SharkPaintApp {
             xform_empty: None,
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
+            select_mode: SelectMode::Replace,
+            select_tolerance: 0.15,
+            select_contiguous: true,
+            select_all_layers: true,
             clip: None,
             library: BrushLibrary { brushes: Vec::new(), tips: Vec::new(), papers: Vec::new() },
             brush_index: Some(1),
@@ -894,6 +910,9 @@ impl SharkPaintApp {
             if hit(cmd, Key::D) {
                 commands.push(Command::Deselect);
             }
+            if hit(cmd | egui::Modifiers::SHIFT, Key::I) {
+                commands.push(Command::InvertSelection);
+            }
             if hit(none, Key::Delete) {
                 commands.push(Command::DeleteSelected);
             }
@@ -1052,6 +1071,9 @@ impl SharkPaintApp {
                 }
                 if ui.add_enabled(selected, egui::Button::new("Deseleccionar").shortcut_text("Ctrl+D")).clicked() {
                     commands.push(Command::Deselect);
+                }
+                if ui.add(egui::Button::new("Invertir selección").shortcut_text("Ctrl+Mayús+I")).clicked() {
+                    commands.push(Command::InvertSelection);
                 }
                 ui.separator();
                 if ui.add_enabled(selected, egui::Button::new("Borrar lo seleccionado").shortcut_text("Supr")).clicked() {
@@ -1913,8 +1935,40 @@ impl SharkPaintApp {
                     }
                 });
                 ui.add_space(4.0);
-                ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
-                ui.label("Un clic sin arrastrar quita la selección.");
+                ui.horizontal_wrapped(|ui| {
+                    for (mode, name, tip) in [
+                        (SelectMode::Replace, "Nueva", "Sustituye la selección"),
+                        (SelectMode::Add, "Añadir", "Suma a la selección"),
+                        (SelectMode::Subtract, "Quitar", "Resta de la selección"),
+                        (SelectMode::Intersect, "Intersecar", "Deja solo lo que coincide con la selección"),
+                    ] {
+                        ui.selectable_value(&mut self.select_mode, mode, name).on_hover_text(tip);
+                    }
+                });
+                ui.add_space(4.0);
+                if self.select_shape == SelectShape::Varita {
+                    ui.horizontal(|ui| {
+                        ui.label("Tolerancia");
+                        ui.add(egui::Slider::new(&mut self.select_tolerance, 0.0..=1.0).custom_formatter(percent));
+                    });
+                    ui.checkbox(&mut self.select_contiguous, "Solo la zona tocada")
+                        .on_hover_text("Desmarcado, toma ese color en todo el lienzo");
+                    ui.checkbox(&mut self.select_all_layers, "Tener en cuenta todas las capas");
+                    ui.label("Haz clic sobre un color para seleccionar su zona.");
+                } else {
+                    ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
+                    if self.select_mode == SelectMode::Replace {
+                        ui.label("Un clic sin arrastrar quita la selección.");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Invertir").on_hover_text("Ctrl+Mayús+I").clicked() {
+                        self.doc.invert_selection();
+                    }
+                    if ui.small_button("Deseleccionar").on_hover_text("Ctrl+D").clicked() {
+                        self.doc.deselect();
+                    }
+                });
                 ui.label("Pintar, borrar, rellenar, transformar y voltear afectan solo a lo seleccionado.");
                 return;
             }
@@ -2607,6 +2661,18 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
+                    if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
+                        let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
+                        self.doc.select_similar(
+                            x,
+                            y,
+                            self.select_tolerance,
+                            self.select_all_layers,
+                            self.select_contiguous,
+                            self.select_mode,
+                        );
+                        continue;
+                    }
                     if self.tool == Tool::Seleccion && !alt {
                         self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
                         continue;
@@ -2712,8 +2778,8 @@ impl SharkPaintApp {
                     if let Some(drag) = self.select_drag.take() {
                         if drag.moved {
                             let outline = self.select_shape.outline(drag.from, drag.to, &drag.trail, free);
-                            self.doc.select_polygon(&outline);
-                        } else {
+                            self.doc.select_polygon_with(&outline, self.select_mode);
+                        } else if self.select_mode == SelectMode::Replace {
                             self.doc.deselect();
                         }
                         continue;
@@ -2815,8 +2881,24 @@ impl SharkPaintApp {
         };
         if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
             dashed(&self.select_shape.outline(drag.from, drag.to, &drag.trail, free));
-        } else if let Some(selection) = self.doc.selection() {
-            dashed(&selection.outline);
+        }
+        if let Some(selection) = self.doc.selection() {
+            // The border as runs along pixel edges; only those in view are drawn.
+            let visible = painter.clip_rect().expand(2.0);
+            let mut drawn = 0;
+            for [a, b] in &selection.edges {
+                let a = self.view.to_screen(Pos2::new(a.0, a.1), viewport, doc_size);
+                let b = self.view.to_screen(Pos2::new(b.0, b.1), viewport, doc_size);
+                if !visible.intersects(Rect::from_two_pos(a, b)) {
+                    continue;
+                }
+                drawn += 1;
+                painter.line_segment([a, b], Stroke::new(1.0, Color32::WHITE));
+                // Dashes cost more; an intricate border goes without once it is long.
+                if drawn < 6000 {
+                    painter.extend(Shape::dashed_line(&[a, b], Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
+                }
+            }
         }
 
         // The transform box: outline and corner handles.
@@ -2977,6 +3059,7 @@ impl SharkPaintApp {
             Command::FinishTransform(apply) => self.finish_transform(apply),
             Command::SelectAll => self.doc.select_all(),
             Command::Deselect => self.doc.deselect(),
+            Command::InvertSelection => self.doc.invert_selection(),
             Command::DeleteSelected => self.doc.clear_selection_contents(),
             Command::FlipContents(horizontal) => self.doc.flip(horizontal),
             Command::Fullscreen => {

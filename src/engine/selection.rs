@@ -9,8 +9,18 @@ pub struct Selection {
     pub mask: Vec<u8>,
     /// Smallest rectangle containing every selected pixel.
     pub bounds: IRect,
-    /// The shape's outline in canvas coordinates, for drawing it.
-    pub outline: Vec<(f32, f32)>,
+    /// The border between selected and unselected pixels, as straight
+    /// segments in canvas coordinates, for drawing it.
+    pub edges: Vec<[(f32, f32); 2]>,
+}
+
+/// How a new selection combines with the one already there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectMode {
+    Replace,
+    Add,
+    Subtract,
+    Intersect,
 }
 
 impl Selection {
@@ -62,13 +72,46 @@ impl Selection {
                 }
             }
         }
-        (x0 != usize::MAX).then(|| Selection {
-            width,
-            height,
-            mask,
-            bounds: IRect::new(x0 as i32, y0 as i32, x1 as i32 + 1, y1 as i32 + 1),
-            outline: points.to_vec(),
-        })
+        let _ = (x0, y0, x1, y1);
+        Selection::from_mask(width, height, mask)
+    }
+
+    /// A selection from per-pixel coverage. `None` if nothing is selected.
+    pub fn from_mask(width: usize, height: usize, mask: Vec<u8>) -> Option<Selection> {
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for (y, row) in mask.chunks_exact(width).enumerate() {
+            let Some(first) = row.iter().position(|&v| v != 0) else { continue };
+            let last = row.iter().rposition(|&v| v != 0).unwrap_or(first);
+            x0 = x0.min(first);
+            x1 = x1.max(last);
+            y0 = y0.min(y);
+            y1 = y;
+        }
+        if x0 == usize::MAX {
+            return None;
+        }
+        let bounds = IRect::new(x0 as i32, y0 as i32, x1 as i32 + 1, y1 as i32 + 1);
+        let edges = trace_edges(width, &mask, bounds);
+        Some(Selection { width, height, mask, bounds, edges })
+    }
+
+    /// This selection combined with new coverage. `None` if nothing is left.
+    pub fn combined(current: Option<&Selection>, width: usize, height: usize, new: &[u8], mode: SelectMode) -> Option<Selection> {
+        let mask: Vec<u8> = match (current, mode) {
+            (_, SelectMode::Replace) | (None, SelectMode::Add) => new.to_vec(),
+            (None, _) => return None,
+            (Some(old), SelectMode::Add) => old.mask.iter().zip(new).map(|(&a, &b)| a.max(b)).collect(),
+            (Some(old), SelectMode::Subtract) => {
+                old.mask.iter().zip(new).map(|(&a, &b)| ((a as u32 * (255 - b as u32) + 127) / 255) as u8).collect()
+            }
+            (Some(old), SelectMode::Intersect) => old.mask.iter().zip(new).map(|(&a, &b)| a.min(b)).collect(),
+        };
+        Selection::from_mask(width, height, mask)
+    }
+
+    /// Everything that is not selected. `None` if the whole canvas was.
+    pub fn inverted(&self) -> Option<Selection> {
+        Selection::from_mask(self.width, self.height, self.mask.iter().map(|&v| 255 - v).collect())
     }
 
     /// Coverage (0..=255) at a canvas pixel; outside the canvas is unselected.
@@ -89,11 +132,47 @@ impl Selection {
                 mask[my as usize * self.width + mx as usize] = self.mask[y as usize * self.width + x as usize];
             }
         }
-        let outline = self
-            .outline
-            .iter()
-            .map(|&(x, y)| if horizontal { ((b.x0 + b.x1) as f32 - x, y) } else { (x, (b.y0 + b.y1) as f32 - y) })
-            .collect();
-        Selection { width: self.width, height: self.height, mask, bounds: b, outline }
+        let edges = trace_edges(self.width, &mask, b);
+        Selection { width: self.width, height: self.height, mask, bounds: b, edges }
     }
+}
+
+/// The border of the selected area inside `bounds`, as runs along pixel
+/// edges. A pixel counts as selected from half coverage up.
+fn trace_edges(width: usize, mask: &[u8], bounds: IRect) -> Vec<[(f32, f32); 2]> {
+    let inside = |x: i32, y: i32| {
+        x >= bounds.x0 && x < bounds.x1 && y >= bounds.y0 && y < bounds.y1 && mask[y as usize * width + x as usize] >= 128
+    };
+    let mut edges = Vec::new();
+    // Horizontal runs: between each row and the one above it.
+    for y in bounds.y0..=bounds.y1 {
+        let mut start: Option<i32> = None;
+        for x in bounds.x0..=bounds.x1 {
+            let border = x < bounds.x1 && inside(x, y - 1) != inside(x, y);
+            match (border, start) {
+                (true, None) => start = Some(x),
+                (false, Some(from)) => {
+                    edges.push([(from as f32, y as f32), (x as f32, y as f32)]);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    // Vertical runs: between each column and the one to its left.
+    for x in bounds.x0..=bounds.x1 {
+        let mut start: Option<i32> = None;
+        for y in bounds.y0..=bounds.y1 {
+            let border = y < bounds.y1 && inside(x - 1, y) != inside(x, y);
+            match (border, start) {
+                (true, None) => start = Some(y),
+                (false, Some(from)) => {
+                    edges.push([(x as f32, from as f32), (x as f32, y as f32)]);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    edges
 }

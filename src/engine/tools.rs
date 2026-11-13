@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::brush::BrushSettings;
 use super::document::Document;
 use super::layer::{IRect, Layer, Px, Tile, ONE, TILE};
-use super::selection::Selection;
+use super::selection::{SelectMode, Selection};
 use super::stroke::StrokePoint;
 
 /// Remembers the original contents of every tile an edit touches.
@@ -36,6 +36,80 @@ impl TileEdit {
 // --- Flood fill -------------------------------------------------------------
 
 impl Document {
+    /// What fills and colour selections look at: 8-bit premultiplied RGBA per
+    /// pixel, of the whole picture or of the active layer alone.
+    fn fill_reference(&self, all_layers: bool) -> Vec<[u8; 4]> {
+        let (w, h) = (self.width, self.height);
+        if all_layers {
+            return self.render_rgba8(self.bounds()).chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        }
+        let layer = &self.layers[self.active_layer];
+        let mut pixels = vec![[0u8; 4]; w * h];
+        for ty in 0..layer.tiles_y {
+            for tx in 0..layer.tiles_x {
+                let Some(tile) = &layer.tiles[layer.tile_index(tx, ty)] else { continue };
+                for py in 0..TILE.min(h - ty * TILE) {
+                    let row = (ty * TILE + py) * w + tx * TILE;
+                    for px in 0..TILE.min(w - tx * TILE) {
+                        pixels[row + px] = tile.0[py * TILE + px].map(|c| (c >> 7).min(255) as u8);
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    /// Selects the pixels whose colour is close to the one at (x, y): the
+    /// area joined to that point, or every such pixel on the canvas. The
+    /// result combines with the current selection as `mode` says. Returns
+    /// whether the point was on the canvas.
+    pub fn select_similar(&mut self, x: i32, y: i32, tolerance: f32, all_layers: bool, contiguous: bool, mode: SelectMode) -> bool {
+        self.end_stroke();
+        let (w, h) = (self.width, self.height);
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+            return false;
+        }
+        let reference = self.fill_reference(all_layers);
+        let seed = reference[y as usize * w + x as usize];
+        let limit = (tolerance.clamp(0.0, 1.0) * 255.0).round() as i32;
+        let matches = |p: [u8; 4]| (0..4).all(|c| (p[c] as i32 - seed[c] as i32).abs() <= limit);
+        let mut mask = vec![0u8; w * h];
+        if contiguous {
+            let mut stack = vec![(x as usize, y as usize)];
+            mask[y as usize * w + x as usize] = 255;
+            while let Some((cx, cy)) = stack.pop() {
+                let mut visit = |nx: usize, ny: usize| {
+                    let i = ny * w + nx;
+                    if mask[i] == 0 && matches(reference[i]) {
+                        mask[i] = 255;
+                        stack.push((nx, ny));
+                    }
+                };
+                if cx > 0 {
+                    visit(cx - 1, cy);
+                }
+                if cx + 1 < w {
+                    visit(cx + 1, cy);
+                }
+                if cy > 0 {
+                    visit(cx, cy - 1);
+                }
+                if cy + 1 < h {
+                    visit(cx, cy + 1);
+                }
+            }
+        } else {
+            for (cell, pixel) in mask.iter_mut().zip(&reference) {
+                if matches(*pixel) {
+                    *cell = 255;
+                }
+            }
+        }
+        let next = Selection::combined(self.selection.as_deref(), w, h, &mask, mode);
+        self.set_selection(next.map(Arc::new));
+        true
+    }
+
     /// Fills the area around (`x`, `y`) on the active layer with `color`.
     ///
     /// The area is every connected pixel within `tolerance` (0..=1) of the one
@@ -54,25 +128,7 @@ impl Document {
             return false;
         }
 
-        // What the fill looks at: 8-bit premultiplied RGBA per pixel.
-        let reference: Vec<[u8; 4]> = if all_layers {
-            self.render_rgba8(self.bounds()).chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect()
-        } else {
-            let layer = &self.layers[li];
-            let mut pixels = vec![[0u8; 4]; w * h];
-            for ty in 0..layer.tiles_y {
-                for tx in 0..layer.tiles_x {
-                    let Some(tile) = &layer.tiles[layer.tile_index(tx, ty)] else { continue };
-                    for py in 0..TILE.min(h - ty * TILE) {
-                        let row = (ty * TILE + py) * w + tx * TILE;
-                        for px in 0..TILE.min(w - tx * TILE) {
-                            pixels[row + px] = tile.0[py * TILE + px].map(|c| (c >> 7).min(255) as u8);
-                        }
-                    }
-                }
-            }
-            pixels
-        };
+        let reference = self.fill_reference(all_layers);
         let seed = reference[y as usize * w + x as usize];
         let limit = (tolerance.clamp(0.0, 1.0) * 255.0).round() as i32;
         let selection = self.selection.clone();

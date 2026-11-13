@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
     builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, StrokePoint,
+    LayerTransform, Reference, SelectMode, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -1333,4 +1333,89 @@ fn photoshop_round_brushes_and_names_come_from_the_settings() {
         assert!(brush.pressure_size && brush.pressure_flow);
         assert_eq!(brush.min_size, Some(0.2));
     }
+}
+
+#[test]
+fn selections_add_subtract_intersect_and_invert() {
+    let mut doc = Document::new(200, 200);
+    let covered = |doc: &Document, x: i32, y: i32| doc.selection().map_or(0, |s| s.coverage(x, y));
+    doc.select_polygon(&rect_points(20.0, 20.0, 100.0, 100.0));
+    doc.select_polygon_with(&rect_points(80.0, 80.0, 160.0, 160.0), SelectMode::Add);
+    assert_eq!((covered(&doc, 30, 30), covered(&doc, 150, 150), covered(&doc, 150, 30)), (255, 255, 0));
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 160, 160));
+
+    doc.select_polygon_with(&rect_points(0.0, 0.0, 60.0, 200.0), SelectMode::Subtract);
+    assert_eq!((covered(&doc, 30, 30), covered(&doc, 70, 30), covered(&doc, 150, 150)), (0, 255, 255));
+
+    doc.select_polygon_with(&rect_points(0.0, 0.0, 200.0, 90.0), SelectMode::Intersect);
+    assert_eq!((covered(&doc, 70, 30), covered(&doc, 150, 150), covered(&doc, 150, 85)), (255, 0, 255));
+
+    doc.invert_selection();
+    assert_eq!((covered(&doc, 70, 30), covered(&doc, 150, 150), covered(&doc, 5, 5)), (0, 255, 255));
+    // Taking away from nothing, or adding nothing, leaves things as they are.
+    let stamp = doc.selection_stamp();
+    doc.select_polygon_with(&rect_points(500.0, 500.0, 600.0, 600.0), SelectMode::Add);
+    assert_eq!(doc.selection_stamp(), stamp);
+    // Inverting with nothing selected selects everything.
+    doc.deselect();
+    doc.invert_selection();
+    assert_eq!(doc.selection().unwrap().bounds, doc.bounds());
+    // The border is drawn from the selected pixels themselves.
+    doc.select_polygon(&rect_points(10.0, 10.0, 50.0, 30.0));
+    let mut edges = doc.selection().unwrap().edges.clone();
+    edges.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(edges, [
+        [(10.0, 10.0), (10.0, 30.0)],
+        [(10.0, 10.0), (50.0, 10.0)],
+        [(10.0, 30.0), (50.0, 30.0)],
+        [(50.0, 10.0), (50.0, 30.0)],
+    ]);
+}
+
+#[test]
+fn selection_changes_can_be_undone_without_touching_the_drawing() {
+    let mut doc = Document::new(200, 200);
+    line(&mut doc, &hard_brush(20.0), [0, 0, 0], false, (40.0, 40.0), (160.0, 40.0));
+    let revision = doc.revision();
+    doc.select_polygon(&rect_points(20.0, 20.0, 100.0, 100.0));
+    doc.select_polygon_with(&rect_points(80.0, 80.0, 160.0, 160.0), SelectMode::Add);
+    assert_eq!(doc.revision(), revision, "selecting is not a change to the drawing");
+    doc.undo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 100, 100));
+    doc.undo();
+    assert!(doc.selection().is_none());
+    assert_eq!(pixel(&doc, 100, 40), [0, 0, 0, 255], "the stroke is still there");
+    doc.redo();
+    doc.redo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 160, 160));
+    doc.undo();
+    doc.undo();
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 40), [255, 255, 255, 255], "the third undo reaches the stroke");
+}
+
+#[test]
+fn the_magic_wand_selects_by_colour() {
+    let mut doc = Document::new(200, 100);
+    // Two separate red blocks and a blue one.
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (30.0, 50.0), (40.0, 50.0));
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (160.0, 50.0), (170.0, 50.0));
+    line(&mut doc, &hard_brush(30.0), [0, 0, 255], false, (95.0, 50.0), (105.0, 50.0));
+    let covered = |doc: &Document, x: i32, y: i32| doc.selection().map_or(0, |s| s.coverage(x, y));
+
+    assert!(doc.select_similar(35, 50, 0.1, true, true, SelectMode::Replace));
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 165, 50), covered(&doc, 100, 50), covered(&doc, 5, 5)), (255, 0, 0, 0));
+    // Not limited to the area touched: both red blocks.
+    doc.select_similar(35, 50, 0.1, true, false, SelectMode::Replace);
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 165, 50), covered(&doc, 100, 50)), (255, 255, 0));
+    // Adding the blue one.
+    doc.select_similar(100, 50, 0.1, true, true, SelectMode::Add);
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 100, 50), covered(&doc, 5, 5)), (255, 255, 0));
+    // The paper around them is one joined area.
+    doc.select_similar(5, 5, 0.1, true, true, SelectMode::Replace);
+    assert_eq!((covered(&doc, 5, 5), covered(&doc, 195, 95), covered(&doc, 35, 50)), (255, 255, 0));
+    // Off the canvas nothing happens.
+    let stamp = doc.selection_stamp();
+    assert!(!doc.select_similar(-5, 50, 0.1, true, true, SelectMode::Replace));
+    assert_eq!(doc.selection_stamp(), stamp);
 }

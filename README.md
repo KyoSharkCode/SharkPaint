@@ -31,8 +31,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
   caja sobre el lienzo).
-- Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
-  transformar y voltear afectan solo a lo seleccionado.
+- Selección rectangular, elíptica, de forma libre o por color (varita mágica), que se
+  puede sumar, restar, intersecar e invertir: pintar, borrar, rellenar, transformar y
+  voltear afectan solo a lo seleccionado. Los cambios de selección se deshacen.
 - Voltear la capa o la selección, en horizontal y en vertical.
 - Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
@@ -53,7 +54,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 ## Pendiente
 
 - Grupos de capas.
-- Sumar y restar selecciones, y deshacer los cambios de selección.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
@@ -66,6 +66,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
+| `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |

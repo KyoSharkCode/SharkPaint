@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::brush::BrushSettings;
 use super::layer::{blend_over, IRect, Layer, LayerProps, Tile, ONE, TILE};
-use super::selection::Selection;
+use super::selection::{SelectMode, Selection};
 use super::stroke::{ActiveStroke, StrokePoint};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
@@ -21,6 +21,8 @@ enum HistoryEntry {
     Layers { layers: Vec<Layer>, active: usize },
     /// One layer's name, visibility, opacity, blend mode or alpha lock.
     Props { layer: usize, props: LayerProps },
+    /// The selection as it was.
+    Selection(Option<Arc<Selection>>),
 }
 
 /// A reference image kept alongside the drawing: shown in its own panel,
@@ -319,9 +321,47 @@ impl Document {
     /// Selects the inside of a closed polygon given in canvas coordinates.
     /// A polygon that covers nothing clears the selection.
     pub fn select_polygon(&mut self, points: &[(f32, f32)]) {
+        self.select_polygon_with(points, SelectMode::Replace);
+    }
+
+    /// Selects the inside of a closed polygon, combined with the selection
+    /// already there as `mode` says.
+    pub fn select_polygon_with(&mut self, points: &[(f32, f32)], mode: SelectMode) {
         self.end_stroke();
-        self.selection = Selection::from_polygon(self.width, self.height, points).map(Arc::new);
+        let shape = Selection::from_polygon(self.width, self.height, points);
+        let next = match (shape, mode) {
+            (shape, SelectMode::Replace) => shape,
+            // Adding or taking away nothing changes nothing.
+            (None, SelectMode::Add | SelectMode::Subtract) => return,
+            (None, SelectMode::Intersect) => None,
+            (Some(shape), _) => Selection::combined(self.selection.as_deref(), self.width, self.height, &shape.mask, mode),
+        };
+        self.set_selection(next.map(Arc::new));
+    }
+
+    /// Selects what was not selected, and the other way round.
+    pub fn invert_selection(&mut self) {
+        self.end_stroke();
+        match self.selection.clone() {
+            Some(selection) => self.set_selection(selection.inverted().map(Arc::new)),
+            None => self.select_all(),
+        }
+    }
+
+    /// Replaces the selection, remembering the old one for undo.
+    pub(super) fn set_selection(&mut self, next: Option<Arc<Selection>>) {
+        if self.selection.is_none() && next.is_none() {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.selection, next);
         self.selection_stamp += 1;
+        // The selection is not part of the drawing: changing it leaves the
+        // document as saved as it was.
+        self.undo.push(HistoryEntry::Selection(previous));
+        self.redo.clear();
+        if self.undo.len() > MAX_UNDO_STEPS {
+            self.undo.remove(0);
+        }
     }
 
     pub fn select_all(&mut self) {
@@ -331,9 +371,7 @@ impl Document {
 
     pub fn deselect(&mut self) {
         self.end_stroke();
-        if self.selection.take().is_some() {
-            self.selection_stamp += 1;
-        }
+        self.set_selection(None);
     }
 
     // --- Strokes --------------------------------------------------------------
@@ -531,8 +569,14 @@ impl Document {
     }
 
     fn swap_entry(&mut self, entry: &mut HistoryEntry) {
+        if let HistoryEntry::Selection(selection) = entry {
+            std::mem::swap(&mut self.selection, selection);
+            self.selection_stamp += 1;
+            return;
+        }
         self.revision += 1;
         match entry {
+            HistoryEntry::Selection(_) => {}
             HistoryEntry::Tiles { layer, tiles } => {
                 self.next_stamp += 1;
                 let layer = &mut self.layers[*layer];

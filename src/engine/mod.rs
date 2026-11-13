@@ -20,6 +20,6 @@ pub use document::{Document, ProjectSnapshot, Reference};
 pub use export::write_png;
 pub use project::PROJECT_EXTENSION;
 pub use layer::{BlendMode, IRect, Layer, LayerProps, Px, Tile, ONE, TILE};
-pub use selection::Selection;
+pub use selection::{SelectMode, Selection};
 pub use stroke::StrokePoint;
 pub use tools::{brush_preview, LayerTransform};
