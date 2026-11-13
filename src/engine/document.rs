@@ -54,6 +54,9 @@ pub struct Document {
     pub(super) active_layer: usize,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
+    /// Brush and eraser strokes are mirrored across the canvas's vertical
+    /// centre line.
+    pub symmetry: bool,
     stroke: Option<ActiveStroke>,
     pub(super) smudge: Option<SmudgeStroke>,
     pub(super) moving: Option<MoveSession>,
@@ -95,6 +98,7 @@ impl Document {
             layers,
             active_layer: active,
             paper: [255, 255, 255],
+            symmetry: false,
             stroke: None,
             smudge: None,
             moving: None,
@@ -345,7 +349,9 @@ impl Document {
         }
         let li = self.active_layer;
         let selection = self.selection.clone();
-        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, p);
+        let mirror_x = self.symmetry.then_some(self.width as f32 * 0.5);
+        let (stroke, rect) =
+            ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, mirror_x, p);
         self.stroke = Some(stroke);
         self.mark_dirty(rect);
     }

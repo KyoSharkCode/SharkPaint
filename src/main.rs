@@ -4,6 +4,7 @@
 mod app;
 mod dpi_fix;
 mod icons;
+mod settings;
 mod view;
 
 fn main() -> eframe::Result {

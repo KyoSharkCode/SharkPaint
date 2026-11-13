@@ -837,3 +837,24 @@ fn references_are_saved_with_the_project_but_not_drawn() {
     // A damaged trailer is rejected rather than half-read.
     assert!(Document::read_from(&mut &bytes[..bytes.len() - 3]).is_err());
 }
+
+#[test]
+fn symmetry_mirrors_strokes_across_the_centre() {
+    let mut doc = Document::new(200, 100);
+    doc.symmetry = true;
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (20.0, 30.0), (60.0, 70.0));
+    for (x, y) in [(20, 30), (40, 50), (60, 70)] {
+        assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255]);
+        assert_eq!(pixel(&doc, 199 - x, y), [0, 0, 0, 255], "mirror of ({x}, {y})");
+    }
+    // The whole picture is its own mirror image, and it is one undo step.
+    let rgba = doc.render_rgba8(doc.bounds());
+    for y in 0..100 {
+        for x in 0..100 {
+            assert_eq!(rgba[(y * 200 + x) * 4], rgba[(y * 200 + 199 - x) * 4]);
+        }
+    }
+    doc.undo();
+    assert_eq!(pixel(&doc, 160, 50), [255, 255, 255, 255]);
+    assert!(!doc.can_undo());
+}

@@ -24,6 +24,10 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
+- Simetría: los trazos se repiten en espejo respecto al centro del lienzo.
+- Paleta de colores guardados e historial de colores recientes.
+- Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
+- Atajos de herramientas configurables (Editar → Preferencias).
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
 - Gestos táctiles con dos dedos: mover, rotar y hacer zoom.
 - Proyectos en formato propio (`.spaint`) que conservan la precisión completa del
@@ -41,7 +45,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 | Atajo | Acción |
 |---|---|
-| `B` / `E` / `D` | Pincel / Borrador / Difuminar |
+| `B` / `E` / `D` | Pincel / Borrador / Difuminar (configurables) |
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
@@ -103,6 +107,7 @@ cargo test
 - `src/engine/`: motor de pintura (capas en mosaicos, pincel, historial), sin
   dependencias de interfaz.
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
+- `src/settings.rs`: preferencias guardadas entre sesiones y archivo de recuperación.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
 - `src/engine/selection.rs`: máscara de selección.
