@@ -374,7 +374,8 @@ pub struct SharkPaintApp {
     brush_window_open: bool,
     /// The reference panel is showing.
     refs_open: bool,
-    /// The navigator window (a small view of the whole canvas) is on show.
+    /// The side panel shows the navigator (a small view of the whole canvas)
+    /// in place of the colour picker.
     nav_open: bool,
     /// Which reference is on screen.
     ref_index: usize,
@@ -473,7 +474,7 @@ impl SharkPaintApp {
             window_hooked: false,
             brush_window_open: true,
             refs_open: false,
-            nav_open: true,
+            nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
             ref_texture: None,
@@ -1172,10 +1173,6 @@ impl SharkPaintApp {
         if ui.add(button).on_hover_text("Referencias (F6)").clicked() {
             commands.push(Command::ToggleReferences);
         }
-        let button = egui::Button::image(icon("navegador", 20.0, text)).selected(self.nav_open).min_size(size);
-        if ui.add(button).on_hover_text("Navegador (F7)").clicked() {
-            commands.push(Command::ToggleNavigator);
-        }
         ui.separator();
         let faint = ui.visuals().weak_text_color().gamma_multiply(0.5);
         for (name, enabled, tip, command) in [
@@ -1230,102 +1227,93 @@ impl SharkPaintApp {
 
     /// The reference panel: images to look at while drawing. They live beside
     /// the picture, with their own zoom, and are never exported.
-    /// A small view of the whole canvas. The outline marks what the main view
-    /// shows; a click or a drag moves the main view there.
-    fn navigator_window(&mut self, ctx: &egui::Context, commands: &mut Vec<Command>) {
-        let mut open = self.nav_open;
+    /// A small view of the whole canvas, in the side panel. The outline marks
+    /// what the main view shows; a click or a drag moves the main view there.
+    fn navigator_panel(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         let (viewport, doc_size) = (self.viewport, self.doc_size());
-        egui::Window::new("Navegador")
-            .open(&mut open)
-            .resizable(false)
-            .default_width(256.0)
-            .default_pos(self.viewport.right_bottom() + Vec2::new(-284.0, -290.0))
-            .show(ctx, |ui| {
-                const SIDE: f32 = 256.0;
-                let scale = (SIDE / doc_size.x).min(SIDE * 0.8 / doc_size.y);
-                let (rect, response) = ui.allocate_exact_size(doc_size * scale, Sense::click_and_drag());
-                let flip = self.view.flip;
-                // Canvas pixel <-> point in the picture, mirrored like the main view.
-                let to_nav = |c: Pos2| {
-                    let x = if flip { doc_size.x - c.x } else { c.x };
-                    rect.min + Vec2::new(x, c.y) * scale
-                };
-                let to_canvas = |p: Pos2| {
-                    let v = (p - rect.min) / scale;
-                    Pos2::new(if flip { doc_size.x - v.x } else { v.x }, v.y)
-                };
-                ui.painter().rect_filled(rect, 0.0, Color32::from_gray(128));
-                // The smallest copy of the canvas is plenty at this size.
-                let level = self.reduced.len();
-                if let Some(texture) = self.reduced.last().or(self.texture.as_ref()) {
-                    let reach = if level == 0 {
-                        Vec2::splat(1.0)
-                    } else {
-                        Vec2::new(
-                            (doc_size.x / (texture.size()[0] << level) as f32).min(1.0),
-                            (doc_size.y / (texture.size()[1] << level) as f32).min(1.0),
-                        )
-                    };
-                    let (left, right) = if flip { (reach.x, 0.0) } else { (0.0, reach.x) };
-                    let uv = Rect::from_min_max(Pos2::new(left, 0.0), Pos2::new(right, reach.y));
-                    ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
-                }
-                // What the main view shows, as an outline; it turns with the view.
-                let outline: Vec<Pos2> =
-                    [viewport.left_top(), viewport.right_top(), viewport.right_bottom(), viewport.left_bottom()]
-                        .into_iter()
-                        .map(|corner| to_nav(self.view.to_canvas(corner, viewport, doc_size)))
-                        .collect();
-                let painter = ui.painter().with_clip_rect(rect);
-                painter.add(egui::Shape::closed_line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
-                painter.add(egui::Shape::closed_line(outline, Stroke::new(1.5, Color32::from_rgb(111, 227, 240))));
-                ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), egui::StrokeKind::Outside);
+        let side = ui.available_width().clamp(120.0, 260.0);
+        let scale = (side / doc_size.x).min(side * 0.8 / doc_size.y);
+        let (rect, response) = ui.allocate_exact_size(doc_size * scale, Sense::click_and_drag());
+        let flip = self.view.flip;
+        // Canvas pixel <-> point in the picture, mirrored like the main view.
+        let to_nav = |c: Pos2| {
+            let x = if flip { doc_size.x - c.x } else { c.x };
+            rect.min + Vec2::new(x, c.y) * scale
+        };
+        let to_canvas = |p: Pos2| {
+            let v = (p - rect.min) / scale;
+            Pos2::new(if flip { doc_size.x - v.x } else { v.x }, v.y)
+        };
+        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(128));
+        // The smallest copy of the canvas is plenty at this size.
+        let level = self.reduced.len();
+        if let Some(texture) = self.reduced.last().or(self.texture.as_ref()) {
+            let reach = if level == 0 {
+                Vec2::splat(1.0)
+            } else {
+                Vec2::new(
+                    (doc_size.x / (texture.size()[0] << level) as f32).min(1.0),
+                    (doc_size.y / (texture.size()[1] << level) as f32).min(1.0),
+                )
+            };
+            let (left, right) = if flip { (reach.x, 0.0) } else { (0.0, reach.x) };
+            let uv = Rect::from_min_max(Pos2::new(left, 0.0), Pos2::new(right, reach.y));
+            ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+        }
+        // What the main view shows, as an outline; it turns with the view.
+        let outline: Vec<Pos2> =
+            [viewport.left_top(), viewport.right_top(), viewport.right_bottom(), viewport.left_bottom()]
+                .into_iter()
+                .map(|corner| to_nav(self.view.to_canvas(corner, viewport, doc_size)))
+                .collect();
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.add(egui::Shape::closed_line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
+        painter.add(egui::Shape::closed_line(outline, Stroke::new(1.5, Color32::from_rgb(111, 227, 240))));
+        ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), egui::StrokeKind::Outside);
 
-                // Press or drag: bring that spot to the middle of the main view.
-                if let Some(pos) = response.interact_pointer_pos().filter(|_| response.is_pointer_button_down_on()) {
-                    let target = to_canvas(rect.clamp(pos));
-                    self.view.pan += viewport.center() - self.view.to_screen(target, viewport, doc_size);
-                }
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.view.zoom_about(viewport.center(), (scroll * 0.004).exp(), viewport, doc_size);
-                    }
-                }
+        // Press or drag: bring that spot to the middle of the main view.
+        if let Some(pos) = response.interact_pointer_pos().filter(|_| response.is_pointer_button_down_on()) {
+            let target = to_canvas(rect.clamp(pos));
+            self.view.pan += viewport.center() - self.view.to_screen(target, viewport, doc_size);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.view.zoom_about(viewport.center(), (scroll * 0.004).exp(), viewport, doc_size);
+            }
+        }
 
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().slider_width = SIDE - 150.0;
-                    let mut zoom = self.view.zoom;
-                    let slider = egui::Slider::new(&mut zoom, MIN_ZOOM..=MAX_ZOOM)
-                        .logarithmic(true)
-                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
-                        .custom_parser(|text| text.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0));
-                    if ui.add(slider).on_hover_text("Zoom").changed() {
-                        self.view.zoom_about(viewport.center(), zoom / self.view.zoom, viewport, doc_size);
-                    }
-                    if ui.small_button("Ajustar").on_hover_text("Ver el lienzo completo").clicked() {
-                        commands.push(Command::Fit);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().slider_width = SIDE - 150.0;
-                    // Shown from -180° to 180°, so a small turn either way reads as small.
-                    let mut degrees = self.view.rotation.to_degrees();
-                    if degrees > 180.0 {
-                        degrees -= 360.0;
-                    }
-                    let before = degrees;
-                    let slider = egui::Slider::new(&mut degrees, -180.0..=180.0).fixed_decimals(0).suffix("°");
-                    if ui.add(slider).on_hover_text("Rotación").changed() {
-                        self.view.rotate_about(viewport.center(), (degrees - before).to_radians(), viewport, doc_size);
-                    }
-                    if ui.small_button("Recto").on_hover_text("Quitar la rotación").clicked() {
-                        commands.push(Command::ResetRotation);
-                    }
-                });
-            });
-        self.nav_open = open;
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = side - 150.0;
+            let mut zoom = self.view.zoom;
+            let slider = egui::Slider::new(&mut zoom, MIN_ZOOM..=MAX_ZOOM)
+                .logarithmic(true)
+                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                .custom_parser(|text| text.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0));
+            if ui.add(slider).on_hover_text("Zoom").changed() {
+                self.view.zoom_about(viewport.center(), zoom / self.view.zoom, viewport, doc_size);
+            }
+            if ui.small_button("Ajustar").on_hover_text("Ver el lienzo completo").clicked() {
+                commands.push(Command::Fit);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = side - 150.0;
+            // Shown from -180° to 180°, so a small turn either way reads as small.
+            let mut degrees = self.view.rotation.to_degrees();
+            if degrees > 180.0 {
+                degrees -= 360.0;
+            }
+            let before = degrees;
+            let slider = egui::Slider::new(&mut degrees, -180.0..=180.0).fixed_decimals(0).suffix("°");
+            if ui.add(slider).on_hover_text("Rotación").changed() {
+                self.view.rotate_about(viewport.center(), (degrees - before).to_radians(), viewport, doc_size);
+            }
+            if ui.small_button("Recto").on_hover_text("Quitar la rotación").clicked() {
+                commands.push(Command::ResetRotation);
+            }
+        });
     }
 
     fn references_window(&mut self, ctx: &egui::Context) {
@@ -1449,8 +1437,6 @@ impl SharkPaintApp {
     }
 
     fn color_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.strong("Color");
         let mut color = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
         ui.scope(|ui| {
             // The picker takes its width from the slider width; make it fill the panel.
@@ -3032,7 +3018,18 @@ impl eframe::App for SharkPaintApp {
             .resizable(false)
             .default_size(260.0)
             .show(ui, |ui| {
-                self.color_panel(ui);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.nav_open, false, egui::RichText::new("Color").strong());
+                    ui.selectable_value(&mut self.nav_open, true, egui::RichText::new("Navegador").strong())
+                        .on_hover_text("Vista del lienzo completo (F7)");
+                });
+                ui.add_space(2.0);
+                if self.nav_open {
+                    self.navigator_panel(ui, &mut commands);
+                } else {
+                    self.color_panel(ui);
+                }
                 ui.separator();
                 self.layers_panel(ui, &mut commands);
             });
@@ -3052,9 +3049,6 @@ impl eframe::App for SharkPaintApp {
             self.references_window(&ctx);
         } else {
             self.refs_rect = None;
-        }
-        if self.nav_open {
-            self.navigator_window(&ctx, &mut commands);
         }
         if self.prefs_open {
             self.preferences_window(&ctx);

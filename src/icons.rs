@@ -32,7 +32,6 @@ pub const TRAZOS: &[(&str, &str)] = &[
     ("candado", "M7 11h10a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2zM8 11V7a4 4 0 0 1 8 0v4"),
     ("candadoAbierto", "M7 11h10a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2zM8 11V7a4 4 0 0 1 7.8-1.2"),
     ("ajustes", "M4 7h9M17 7h3M4 17h3M11 17h9M15 4.5v5M9 14.5v5"),
-    ("navegador", "M3 5h18v14H3zM7 9h8v6H7z"),
     ("deshacer", "M9 14L4 9l5-5M4 9h11a5 5 0 0 1 0 10h-3"),
     ("rehacer", "M15 14l5-5-5-5M20 9H9a5 5 0 0 0 0 10h3"),
 ];
