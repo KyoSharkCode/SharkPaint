@@ -21,7 +21,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Alt` + clic | Tomar color del lienzo |
 | `Ctrl+Z` / `Ctrl+Mayús+Z` | Deshacer / Rehacer |
 | `Espacio` + arrastrar, botón central | Mover el lienzo |
-| Rueda del ratón | Zoom |
+| Rueda del ratón, `Ctrl` + `+` / `-` | Zoom del lienzo |
 | `R` + arrastrar, `4` / `6` | Rotar el lienzo |
 | `5` | Restablecer la rotación |
 | `M` | Voltear horizontalmente |

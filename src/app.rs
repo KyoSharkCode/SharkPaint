@@ -28,6 +28,7 @@ enum Command {
     ClearLayer,
     Fit,
     ActualSize,
+    Zoom(f32),
     Rotate(f32),
     ResetRotation,
     Flip,
@@ -55,6 +56,10 @@ pub struct SharkPaintApp {
     pen_pressure: Option<f32>,
     /// Pressure used for the most recent stroke sample (status bar readout).
     last_pressure: f32,
+    /// Canvas position of a press whose first dab waits for a pressure reading.
+    pending_start: Option<Pos2>,
+    /// Latest pen pressure reported since the current press began.
+    contact_pressure: Option<f32>,
     pen_seen: bool,
     fit_pending: bool,
     new_dialog: Option<NewCanvasDialog>,
@@ -64,6 +69,8 @@ pub struct SharkPaintApp {
 impl SharkPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // Ctrl +/- must zoom the canvas, not scale the whole interface.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let mut eraser = BrushPreset::Marcador.settings();
         eraser.opacity = 1.0;
         SharkPaintApp {
@@ -79,6 +86,8 @@ impl SharkPaintApp {
             color: [24, 24, 32],
             pen_pressure: None,
             last_pressure: 1.0,
+            pending_start: None,
+            contact_pressure: None,
             pen_seen: false,
             fit_pending: true,
             new_dialog: None,
@@ -122,6 +131,12 @@ impl SharkPaintApp {
             }
             if hit(cmd, Key::Num1) {
                 commands.push(Command::ActualSize);
+            }
+            if hit(cmd, Key::Plus) || hit(cmd, Key::Equals) {
+                commands.push(Command::Zoom(1.25));
+            }
+            if hit(cmd, Key::Minus) {
+                commands.push(Command::Zoom(0.8));
             }
             if hit(none, Key::Num4) {
                 commands.push(Command::Rotate(-15.0));
@@ -191,6 +206,12 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Tamaño real (100 %)", "Ctrl+1") {
                     commands.push(Command::ActualSize);
+                }
+                if item(ui, "Acercar", "Ctrl++") {
+                    commands.push(Command::Zoom(1.25));
+                }
+                if item(ui, "Alejar", "Ctrl+-") {
+                    commands.push(Command::Zoom(0.8));
                 }
                 ui.separator();
                 if item(ui, "Rotar a la izquierda", "4") {
@@ -372,6 +393,12 @@ impl SharkPaintApp {
         self.texture_options = options;
     }
 
+    fn begin_stroke(&mut self, at: Pos2, pressure: f32) {
+        let erase = self.tool == Tool::Borrador;
+        let brush = self.active_brush().clone();
+        self.doc.begin_stroke(&brush, self.color, erase, StrokePoint::new(at.x, at.y, pressure));
+    }
+
     fn pick_color(&mut self, canvas: Pos2) {
         let (x, y) = (canvas.x.floor() as i32, canvas.y.floor() as i32);
         let rect = IRect::new(x, y, x + 1, y + 1);
@@ -440,7 +467,9 @@ impl SharkPaintApp {
                 Event::Touch { phase, force, .. } => match phase {
                     TouchPhase::Start | TouchPhase::Move => {
                         if let Some(f) = force {
-                            self.pen_pressure = Some(f.clamp(0.0, 1.0));
+                            let f = f.clamp(0.0, 1.0);
+                            self.pen_pressure = Some(f);
+                            self.contact_pressure = Some(f);
                             self.pen_seen = true;
                         }
                     }
@@ -455,20 +484,32 @@ impl SharkPaintApp {
                         self.pick_color(c);
                         continue;
                     }
-                    let pressure = self.pen_pressure.unwrap_or(1.0);
-                    self.last_pressure = pressure;
-                    let erase = self.tool == Tool::Borrador;
-                    let brush = self.active_brush().clone();
-                    self.doc.begin_stroke(&brush, self.color, erase, StrokePoint::new(c.x, c.y, pressure));
+                    // The press can arrive before the pen reports any pressure, so
+                    // the first dab waits for the next sample instead of assuming
+                    // full pressure (which stamped a full-size dot).
+                    self.doc.end_stroke();
+                    self.pending_start = Some(c);
+                    self.contact_pressure = self.pen_pressure;
                 }
-                Event::PointerMoved(pos) if self.doc.is_stroking() => {
+                Event::PointerMoved(pos) if self.pending_start.is_some() || self.doc.is_stroking() => {
                     let c = to_canvas(*pos);
                     let pressure = self.pen_pressure.unwrap_or(1.0);
                     self.last_pressure = pressure;
+                    if let Some(start) = self.pending_start.take() {
+                        self.begin_stroke(start, pressure);
+                    }
                     self.doc.stroke_to(StrokePoint::new(c.x, c.y, pressure));
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
-                | Event::PointerGone => self.doc.end_stroke(),
+                | Event::PointerGone => {
+                    // A tap without movement still leaves one dab.
+                    if let Some(start) = self.pending_start.take() {
+                        let pressure = self.contact_pressure.unwrap_or(1.0);
+                        self.last_pressure = pressure;
+                        self.begin_stroke(start, pressure);
+                    }
+                    self.doc.end_stroke();
+                }
                 _ => {}
             }
         }
@@ -607,6 +648,7 @@ impl SharkPaintApp {
                 self.view.zoom = 1.0;
                 self.view.pan = Vec2::ZERO;
             }
+            Command::Zoom(factor) => self.view.zoom_about(viewport.center(), factor, viewport, doc_size),
             Command::Rotate(degrees) => self.view.rotate_by(degrees.to_radians(), viewport, doc_size),
             Command::ResetRotation => self.view.rotate_by(-self.view.rotation, viewport, doc_size),
             Command::Flip => self.view.flip = !self.view.flip,
