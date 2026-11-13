@@ -1542,3 +1542,31 @@ fn layer_groups_are_saved_with_the_project() {
         let _ = Document::read_from(&mut &file[..cut]);
     }
 }
+
+#[test]
+fn a_brush_can_paint_in_a_blend_mode() {
+    // Grey over which a stroke multiplies; outside the grey it paints plainly.
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(60.0), [128, 128, 128], false, (40.0, 50.0), (60.0, 50.0));
+    let multiply = BrushSettings { blend: BlendMode::Multiply, ..hard_brush(20.0) };
+    line(&mut doc, &multiply, [255, 0, 0], false, (50.0, 50.0), (150.0, 50.0));
+    assert_eq!(pixel(&doc, 50, 50), [128, 0, 0, 255], "red times grey");
+    assert_eq!(pixel(&doc, 140, 50), [255, 0, 0, 255], "nothing under it: plain red");
+    assert_eq!(doc.layers()[0].pixel(140, 80)[3], 0, "the rest of the layer stays empty");
+    // Going over the same spot within one stroke does not multiply twice.
+    doc.undo();
+    doc.begin_stroke(&multiply, [255, 0, 0], false, StrokePoint::new(40.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(60.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(40.0, 50.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 50, 50), [128, 0, 0, 255]);
+    // Screen lightens, and locked transparency is respected.
+    let mut props = doc.layers()[0].props.clone();
+    props.alpha_lock = true;
+    doc.set_layer_props(0, props, false);
+    let screen = BrushSettings { blend: BlendMode::Screen, ..hard_brush(20.0) };
+    line(&mut doc, &screen, [0, 0, 255], false, (50.0, 20.0), (50.0, 99.0));
+    let lit = pixel(&doc, 50, 70);
+    assert_eq!((lit[0], lit[1], lit[2]), (128, 128, 255), "grey screened with blue");
+    assert_eq!(doc.layers()[0].pixel(50, 95)[3], 0, "locked transparency stays empty");
+}

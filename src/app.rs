@@ -2000,6 +2000,25 @@ impl SharkPaintApp {
             });
         });
 
+        // How the stroke combines with what is already on the layer.
+        if self.tool == Tool::Pincel {
+            let width = ui.available_width();
+            let mixing = self.brush.mix > 0.0;
+            ui.add_enabled_ui(!mixing, |ui| {
+                egui::ComboBox::from_id_salt("fusion_pincel")
+                    .selected_text(if mixing { "Normal" } else { self.brush.blend.name() })
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for mode in BlendMode::ALL {
+                            ui.selectable_value(&mut self.brush.blend, mode, mode.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Modo de fusión del pincel: cómo se combina el trazo\ncon lo que ya hay en la capa")
+                    .on_disabled_hover_text("Los pinceles que mezclan color pintan siempre en modo normal");
+            });
+        }
+
         // The four settings reached for all the time, each on its own line.
         {
             ui.spacing_mut().slider_width = 176.0;

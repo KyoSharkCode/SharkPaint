@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
+    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
 };
 
 use crate::settings::config_dir;
@@ -291,6 +291,7 @@ impl BrushLibrary {
             put("escala_grano", s.grain_scale.to_string());
             put("mezcla", s.mix.to_string());
             put("arrastre", s.drag.to_string());
+            put("fusion", s.blend.id().to_string());
         }
         text
     }
@@ -316,6 +317,7 @@ impl BrushLibrary {
                 ("escala_grano", Some(v)) => s.grain_scale = v.clamp(0.1, 16.0),
                 ("mezcla", Some(v)) => s.mix = v.clamp(0.0, 1.0),
                 ("arrastre", Some(v)) => s.drag = v.clamp(0.0, 1.0),
+                ("fusion", Some(v)) => s.blend = BlendMode::from_id(v as u8).unwrap_or(BlendMode::Normal),
                 ("presion_tamano", _) => s.pressure_size = flag,
                 ("presion_flujo", _) => s.pressure_flow = flag,
                 ("seguir_direccion", _) => s.follow_direction = flag,
