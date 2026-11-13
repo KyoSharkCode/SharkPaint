@@ -4,13 +4,15 @@ mod brush;
 mod document;
 mod export;
 mod layer;
+mod papers;
 mod project;
 mod selection;
 mod stroke;
 mod tips;
 mod tools;
 
-pub use brush::{BrushPreset, BrushSettings, BrushTip, TipImage};
+pub use brush::{BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage};
+pub use papers::builtin_papers;
 pub use tips::builtin_tips;
 pub use document::{Document, ProjectSnapshot, Reference};
 pub use export::write_png;

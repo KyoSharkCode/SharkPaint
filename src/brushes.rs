@@ -7,12 +7,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use sharkpaint::engine::{builtin_tips, BrushPreset, BrushSettings, BrushTip, TipImage};
+use sharkpaint::engine::{
+    builtin_papers, builtin_tips, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
+};
 
 use crate::settings::config_dir;
 
 /// Raised whenever the set of default brushes grows.
-const LIBRARY_VERSION: u32 = 2;
+const LIBRARY_VERSION: u32 = 3;
 
 /// Side of the square an imported tip is stored at, at most.
 const MAX_TIP_SIDE: u32 = 256;
@@ -27,6 +29,8 @@ pub struct BrushLibrary {
     pub brushes: Vec<Brush>,
     /// Built-in tips first, then the imported ones.
     pub tips: Vec<Arc<TipImage>>,
+    /// Paper textures whose grain a brush can show.
+    pub papers: Vec<Arc<PaperTexture>>,
 }
 
 impl BrushLibrary {
@@ -43,7 +47,7 @@ impl BrushLibrary {
             files.sort();
             tips.extend(files.iter().filter_map(|path| read_tip(path)));
         }
-        let mut library = BrushLibrary { brushes: Vec::new(), tips };
+        let mut library = BrushLibrary { brushes: Vec::new(), tips, papers: builtin_papers() };
         let saved = config_dir().and_then(|dir| std::fs::read_to_string(dir.join("pinceles.txt")).ok());
         let version = saved
             .as_deref()
@@ -79,12 +83,20 @@ impl BrushLibrary {
         self.tips.iter().find(|t| t.id == id).map_or(BrushTip::Round, |t| BrushTip::Image(t.clone()))
     }
 
+    /// The paper with this identifier, if there is one.
+    pub fn paper(&self, id: &str) -> Option<Arc<PaperTexture>> {
+        self.papers.iter().find(|p| p.id == id).cloned()
+    }
+
     /// The brushes a new installation starts with.
     pub fn default_brushes(&self) -> Vec<Brush> {
         let mut brushes: Vec<Brush> = BrushPreset::ALL
             .iter()
             .map(|preset| Brush { name: preset.name().to_owned(), settings: preset.settings() })
             .collect();
+        // The pencil drags over fine paper.
+        brushes[0].settings.paper = self.paper("fino");
+        brushes[0].settings.grain = 0.75;
         let shaped = |name: &str, tip: &str, settings: BrushSettings| Brush {
             name: name.to_owned(),
             settings: BrushSettings { tip: self.tip(tip), ..settings },
@@ -109,6 +121,8 @@ impl BrushLibrary {
                 ..BrushSettings::round(28.0)
             }),
             shaped("Carboncillo", "carbon", BrushSettings {
+                paper: self.paper("rugoso"),
+                grain: 0.8,
                 flow: 0.5,
                 spacing: 0.18,
                 angle_jitter: 1.0,
@@ -127,6 +141,8 @@ impl BrushLibrary {
                 ..BrushSettings::round(44.0)
             }),
             shaped("Pincel seco", "cerdas", BrushSettings {
+                paper: self.paper("lienzo"),
+                grain: 0.5,
                 flow: 0.6,
                 spacing: 0.03,
                 follow_direction: true,
@@ -136,7 +152,31 @@ impl BrushLibrary {
                 min_size: 0.4,
                 ..BrushSettings::round(60.0)
             }),
+            // Soft stick dragged over rough paper: the paper does the texturing.
+            shaped("Pastel", "redonda", BrushSettings {
+                paper: self.paper("rugoso"),
+                grain: 1.0,
+                grain_scale: 1.5,
+                flow: 0.7,
+                hardness: 0.6,
+                spacing: 0.06,
+                pressure_flow: true,
+                ..BrushSettings::round(46.0)
+            }),
+            // Wax crayon: a hard edge with the tooth of the paper inside it.
+            shaped("Crayón", "redonda", BrushSettings {
+                paper: self.paper("fino"),
+                grain: 1.0,
+                grain_scale: 2.0,
+                hardness: 0.9,
+                spacing: 0.05,
+                pressure_size: true,
+                min_size: 0.6,
+                ..BrushSettings::round(22.0)
+            }),
             shaped("Tiza", "tiza", BrushSettings {
+                paper: self.paper("rugoso"),
+                grain: 0.6,
                 flow: 0.75,
                 spacing: 0.1,
                 follow_direction: true,
@@ -195,6 +235,9 @@ impl BrushLibrary {
             put("dispersion", s.scatter.to_string());
             put("variacion_tamano", s.size_jitter.to_string());
             put("redondez", s.roundness.to_string());
+            put("papel", s.paper.as_ref().map_or("ninguno", |p| p.id.as_str()).to_owned());
+            put("grano", s.grain.to_string());
+            put("escala_grano", s.grain_scale.to_string());
         }
         text
     }
@@ -214,6 +257,9 @@ impl BrushLibrary {
             match (key.trim(), number) {
                 ("nombre", _) => brush.name = value.trim().to_owned(),
                 ("punta", _) => s.tip = self.tip(value.trim()),
+                ("papel", _) => s.paper = self.paper(value.trim()),
+                ("grano", Some(v)) => s.grain = v.clamp(0.0, 1.0),
+                ("escala_grano", Some(v)) => s.grain_scale = v.clamp(0.1, 16.0),
                 ("presion_tamano", _) => s.pressure_size = flag,
                 ("presion_flujo", _) => s.pressure_flow = flag,
                 ("seguir_direccion", _) => s.follow_direction = flag,
@@ -310,10 +356,10 @@ mod tests {
 
     #[test]
     fn brushes_round_trip_through_text() {
-        let library = BrushLibrary { brushes: Vec::new(), tips: builtin_tips() };
+        let library = BrushLibrary { brushes: Vec::new(), tips: builtin_tips(), papers: builtin_papers() };
         let brushes = library.default_brushes();
         assert!(brushes.len() >= 10);
-        let saved = BrushLibrary { brushes: brushes.clone(), tips: builtin_tips() }.to_text();
+        let saved = BrushLibrary { brushes: brushes.clone(), tips: builtin_tips(), papers: builtin_papers() }.to_text();
         assert_eq!(library.brushes_from_text(&saved), brushes);
 
         // Unknown tips and junk values fall back instead of failing.
@@ -322,6 +368,10 @@ mod tests {
         assert_eq!(read.len(), 1);
         assert_eq!((read[0].name.as_str(), read[0].settings.tip.id()), ("Raro", "redonda"));
         assert_eq!((read[0].settings.size, read[0].settings.flow), (20.0, 1.0));
+        // Papers are saved by name; an unknown one means no paper.
+        assert!(brushes.iter().any(|b| b.settings.paper.as_ref().is_some_and(|p| p.id == "rugoso")));
+        let lost = library.brushes_from_text("[pincel]\npapel=desconocido\ngrano=0.4\n");
+        assert!(lost[0].settings.paper.is_none() && lost[0].settings.grain == 0.4);
         assert!(library.brushes_from_text("sin secciones\n").is_empty());
     }
 
@@ -343,7 +393,7 @@ mod tests {
         let file = dir.join("mi punta!.png");
         picture.save(&file).unwrap();
 
-        let mut library = BrushLibrary { brushes: Vec::new(), tips: builtin_tips() };
+        let mut library = BrushLibrary { brushes: Vec::new(), tips: builtin_tips(), papers: builtin_papers() };
         let tip = library.import_tip(&file).unwrap();
         assert_eq!((tip.id.as_str(), tip.name.as_str()), ("archivo:mi punta_", "mi punta_"));
         assert_eq!(tip.size, 80); // trimmed to the bar and squared

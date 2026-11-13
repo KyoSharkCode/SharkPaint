@@ -428,7 +428,7 @@ impl SharkPaintApp {
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
             clip: None,
-            library: BrushLibrary { brushes: Vec::new(), tips: Vec::new() },
+            library: BrushLibrary { brushes: Vec::new(), tips: Vec::new(), papers: Vec::new() },
             brush_index: Some(1),
             brush_source: None,
             saved_brushes: String::new(),
@@ -1598,6 +1598,39 @@ impl SharkPaintApp {
         }
     }
 
+    /// The paper under the brush and how much of its grain shows.
+    fn paper_settings(&mut self, ui: &mut egui::Ui) {
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        let papers = self.library.papers.clone();
+        let b = self.active_brush();
+        egui::Grid::new("papel").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Papel");
+            let current = b.paper.as_ref().map_or("Ninguno".to_owned(), |p| p.name.clone());
+            egui::ComboBox::from_id_salt("papel_pincel").selected_text(current).width(150.0).show_ui(ui, |ui| {
+                if ui.selectable_label(b.paper.is_none(), "Ninguno").clicked() {
+                    b.paper = None;
+                }
+                for paper in &papers {
+                    if ui.selectable_label(b.paper.as_ref() == Some(paper), &paper.name).clicked() {
+                        b.paper = Some(paper.clone());
+                    }
+                }
+            });
+            ui.end_row();
+            let has_paper = b.paper.is_some();
+            ui.label("Intensidad");
+            ui.add_enabled(has_paper, egui::Slider::new(&mut b.grain, 0.0..=1.0).custom_formatter(percent));
+            ui.end_row();
+            ui.label("Tamaño del grano");
+            ui.add_enabled(
+                has_paper,
+                egui::Slider::new(&mut b.grain_scale, 0.25..=6.0).logarithmic(true).custom_formatter(percent),
+            );
+            ui.end_row();
+        });
+        ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
+    }
+
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
@@ -1677,6 +1710,7 @@ impl SharkPaintApp {
         });
         if !smudging {
             egui::CollapsingHeader::new("Punta").default_open(false).show(ui, |ui| self.tip_settings(ui));
+            egui::CollapsingHeader::new("Textura de papel").default_open(false).show(ui, |ui| self.paper_settings(ui));
         }
         egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
             let b = self.active_brush();

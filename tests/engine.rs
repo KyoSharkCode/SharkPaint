@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
-    builtin_tips, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect, LayerTransform,
-    Reference, StrokePoint,
+    builtin_papers, builtin_tips, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, StrokePoint,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -966,5 +966,86 @@ fn built_in_tips_have_clean_edges() {
         let solid = tip.alpha.iter().filter(|&&a| a >= 235).count();
         assert!(solid > 1500, "{id} is nearly empty");
         assert!((soft as f64) < 0.35 * solid as f64, "{id} is blurry: {soft} soft pixels against {solid} solid");
+    }
+}
+
+fn grainy(pressure_flow: bool) -> BrushSettings {
+    let paper = builtin_papers().into_iter().find(|p| p.id == "rugoso").unwrap();
+    BrushSettings { paper: Some(paper), grain: 1.0, pressure_flow, ..hard_brush(40.0) }
+}
+
+/// Draws a line at a fixed pressure and returns how much of its core is covered.
+fn core_coverage(brush: &BrushSettings, pressure: f32, passes: usize) -> (f64, Document) {
+    let mut doc = Document::new(400, 120);
+    doc.begin_stroke(brush, [0, 0, 0], false, StrokePoint::new(40.0, 60.0, pressure));
+    for pass in 0..passes {
+        let x = if pass % 2 == 0 { 360.0 } else { 40.0 };
+        doc.stroke_to(StrokePoint::new(x, 60.0, pressure));
+    }
+    doc.end_stroke();
+    (ink(&doc, 80, 50, 320, 70) / (240.0 * 20.0), doc)
+}
+
+#[test]
+fn paper_grain_shows_under_light_pressure_and_fills_under_firm() {
+    let brush = grainy(false);
+    let (light, _) = core_coverage(&brush, 0.15, 1);
+    let (medium, _) = core_coverage(&brush, 0.5, 1);
+    let (firm, _) = core_coverage(&brush, 1.0, 1);
+    assert!(light < 0.45, "light pressure should leave much paper bare: {light}");
+    assert!(light + 0.15 < medium && medium + 0.1 < firm, "coverage should grow: {light} {medium} {firm}");
+    assert!(firm > 0.9, "firm pressure should fill almost everything: {firm}");
+    // Without a paper the same strokes are solid at any pressure.
+    let plain = BrushSettings { paper: None, ..brush.clone() };
+    assert!(core_coverage(&plain, 0.15, 1).0 > 0.99);
+    // With the strength at zero the paper has no effect either.
+    let off = BrushSettings { grain: 0.0, ..brush };
+    assert!(core_coverage(&off, 0.15, 1).0 > 0.99);
+}
+
+#[test]
+fn going_over_a_stroke_does_not_fill_the_grain_in() {
+    let brush = grainy(false);
+    let (once, _) = core_coverage(&brush, 0.3, 1);
+    let (many, _) = core_coverage(&brush, 0.3, 6);
+    assert!((many - once).abs() < 0.02, "one pass {once}, six passes {many}");
+}
+
+#[test]
+fn paper_grain_is_fixed_to_the_canvas() {
+    // Two strokes over the same place leave the same pattern, wherever they start.
+    let brush = grainy(false);
+    let draw = |from: f32| {
+        let mut doc = Document::new(400, 120);
+        doc.begin_stroke(&brush, [0, 0, 0], false, StrokePoint::new(from, 60.0, 0.3));
+        doc.stroke_to(StrokePoint::new(380.0, 60.0, 0.3));
+        doc.end_stroke();
+        doc.render_rgba8(IRect::new(150, 50, 300, 70))
+    };
+    assert_eq!(draw(20.0), draw(47.0));
+    // A coarser grain gives a different pattern.
+    let coarse = BrushSettings { grain_scale: 3.0, ..brush.clone() };
+    let mut doc = Document::new(400, 120);
+    doc.begin_stroke(&coarse, [0, 0, 0], false, StrokePoint::new(20.0, 60.0, 0.3));
+    doc.stroke_to(StrokePoint::new(380.0, 60.0, 0.3));
+    doc.end_stroke();
+    assert_ne!(doc.render_rgba8(IRect::new(150, 50, 300, 70)), draw(20.0));
+}
+
+#[test]
+fn papers_tile_without_a_seam() {
+    for paper in builtin_papers() {
+        assert_eq!(paper.data.len(), paper.size * paper.size);
+        let n = paper.size as f32;
+        // The same height one whole tile away, and no jump across the edge.
+        for i in 0..40 {
+            let (x, y) = (i as f32 * 6.3, i as f32 * 4.1);
+            assert!((paper.height(x, y) - paper.height(x + n, y - n)).abs() < 1e-4, "{} does not repeat", paper.id);
+        }
+        let across: f32 = (0..paper.size).map(|y| (paper.height(n - 0.5, y as f32) - paper.height(n + 0.5, y as f32)).abs()).sum::<f32>() / n;
+        let inside: f32 = (0..paper.size).map(|y| (paper.height(100.5, y as f32) - paper.height(101.5, y as f32)).abs()).sum::<f32>() / n;
+        assert!(across < inside * 3.0 + 0.02, "{} has a seam: {across} against {inside}", paper.id);
+        // It uses the whole range, so it responds across all pressures.
+        assert!(paper.data.iter().any(|&h| h < 30) && paper.data.iter().any(|&h| h > 225), "{} is flat", paper.id);
     }
 }

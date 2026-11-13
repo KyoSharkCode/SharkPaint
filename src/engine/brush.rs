@@ -80,6 +80,48 @@ impl TipImage {
     }
 }
 
+/// The surface a brush drags over: a tiling height map. High points take
+/// paint first; hollows fill only under firm pressure.
+pub struct PaperTexture {
+    /// Stable identifier used when saving brushes ("fino", "lienzo"…).
+    pub id: String,
+    /// Name shown to the user.
+    pub name: String,
+    /// Side of the square, in pixels.
+    pub size: usize,
+    /// `size * size` heights, row-major: 0 = deepest hollow, 255 = highest point.
+    pub data: Vec<u8>,
+}
+
+impl PaperTexture {
+    /// Height (0..=1) at a position in texture pixels, repeating in both
+    /// directions, with bilinear filtering.
+    pub fn height(&self, x: f32, y: f32) -> f32 {
+        let (x0, y0) = (x.floor(), y.floor());
+        let (tx, ty) = (x - x0, y - y0);
+        let n = self.size as i64;
+        let at = |dx: i64, dy: i64| -> f32 {
+            let (ix, iy) = ((x0 as i64 + dx).rem_euclid(n), (y0 as i64 + dy).rem_euclid(n));
+            self.data[iy as usize * self.size + ix as usize] as f32
+        };
+        let top = at(0, 0) + (at(1, 0) - at(0, 0)) * tx;
+        let bottom = at(0, 1) + (at(1, 1) - at(0, 1)) * tx;
+        (top + (bottom - top) * ty) / 255.0
+    }
+}
+
+impl PartialEq for PaperTexture {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::fmt::Debug for PaperTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PaperTexture({})", self.id)
+    }
+}
+
 /// What the brush stamps along the stroke.
 #[derive(Clone)]
 pub enum BrushTip {
@@ -147,6 +189,12 @@ pub struct BrushSettings {
     pub size_jitter: f32,
     /// Height of the tip relative to its width (1 = as drawn, lower = flatter).
     pub roundness: f32,
+    /// Paper whose grain shows through the stroke, if any.
+    pub paper: Option<Arc<PaperTexture>>,
+    /// How strongly the grain shows (0 = not at all, 1 = hollows stay bare).
+    pub grain: f32,
+    /// Size of the grain (1 = as drawn, 2 = twice as coarse).
+    pub grain_scale: f32,
 }
 
 impl Default for BrushSettings {
@@ -175,6 +223,9 @@ impl BrushSettings {
             scatter: 0.0,
             size_jitter: 0.0,
             roundness: 1.0,
+            paper: None,
+            grain: 0.7,
+            grain_scale: 1.0,
         }
     }
 

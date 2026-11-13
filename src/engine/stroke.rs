@@ -241,6 +241,12 @@ impl ActiveStroke {
         let plain = matches!(self.brush.tip, BrushTip::Round) && roundness >= 0.999;
         let (sin, cos) = angle.sin_cos();
         let tip = self.brush.tip.clone();
+        // Paper grain: light pressure only reaches the high points of the paper,
+        // firm pressure fills the hollows too. The paper is fixed to the canvas.
+        let grain = self.brush.paper.clone().filter(|_| self.brush.grain > 0.0).map(|paper| {
+            let reach = 0.25 + 0.7 * p.pressure.clamp(0.0, 1.0);
+            (paper, self.brush.grain.clamp(0.0, 1.0), 1.0 / self.brush.grain_scale.clamp(0.1, 16.0), reach)
+        });
 
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
@@ -291,7 +297,18 @@ impl ActiveStroke {
                         let add = (c * flow15) as u32;
                         let m = &mut tile.mask[row + (x - ox) as usize];
                         let cur = *m as u32;
-                        *m = (cur + (((ONE - cur) * add) >> 15)).min(ONE) as u16;
+                        let mut value = (cur + (((ONE - cur) * add) >> 15)).min(ONE);
+                        if let Some((paper, strength, inverse_scale, reach)) = &grain {
+                            // How much paint this spot of paper can hold at this
+                            // pressure. It caps the coverage rather than thinning
+                            // each dab, so overlapping dabs do not fill the grain in.
+                            let height = paper.height(x as f32 * inverse_scale, y as f32 * inverse_scale);
+                            let held = ((height - (1.0 - reach)) / 0.5 + 0.5).clamp(0.0, 1.0);
+                            let held = held * held * (3.0 - 2.0 * held);
+                            let limit = ((1.0 - strength + strength * held) * ONE as f32) as u32;
+                            value = value.min(limit.max(cur));
+                        }
+                        *m = value as u16;
                     }
                 }
             }
