@@ -39,13 +39,14 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Alt` + clic | Tomar color del lienzo |
 | `F5`, o clic en la herramienta activa | Mostrar u ocultar los ajustes del pincel |
 | `Ctrl+Z` / `Ctrl+Mayús+Z` | Deshacer / Rehacer |
-| `R` + arrastrar, `Espacio` + arrastrar, botón central | Mover el lienzo |
+| `M` + arrastrar, `Espacio` + arrastrar, botón central | Mover el lienzo |
 | Rueda del ratón, `Ctrl` + `+` / `-` | Zoom del lienzo |
-| `Mayús` + `R` + arrastrar, `4` / `6` | Rotar el lienzo |
+| `R` + arrastrar, `4` / `6` | Rotar el lienzo |
 | Dos dedos (pantalla táctil) | Mover, rotar y hacer zoom |
 | `Ctrl+Mayús+N` / `Ctrl+J` | Nueva capa / Duplicar capa |
 | `5` | Restablecer la rotación |
-| `M` | Voltear horizontalmente |
+| `F` | Voltear horizontalmente |
+| `F11` | Pantalla completa |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
 | `Ctrl+O` | Abrir proyecto |
 | `Ctrl+S` / `Ctrl+Mayús+S` | Guardar / Guardar como |

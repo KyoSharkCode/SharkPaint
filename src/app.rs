@@ -76,6 +76,7 @@ enum Command {
     ResetRotation,
     Flip,
     ToggleBrushWindow,
+    Fullscreen,
     Quit,
 }
 
@@ -152,6 +153,12 @@ pub struct SharkPaintApp {
     /// The window may close even with unsaved changes (the user chose to).
     allow_close: bool,
     window_title: String,
+    /// Display scale of the monitor the window is on.
+    display_scale: f32,
+    /// Window size in points while the display scale was last steady.
+    steady_size: Option<Vec2>,
+    /// When the display scale last changed (the window crossed to another monitor).
+    scale_changed_at: Option<f64>,
     /// The floating brush settings window is showing.
     brush_window_open: bool,
 }
@@ -211,6 +218,9 @@ impl SharkPaintApp {
             confirm: None,
             allow_close: false,
             window_title: String::new(),
+            display_scale: 0.0,
+            steady_size: None,
+            scale_changed_at: None,
             brush_window_open: true,
         };
         if let Some(path) = open_path {
@@ -352,6 +362,44 @@ impl SharkPaintApp {
         }
     }
 
+    /// Keeps the window the same apparent size when it moves to a monitor with a
+    /// different display scale. Dragging a window across such monitors can leave
+    /// it shrunken on Windows; once the scale settles, the size from before the
+    /// move is restored.
+    fn keep_size_across_monitors(&mut self, ctx: &egui::Context) {
+        let (scale, size, fixed, now) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.native_pixels_per_point.unwrap_or(1.0),
+                v.inner_rect.map(|r| r.size()),
+                v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false) || v.minimized.unwrap_or(false),
+                i.time,
+            )
+        });
+        if self.display_scale == 0.0 {
+            self.display_scale = scale;
+        }
+        if scale != self.display_scale {
+            self.display_scale = scale;
+            self.scale_changed_at = Some(now);
+        }
+        match self.scale_changed_at {
+            Some(changed) if now - changed < 0.6 => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Some(_) => {
+                self.scale_changed_at = None;
+                if let (Some(want), Some(have), false) = (self.steady_size, size, fixed) {
+                    if (have - want).abs().max_elem() > 8.0 {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+                    }
+                }
+            }
+            None if !fixed => self.steady_size = size,
+            None => {}
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let name = self
             .path
@@ -435,8 +483,11 @@ impl SharkPaintApp {
             if hit(none, Key::Num5) {
                 commands.push(Command::ResetRotation);
             }
-            if hit(none, Key::M) {
+            if hit(none, Key::F) {
                 commands.push(Command::Flip);
+            }
+            if hit(none, Key::F11) {
+                commands.push(Command::Fullscreen);
             }
             if hit(none, Key::F5) {
                 commands.push(Command::ToggleBrushWindow);
@@ -554,12 +605,15 @@ impl SharkPaintApp {
                 if item(ui, "Restablecer rotación", "5") {
                     commands.push(Command::ResetRotation);
                 }
-                if item(ui, "Voltear horizontalmente", "M") {
+                if item(ui, "Voltear horizontalmente", "F") {
                     commands.push(Command::Flip);
                 }
                 ui.separator();
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
+                }
+                if item(ui, "Pantalla completa", "F11") {
+                    commands.push(Command::Fullscreen);
                 }
             });
             ui.menu_button("Ayuda", |ui| {
@@ -575,11 +629,12 @@ impl SharkPaintApp {
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
-                        ("R + arrastrar", "Mover el lienzo"),
+                        ("M + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
                         ("Botón central", "Mover el lienzo"),
                         ("Rueda del ratón", "Zoom"),
-                        ("Mayús + R + arrastrar", "Rotar el lienzo"),
+                        ("R + arrastrar", "Rotar el lienzo"),
+                        ("F", "Voltear horizontalmente"),
                         ("Dos dedos", "Mover, rotar y hacer zoom"),
                     ] {
                         ui.label(keys);
@@ -997,11 +1052,11 @@ impl SharkPaintApp {
         }
 
         let ctx = ui.ctx().clone();
-        let (space, nav_key, shift, alt, events, hover, now) = ctx.input(|i| {
+        let (space, move_key, rotate_key, alt, events, hover, now) = ctx.input(|i| {
             (
                 i.key_down(Key::Space),
+                i.key_down(Key::M),
                 i.key_down(Key::R),
-                i.modifiers.shift,
                 i.modifiers.alt,
                 i.events.clone(),
                 i.pointer.hover_pos(),
@@ -1009,8 +1064,8 @@ impl SharkPaintApp {
             )
         });
         let typing = ctx.text_edit_focused();
-        let navigating = !typing && (space || nav_key);
-        let rotating = nav_key && shift;
+        let navigating = !typing && (space || move_key || rotate_key);
+        let rotating = rotate_key && !space && !move_key;
         // The pointer is over the canvas itself, not a menu or window on top of it.
         let over_canvas = |pos: Pos2| {
             viewport.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
@@ -1341,6 +1396,10 @@ impl SharkPaintApp {
             }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
+            Command::Fullscreen => {
+                let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+            }
             Command::Quit => self.discarding(Discarding::Quit, ctx),
         }
     }
@@ -1382,6 +1441,7 @@ impl eframe::App for SharkPaintApp {
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
+        self.keep_size_across_monitors(&ctx);
         for command in commands {
             self.run(command, &ctx);
         }
