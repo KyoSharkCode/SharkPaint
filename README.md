@@ -15,6 +15,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
   caja sobre el lienzo).
+- Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
+  transformar y voltear afectan solo a lo seleccionado.
+- Voltear la capa o la selección, en horizontal y en vertical.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
@@ -26,6 +29,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 ## Pendiente
 
 - Máscaras de recorte y grupos de capas.
+- Sumar y restar selecciones, y deshacer los cambios de selección.
 - Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
   de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
   referencia. No se incluyen al exportar.
@@ -38,7 +42,10 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 |---|---|
 | `B` / `E` / `D` | Pincel / Borrador / Difuminar |
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
-| `T` | Transformar capa (`Intro` aplica, `Esc` cancela) |
+| `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
+| `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
+| `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
+| `Supr` | Borrar lo seleccionado |
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |
 | `F5`, o clic en la herramienta activa | Mostrar u ocultar los ajustes del pincel |
@@ -96,6 +103,7 @@ cargo test
 - `src/app.rs`, `src/view.rs`: interfaz de escritorio y navegación del lienzo.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
+- `src/engine/selection.rs`: máscara de selección.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
 - `examples/muestra.rs`: genera una hoja de muestra de los pinceles sin abrir ventana.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::brush::BrushSettings;
 use super::document::Document;
 use super::layer::{IRect, Layer, Px, Tile, ONE, TILE};
+use super::selection::Selection;
 use super::stroke::StrokePoint;
 
 /// Remembers the original contents of every tile an edit touches.
@@ -74,6 +75,11 @@ impl Document {
         };
         let seed = reference[y as usize * w + x as usize];
         let limit = (tolerance.clamp(0.0, 1.0) * 255.0).round() as i32;
+        let selection = self.selection.clone();
+        let selected = |i: usize| selection.as_ref().is_none_or(|s| s.mask[i] >= 128);
+        if !selected(y as usize * w + x as usize) {
+            return false;
+        }
         let matches = |p: [u8; 4]| (0..4).all(|c| (p[c] as i32 - seed[c] as i32).abs() <= limit);
 
         // 0 = untouched, 1 = border (fill goes underneath), 2 = inside the area.
@@ -84,7 +90,7 @@ impl Document {
         while let Some((cx, cy)) = stack.pop() {
             let mut visit = |nx: usize, ny: usize| {
                 let i = ny * w + nx;
-                if mask[i] == 2 {
+                if mask[i] == 2 || !selected(i) {
                     return;
                 }
                 if matches(reference[i]) {
@@ -173,6 +179,7 @@ pub(super) struct SmudgeStroke {
     brush: BrushSettings,
     last: StrokePoint,
     edit: TileEdit,
+    selection: Option<Arc<Selection>>,
 }
 
 impl Document {
@@ -185,6 +192,7 @@ impl Document {
             brush: brush.clone(),
             last: p,
             edit: TileEdit::default(),
+            selection: self.selection.clone(),
         });
     }
 
@@ -208,7 +216,8 @@ impl Document {
                 smudge.last.y + sy,
                 smudge.last.pressure + (p.pressure - smudge.last.pressure) * t,
             );
-            dirty = dirty.union(&smudge_step(layer, &mut smudge.edit, &smudge.brush, to, sx, sy));
+            let selection = smudge.selection.as_deref();
+            dirty = dirty.union(&smudge_step(layer, &mut smudge.edit, &smudge.brush, selection, to, sx, sy));
             smudge.last = to;
         }
         self.smudge = Some(smudge);
@@ -231,7 +240,15 @@ impl Document {
 
 /// Pulls the pixels around `at` one step along (`sx`, `sy`): each pixel under
 /// the tip moves towards the colour that was one step behind it.
-fn smudge_step(layer: &mut Layer, edit: &mut TileEdit, brush: &BrushSettings, at: StrokePoint, sx: f32, sy: f32) -> IRect {
+fn smudge_step(
+    layer: &mut Layer,
+    edit: &mut TileEdit,
+    brush: &BrushSettings,
+    selection: Option<&Selection>,
+    at: StrokePoint,
+    sx: f32,
+    sy: f32,
+) -> IRect {
     let radius = (brush.diameter_at(at.pressure) * 0.5).max(1.0);
     let strength = brush.flow_at(at.pressure).clamp(0.0, 1.0);
     let falloff = (radius * (1.0 - brush.hardness.clamp(0.0, 1.0))).max(1.0);
@@ -279,6 +296,9 @@ fn smudge_step(layer: &mut Layer, edit: &mut TileEdit, brush: &BrushSettings, at
             }
             let mut weight = ((outer - d) / falloff).min(1.0);
             weight = weight * weight * (3.0 - 2.0 * weight) * strength;
+            if let Some(selection) = selection {
+                weight *= selection.coverage(x, y) as f32 / 255.0;
+            }
             let here = at_buffer(x, y);
             let behind = sample(x as f32 - sx, y as f32 - sy);
             if here == [0; 4] && behind[3] < 0.5 {
@@ -483,6 +503,11 @@ impl LayerTransform {
 pub(super) struct TransformSession {
     layer: usize,
     original: Vec<Option<Arc<Tile>>>,
+    /// The pixels being transformed: the whole layer, or its selected part.
+    floating: Vec<Option<Arc<Tile>>>,
+    /// What stays behind when only a selection is transformed.
+    base: Vec<Option<Arc<Tile>>>,
+    selected: bool,
     bounds: IRect,
     current: LayerTransform,
 }
@@ -493,15 +518,24 @@ impl Document {
         self.transforming.is_some()
     }
 
-    /// Starts transforming the active layer. Returns the bounding box of its
-    /// contents, or `None` (and starts nothing) if the layer is empty.
+    /// Starts transforming the active layer, or only its selected part when
+    /// there is a selection. Returns the bounding box of the pixels that will
+    /// move, or `None` (and starts nothing) if there are none.
     pub fn begin_transform(&mut self) -> Option<IRect> {
         self.end_stroke();
         let li = self.active_layer;
-        let bounds = content_bounds(&self.layers[li])?;
+        let layer = &self.layers[li];
+        let (floating, base) = match &self.selection {
+            Some(selection) => split_by_selection(layer, selection),
+            None => (layer.tiles.clone(), vec![None; layer.tiles.len()]),
+        };
+        let bounds = content_bounds(layer, &floating)?;
         self.transforming = Some(TransformSession {
             layer: li,
-            original: self.layers[li].tiles.clone(),
+            original: layer.tiles.clone(),
+            floating,
+            base,
+            selected: self.selection.is_some(),
             bounds,
             current: LayerTransform::IDENTITY,
         });
@@ -519,7 +553,12 @@ impl Document {
         layer.tiles = if transform == LayerTransform::IDENTITY {
             session.original.clone()
         } else {
-            transformed(layer, &session.original, session.bounds, transform)
+            let moved = transformed(layer, &session.floating, session.bounds, transform);
+            if session.selected {
+                stacked(&session.base, moved)
+            } else {
+                moved
+            }
         };
         self.mark_dirty(self.bounds());
     }
@@ -537,6 +576,11 @@ impl Document {
                 .filter(|(i, orig)| orig.is_some() || now[*i].is_some())
                 .collect();
             self.commit_tiles(session.layer, saved);
+            if session.selected {
+                // The outline no longer matches what was moved.
+                self.selection = None;
+                self.selection_stamp += 1;
+            }
         }
     }
 
@@ -548,12 +592,64 @@ impl Document {
     }
 }
 
-/// Smallest rectangle containing every non-transparent pixel of the layer.
-fn content_bounds(layer: &Layer) -> Option<IRect> {
+/// Splits a layer's tiles into the selected part and the rest.
+fn split_by_selection(layer: &Layer, selection: &Selection) -> (Vec<Option<Arc<Tile>>>, Vec<Option<Arc<Tile>>>) {
+    let mut floating: Vec<Option<Arc<Tile>>> = vec![None; layer.tiles.len()];
+    let mut base = layer.tiles.clone();
+    let b = selection.bounds;
+    for ty in b.y0 as usize / TILE..=(b.y1 as usize - 1) / TILE {
+        for tx in b.x0 as usize / TILE..=(b.x1 as usize - 1) / TILE {
+            let idx = layer.tile_index(tx, ty);
+            let Some(source) = &layer.tiles[idx] else { continue };
+            let (mut taken, mut left) = (Tile::empty(), Tile::empty());
+            let mut any = false;
+            for py in 0..TILE {
+                for px in 0..TILE {
+                    let i = py * TILE + px;
+                    let m = selection.coverage((tx * TILE + px) as i32, (ty * TILE + py) as i32) as u32;
+                    let p = source.0[i];
+                    let part: Px = std::array::from_fn(|c| ((p[c] as u32 * m + 127) / 255) as u16);
+                    left.0[i] = std::array::from_fn(|c| p[c] - part[c]);
+                    taken.0[i] = part;
+                    any |= part[3] != 0;
+                }
+            }
+            if any {
+                floating[idx] = Some(Arc::new(taken));
+                base[idx] = Some(Arc::new(left));
+            }
+        }
+    }
+    (floating, base)
+}
+
+/// `top` composited over `base`, tile by tile.
+fn stacked(base: &[Option<Arc<Tile>>], top: Vec<Option<Arc<Tile>>>) -> Vec<Option<Arc<Tile>>> {
+    base.iter()
+        .zip(top)
+        .map(|(below, above)| match (below, above) {
+            (None, above) => above,
+            (below, None) => below.clone(),
+            (Some(below), Some(mut above)) => {
+                let tile = Arc::make_mut(&mut above);
+                for (a, b) in tile.0.iter_mut().zip(below.0.iter()) {
+                    let keep = ONE - a[3] as u32;
+                    for c in 0..4 {
+                        a[c] = (a[c] as u32 + ((b[c] as u32 * keep + ONE / 2) >> 15)).min(ONE) as u16;
+                    }
+                }
+                Some(above)
+            }
+        })
+        .collect()
+}
+
+/// Smallest rectangle containing every non-transparent pixel of `tiles`.
+fn content_bounds(layer: &Layer, tiles: &[Option<Arc<Tile>>]) -> Option<IRect> {
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
     for ty in 0..layer.tiles_y {
         for tx in 0..layer.tiles_x {
-            let Some(tile) = &layer.tiles[layer.tile_index(tx, ty)] else { continue };
+            let Some(tile) = &tiles[layer.tile_index(tx, ty)] else { continue };
             for py in 0..TILE {
                 for px in 0..TILE {
                     if tile.0[py * TILE + px][3] != 0 {
@@ -665,4 +761,109 @@ fn transformed(layer: &Layer, original: &[Option<Arc<Tile>>], bounds: IRect, t: 
         out[idx] = Some(Arc::new(tile));
     }
     out
+}
+
+// --- Flipping and clearing --------------------------------------------------
+
+/// Reads a rectangle of a layer into a row-major buffer.
+fn read_region(layer: &Layer, rect: IRect) -> Vec<Px> {
+    let mut buffer = Vec::with_capacity(rect.width() * rect.height());
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            buffer.push(layer.pixel(x, y));
+        }
+    }
+    buffer
+}
+
+/// Writes a buffer back over a rectangle of a layer, without creating tiles
+/// for areas that are and stay empty.
+fn write_region(layer: &mut Layer, edit: &mut TileEdit, rect: IRect, buffer: &[Px]) {
+    let w = rect.width();
+    let t = TILE as i32;
+    for ty in rect.y0 / t..=(rect.y1 - 1) / t {
+        for tx in rect.x0 / t..=(rect.x1 - 1) / t {
+            let part = rect.intersect(&IRect::new(tx * t, ty * t, (tx + 1) * t, (ty + 1) * t));
+            let idx = layer.tile_index(tx as usize, ty as usize);
+            let at = |x: i32, y: i32| buffer[(y - rect.y0) as usize * w + (x - rect.x0) as usize];
+            let blank = (part.y0..part.y1).all(|y| (part.x0..part.x1).all(|x| at(x, y) == [0; 4]));
+            if blank && layer.tiles[idx].is_none() {
+                continue;
+            }
+            let tile = edit.tile_mut(layer, idx);
+            for y in part.y0..part.y1 {
+                for x in part.x0..part.x1 {
+                    tile.0[(y - ty * t) as usize * TILE + (x - tx * t) as usize] = at(x, y);
+                }
+            }
+        }
+    }
+}
+
+impl Document {
+    /// Mirrors the active layer about the centre of the canvas, or, with a
+    /// selection, mirrors the selected part (and the selection) within the
+    /// selection's bounding box.
+    pub fn flip(&mut self, horizontal: bool) {
+        self.end_stroke();
+        let li = self.active_layer;
+        let selection = self.selection.clone();
+        let rect = selection.as_ref().map_or(self.bounds(), |s| s.bounds);
+        let (w, h) = (rect.width(), rect.height());
+        let layer = &mut self.layers[li];
+        let source = read_region(layer, rect);
+        let mirror = |x: usize, y: usize| if horizontal { (w - 1 - x, y) } else { (x, h - 1 - y) };
+        let mut out = vec![[0u16; 4]; source.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (mx, my) = mirror(x, y);
+                out[y * w + x] = match &selection {
+                    None => source[my * w + mx],
+                    Some(sel) => {
+                        // The selected part of the mirrored pixel, over what this
+                        // pixel keeps for being outside the selection.
+                        let share = |px: Px, m: u32| -> Px { std::array::from_fn(|c| ((px[c] as u32 * m + 127) / 255) as u16) };
+                        let m_here = sel.coverage(rect.x0 + x as i32, rect.y0 + y as i32) as u32;
+                        let m_there = sel.coverage(rect.x0 + mx as i32, rect.y0 + my as i32) as u32;
+                        let here = source[y * w + x];
+                        let taken = share(here, m_here);
+                        let stays: Px = std::array::from_fn(|c| here[c] - taken[c]);
+                        let arrives = share(source[my * w + mx], m_there);
+                        let keep = ONE - arrives[3] as u32;
+                        std::array::from_fn(|c| {
+                            (arrives[c] as u32 + ((stays[c] as u32 * keep + ONE / 2) >> 15)).min(ONE) as u16
+                        })
+                    }
+                };
+            }
+        }
+        let mut edit = TileEdit::default();
+        write_region(layer, &mut edit, rect, &out);
+        self.commit_tiles(li, edit.into_saved());
+        if let Some(sel) = selection {
+            self.selection = Some(Arc::new(sel.mirrored(horizontal)));
+            self.selection_stamp += 1;
+        }
+        self.mark_dirty(rect);
+    }
+
+    /// Erases the selected part of the active layer. Does nothing without a
+    /// selection.
+    pub fn clear_selection_contents(&mut self) {
+        self.end_stroke();
+        let Some(selection) = self.selection.clone() else { return };
+        let li = self.active_layer;
+        let rect = selection.bounds;
+        let layer = &mut self.layers[li];
+        let mut buffer = read_region(layer, rect);
+        let w = rect.width();
+        for (i, px) in buffer.iter_mut().enumerate() {
+            let keep = 255 - selection.coverage(rect.x0 + (i % w) as i32, rect.y0 + (i / w) as i32) as u32;
+            *px = px.map(|c| ((c as u32 * keep + 127) / 255) as u16);
+        }
+        let mut edit = TileEdit::default();
+        write_region(layer, &mut edit, rect, &buffer);
+        self.commit_tiles(li, edit.into_saved());
+        self.mark_dirty(rect);
+    }
 }

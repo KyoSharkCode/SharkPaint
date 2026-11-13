@@ -31,11 +31,12 @@ enum Tool {
     Cuentagotas,
     Mover,
     Transformar,
+    Seleccion,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 7] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 8] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -43,6 +44,7 @@ impl Tool {
         (Tool::Cuentagotas, "cuentagotas", "Cuentagotas", "I"),
         (Tool::Mover, "mover", "Mover capa", "V"),
         (Tool::Transformar, "transformar", "Transformar", "T"),
+        (Tool::Seleccion, "seleccion", "Selección", "S"),
     ];
 
     fn name(self) -> &'static str {
@@ -53,6 +55,56 @@ impl Tool {
     fn has_tip(self) -> bool {
         matches!(self, Tool::Pincel | Tool::Borrador | Tool::Difuminar)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectShape {
+    Rectangulo,
+    Elipse,
+    Libre,
+}
+
+impl SelectShape {
+    const ALL: [(SelectShape, &'static str); 3] = [
+        (SelectShape::Rectangulo, "Rectángulo"),
+        (SelectShape::Elipse, "Elipse"),
+        (SelectShape::Libre, "Forma libre"),
+    ];
+
+    /// The outline of a selection dragged from `from` to `to`, in canvas
+    /// coordinates. `trail` is the path of a freehand drag; `regular` makes
+    /// rectangles square and ellipses round.
+    fn outline(self, from: Pos2, to: Pos2, trail: &[Pos2], regular: bool) -> Vec<(f32, f32)> {
+        let mut to = to;
+        if regular && self != SelectShape::Libre {
+            let side = (to.x - from.x).abs().max((to.y - from.y).abs());
+            to = Pos2::new(from.x + side * (to.x - from.x).signum(), from.y + side * (to.y - from.y).signum());
+        }
+        let rect = Rect::from_two_pos(from, to);
+        match self {
+            SelectShape::Rectangulo => {
+                vec![(rect.min.x, rect.min.y), (rect.max.x, rect.min.y), (rect.max.x, rect.max.y), (rect.min.x, rect.max.y)]
+            }
+            SelectShape::Elipse => (0..96)
+                .map(|i| {
+                    let a = i as f32 / 96.0 * std::f32::consts::TAU;
+                    (rect.center().x + rect.width() * 0.5 * a.cos(), rect.center().y + rect.height() * 0.5 * a.sin())
+                })
+                .collect(),
+            SelectShape::Libre => trail.iter().map(|p| (p.x, p.y)).collect(),
+        }
+    }
+}
+
+/// A selection being dragged out.
+struct SelectDrag {
+    from: Pos2,
+    to: Pos2,
+    /// Path of the pointer, for freehand selections.
+    trail: Vec<Pos2>,
+    /// Screen position of the press, to tell a click from a drag.
+    pressed_at: Pos2,
+    moved: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -168,6 +220,10 @@ enum Command {
     ToggleBrushWindow,
     Fullscreen,
     FinishTransform(bool),
+    SelectAll,
+    Deselect,
+    DeleteSelected,
+    FlipContents(bool),
     Quit,
 }
 
@@ -208,8 +264,11 @@ pub struct SharkPaintApp {
     picking: bool,
     /// The transform tool's box, while a transform is open.
     xform: Option<TransformBox>,
-    /// Layer (id, version) found empty, so the transform tool does not rescan it.
-    xform_empty: Option<(u64, u64)>,
+    /// Layer (id, version) and selection found empty, so the transform tool
+    /// does not rescan them.
+    xform_empty: Option<(u64, u64, u64)>,
+    select_shape: SelectShape,
+    select_drag: Option<SelectDrag>,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -293,6 +352,8 @@ impl SharkPaintApp {
             picking: false,
             xform: None,
             xform_empty: None,
+            select_shape: SelectShape::Rectangulo,
+            select_drag: None,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -565,6 +626,15 @@ impl SharkPaintApp {
             if hit(cmd, Key::J) {
                 commands.push(Command::LayerDuplicate);
             }
+            if hit(cmd, Key::A) {
+                commands.push(Command::SelectAll);
+            }
+            if hit(cmd, Key::D) {
+                commands.push(Command::Deselect);
+            }
+            if hit(none, Key::Delete) {
+                commands.push(Command::DeleteSelected);
+            }
             if hit(cmd, Key::Num0) {
                 commands.push(Command::Fit);
             }
@@ -611,6 +681,7 @@ impl SharkPaintApp {
                 (Tool::Cuentagotas, Key::I),
                 (Tool::Mover, Key::V),
                 (Tool::Transformar, Key::T),
+                (Tool::Seleccion, Key::S),
             ] {
                 if hit(none, key) {
                     self.tool = tool;
@@ -691,11 +762,39 @@ impl SharkPaintApp {
                     commands.push(Command::LayerMove(false));
                 }
                 ui.separator();
+                if ui.button("Voltear horizontalmente").clicked() {
+                    commands.push(Command::FlipContents(true));
+                }
+                if ui.button("Voltear verticalmente").clicked() {
+                    commands.push(Command::FlipContents(false));
+                }
+                ui.separator();
                 if ui.button("Limpiar capa").clicked() {
                     commands.push(Command::ClearLayer);
                 }
                 if ui.add_enabled(many, egui::Button::new("Eliminar capa")).clicked() {
                     commands.push(Command::LayerDelete);
+                }
+            });
+            ui.menu_button("Selección", |ui| {
+                let selected = self.doc.selection().is_some();
+                if ui.add(egui::Button::new("Seleccionar todo").shortcut_text("Ctrl+A")).clicked() {
+                    commands.push(Command::SelectAll);
+                }
+                if ui.add_enabled(selected, egui::Button::new("Deseleccionar").shortcut_text("Ctrl+D")).clicked() {
+                    commands.push(Command::Deselect);
+                }
+                ui.separator();
+                if ui.add_enabled(selected, egui::Button::new("Borrar lo seleccionado").shortcut_text("Supr")).clicked() {
+                    commands.push(Command::DeleteSelected);
+                }
+                ui.separator();
+                let what = if selected { "la selección" } else { "la capa" };
+                if ui.button(format!("Voltear {what} horizontalmente")).clicked() {
+                    commands.push(Command::FlipContents(true));
+                }
+                if ui.button(format!("Voltear {what} verticalmente")).clicked() {
+                    commands.push(Command::FlipContents(false));
                 }
             });
             ui.menu_button("Ver", |ui| {
@@ -746,6 +845,8 @@ impl SharkPaintApp {
                         ("B / E / D", "Pincel / Borrador / Difuminar"),
                         ("G / I / V", "Relleno / Cuentagotas / Mover capa"),
                         ("T", "Transformar (Intro aplica, Esc cancela)"),
+                        ("S", "Selección (Ctrl+A todo, Ctrl+D ninguna)"),
+                        ("Supr", "Borrar lo seleccionado"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
@@ -897,7 +998,7 @@ impl SharkPaintApp {
             self.xform = None; // something else (undo, saving…) closed it
         }
         if self.xform.is_none() && self.doc.active().props.visible {
-            let key = (self.doc.active().id, self.doc.active().version);
+            let key = (self.doc.active().id, self.doc.active().version, self.doc.selection_stamp());
             if self.xform_empty == Some(key) {
                 return;
             }
@@ -950,6 +1051,18 @@ impl SharkPaintApp {
             }
             Tool::Transformar => {
                 self.transform_panel(ui);
+                return;
+            }
+            Tool::Seleccion => {
+                ui.horizontal_wrapped(|ui| {
+                    for (shape, name) in SelectShape::ALL {
+                        ui.selectable_value(&mut self.select_shape, shape, name);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
+                ui.label("Un clic sin arrastrar quita la selección.");
+                ui.label("Pintar, borrar, rellenar, transformar y voltear afectan solo a lo seleccionado.");
                 return;
             }
         }
@@ -1424,6 +1537,7 @@ impl SharkPaintApp {
                                     self.pending_start = None;
                                     self.move_origin = None;
                                     self.picking = false;
+                                    self.select_drag = None;
                                     self.doc.cancel_stroke();
                                 }
                             }
@@ -1462,6 +1576,10 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
+                    if self.tool == Tool::Seleccion && !alt {
+                        self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
+                        continue;
+                    }
                     if alt || self.tool == Tool::Cuentagotas {
                         self.pick_color(c);
                         self.picking = self.tool == Tool::Cuentagotas;
@@ -1519,6 +1637,13 @@ impl SharkPaintApp {
                     }
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
+                Event::PointerMoved(pos) if self.select_drag.is_some() => {
+                    if let Some(drag) = &mut self.select_drag {
+                        drag.to = to_canvas(*pos);
+                        drag.trail.push(drag.to);
+                        drag.moved |= (*pos - drag.pressed_at).length() > 3.0;
+                    }
+                }
                 Event::PointerMoved(pos) if self.picking => self.pick_color(to_canvas(*pos)),
                 Event::PointerMoved(pos) if self.move_origin.is_some() => {
                     let delta = to_canvas(*pos) - self.move_origin.unwrap_or_default();
@@ -1549,6 +1674,15 @@ impl SharkPaintApp {
                         // The transform stays open between drags; only the drag ends.
                         if let Some(xform) = &mut self.xform {
                             xform.drag = None;
+                        }
+                        continue;
+                    }
+                    if let Some(drag) = self.select_drag.take() {
+                        if drag.moved {
+                            let outline = self.select_shape.outline(drag.from, drag.to, &drag.trail, free);
+                            self.doc.select_polygon(&outline);
+                        } else {
+                            self.doc.deselect();
                         }
                         continue;
                     }
@@ -1604,6 +1738,22 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
+        // The selection, and the one being dragged out, as a dashed outline.
+        let dashed = |outline: &[(f32, f32)]| {
+            let mut points: Vec<Pos2> =
+                outline.iter().map(|&(x, y)| self.view.to_screen(Pos2::new(x, y), viewport, doc_size)).collect();
+            if let Some(first) = points.first().copied() {
+                points.push(first);
+            }
+            painter.add(Shape::line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
+            painter.extend(Shape::dashed_line(&points, Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
+        };
+        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
+            dashed(&self.select_shape.outline(drag.from, drag.to, &drag.trail, free));
+        } else if let Some(selection) = self.doc.selection() {
+            dashed(&selection.outline);
+        }
+
         // The transform box: outline and corner handles.
         if let Some(xform) = &self.xform {
             let points: Vec<Pos2> = xform.corners().iter().map(|c| self.view.to_screen(*c, viewport, doc_size)).collect();
@@ -1620,7 +1770,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno) {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -1755,6 +1905,10 @@ impl SharkPaintApp {
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
             Command::FinishTransform(apply) => self.finish_transform(apply),
+            Command::SelectAll => self.doc.select_all(),
+            Command::Deselect => self.doc.deselect(),
+            Command::DeleteSelected => self.doc.clear_selection_contents(),
+            Command::FlipContents(horizontal) => self.doc.flip(horizontal),
             Command::Fullscreen => {
                 let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));

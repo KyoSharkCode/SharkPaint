@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::brush::BrushSettings;
 use super::layer::{blend_over, IRect, Layer, LayerProps, Tile, ONE, TILE};
+use super::selection::Selection;
 use super::stroke::{ActiveStroke, StrokePoint};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
@@ -43,6 +44,9 @@ pub struct Document {
     next_layer_number: usize,
     /// Source of layer ids and versions; never repeats.
     next_stamp: u64,
+    pub(super) selection: Option<Arc<Selection>>,
+    /// Changes whenever the selection does.
+    pub(super) selection_stamp: u64,
 }
 
 impl Document {
@@ -75,6 +79,8 @@ impl Document {
             redo: Vec::new(),
             dirty: IRect::new(0, 0, width as i32, height as i32),
             revision: 0,
+            selection: None,
+            selection_stamp: 0,
         }
     }
 
@@ -225,6 +231,37 @@ impl Document {
         }
     }
 
+    // --- Selection ------------------------------------------------------------
+
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_deref()
+    }
+
+    /// A counter that changes whenever the selection changes.
+    pub fn selection_stamp(&self) -> u64 {
+        self.selection_stamp
+    }
+
+    /// Selects the inside of a closed polygon given in canvas coordinates.
+    /// A polygon that covers nothing clears the selection.
+    pub fn select_polygon(&mut self, points: &[(f32, f32)]) {
+        self.end_stroke();
+        self.selection = Selection::from_polygon(self.width, self.height, points).map(Arc::new);
+        self.selection_stamp += 1;
+    }
+
+    pub fn select_all(&mut self) {
+        let (w, h) = (self.width as f32, self.height as f32);
+        self.select_polygon(&[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]);
+    }
+
+    pub fn deselect(&mut self) {
+        self.end_stroke();
+        if self.selection.take().is_some() {
+            self.selection_stamp += 1;
+        }
+    }
+
     // --- Strokes --------------------------------------------------------------
 
     /// A brush stroke, smudge or layer move is in progress.
@@ -237,7 +274,8 @@ impl Document {
             self.end_stroke();
         }
         let li = self.active_layer;
-        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, p);
+        let selection = self.selection.clone();
+        let (stroke, rect) = ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, p);
         self.stroke = Some(stroke);
         self.mark_dirty(rect);
     }

@@ -629,3 +629,119 @@ fn transform_keeps_soft_edges_when_rotated() {
         .map(|(x, y)| layer.pixel(x, y)[3] as f64 / 32768.0).sum();
     assert!((area - 1800.0).abs() < 60.0, "area {area}");
 }
+
+fn rect_points(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<(f32, f32)> {
+    vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+}
+
+#[test]
+fn selections_cover_the_inside_of_their_shape() {
+    let mut doc = Document::new(200, 150);
+    doc.select_polygon(&rect_points(20.0, 30.0, 80.5, 90.0));
+    let sel = doc.selection().unwrap();
+    assert_eq!(sel.bounds, IRect::new(20, 30, 81, 90));
+    assert_eq!((sel.coverage(20, 30), sel.coverage(79, 89), sel.coverage(19, 50), sel.coverage(50, 90)), (255, 255, 0, 0));
+    assert!((120..=135).contains(&sel.coverage(80, 50)), "half-covered edge: {}", sel.coverage(80, 50));
+
+    // A circle of radius 40: area close to πr², smooth edge, outside empty.
+    let circle: Vec<(f32, f32)> = (0..96)
+        .map(|i| { let a = i as f32 / 96.0 * std::f32::consts::TAU; (100.0 + 40.0 * a.cos(), 75.0 + 40.0 * a.sin()) })
+        .collect();
+    doc.select_polygon(&circle);
+    let sel = doc.selection().unwrap();
+    let area: f64 = sel.mask.iter().map(|&m| m as f64 / 255.0).sum();
+    assert!((area - std::f64::consts::PI * 1600.0).abs() < 30.0, "area {area}");
+    assert_eq!((sel.coverage(100, 75), sel.coverage(100, 30), sel.coverage(140, 110)), (255, 0, 0));
+
+    // A shape partly off the canvas is clipped; one fully off clears the selection.
+    doc.select_polygon(&rect_points(-50.0, -50.0, 10.0, 10.0));
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(0, 0, 10, 10));
+    let stamp = doc.selection_stamp();
+    doc.select_polygon(&rect_points(500.0, 500.0, 600.0, 600.0));
+    assert!(doc.selection().is_none());
+    assert_ne!(doc.selection_stamp(), stamp);
+    doc.select_all();
+    assert_eq!(doc.selection().unwrap().bounds, doc.bounds());
+    doc.deselect();
+    assert!(doc.selection().is_none());
+}
+
+#[test]
+fn painting_stays_inside_the_selection() {
+    let mut doc = Document::new(200, 200);
+    doc.select_polygon(&rect_points(50.0, 50.0, 150.0, 150.0));
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (10.0, 100.0), (190.0, 100.0));
+    assert_eq!(pixel(&doc, 100, 100), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 30, 100), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 170, 100), [255, 255, 255, 255]);
+    // The eraser and the fill respect it too.
+    doc.deselect();
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (10.0, 100.0), (190.0, 100.0));
+    doc.select_polygon(&rect_points(0.0, 0.0, 100.0, 200.0));
+    line(&mut doc, &hard_brush(60.0), [0, 0, 0], true, (10.0, 100.0), (190.0, 100.0));
+    assert_eq!(pixel(&doc, 50, 100), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 150, 100), [255, 0, 0, 255]);
+    assert!(doc.flood_fill(50, 20, [0, 0, 255], 0.1, false));
+    assert_eq!(pixel(&doc, 50, 20), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 150, 20), [255, 255, 255, 255]);
+    assert!(!doc.flood_fill(150, 20, [0, 0, 255], 0.1, false)); // clicked outside the selection
+}
+
+#[test]
+fn transform_moves_only_the_selected_part() {
+    let mut doc = doc_with_block(); // red block x 30..70, y 40..60
+    let before = doc.render_rgba8(doc.bounds());
+    doc.select_polygon(&rect_points(50.0, 0.0, 200.0, 200.0)); // its right half
+    assert_eq!(doc.begin_transform(), Some(IRect::new(50, 40, 70, 60)));
+    doc.set_transform(LayerTransform { scale: (1.0, 1.0), rotation: 0.0, offset: (60.0, 100.0) });
+    assert!(red(&doc, 35, 50) && red(&doc, 49, 50)); // the left half stays
+    assert!(!red(&doc, 55, 50) && !red(&doc, 65, 50)); // the right half left
+    assert!(red(&doc, 115, 150) && red(&doc, 125, 150)); // and landed here
+    doc.end_stroke();
+    assert!(doc.selection().is_none()); // the outline no longer matched
+    assert!(doc.undo());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // A selection over empty space has nothing to transform.
+    doc.select_polygon(&rect_points(120.0, 120.0, 180.0, 180.0));
+    assert_eq!(doc.begin_transform(), None);
+}
+
+#[test]
+fn flipping_a_layer_or_a_selection() {
+    let mut doc = doc_with_block(); // red block x 30..70, y 40..60 on a 200 × 200 canvas
+    let before = doc.render_rgba8(doc.bounds());
+    doc.flip(true);
+    assert!(red(&doc, 135, 50) && red(&doc, 165, 50) && !red(&doc, 50, 50)); // now x 130..170
+    doc.flip(false);
+    assert!(red(&doc, 150, 150) && !red(&doc, 150, 50)); // and y 140..160
+    doc.flip(false);
+    doc.flip(true);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before); // two flips each way cancel out
+    for _ in 0..4 {
+        assert!(doc.undo());
+    }
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // With a selection, only its contents flip, within its bounds.
+    doc.select_polygon(&rect_points(20.0, 30.0, 120.0, 70.0)); // the block sits in its left part
+    doc.flip(true);
+    assert!(!red(&doc, 40, 50), "the block left its old place");
+    assert!(red(&doc, 75, 50) && red(&doc, 105, 50), "and is mirrored to x 70..110");
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 30, 120, 70));
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+}
+
+#[test]
+fn deleting_clears_only_the_selection() {
+    let mut doc = doc_with_block();
+    let revision = doc.revision();
+    doc.clear_selection_contents(); // nothing selected: nothing happens
+    assert_eq!(doc.revision(), revision);
+    doc.select_polygon(&rect_points(0.0, 0.0, 50.0, 200.0));
+    doc.clear_selection_contents();
+    assert!(!red(&doc, 40, 50) && red(&doc, 60, 50));
+    doc.undo();
+    assert!(red(&doc, 40, 50));
+}
