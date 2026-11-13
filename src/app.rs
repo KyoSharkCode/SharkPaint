@@ -307,12 +307,8 @@ pub struct SharkPaintApp {
     /// The window may close even with unsaved changes (the user chose to).
     allow_close: bool,
     window_title: String,
-    /// Display scale of the monitor the window is on.
-    display_scale: f32,
-    /// Window size in points while the display scale was last steady.
-    steady_size: Option<Vec2>,
-    /// When the display scale last changed (the window crossed to another monitor).
-    scale_changed_at: Option<f64>,
+    /// The fix for moving between monitors of different scale has been tried.
+    window_hooked: bool,
     /// The floating brush settings window is showing.
     brush_window_open: bool,
 }
@@ -376,9 +372,7 @@ impl SharkPaintApp {
             confirm: None,
             allow_close: false,
             window_title: String::new(),
-            display_scale: 0.0,
-            steady_size: None,
-            scale_changed_at: None,
+            window_hooked: false,
             brush_window_open: true,
         };
         // A project opens as such; any other file is taken as an image to draw over.
@@ -523,44 +517,6 @@ impl SharkPaintApp {
             }
             Some(2) => self.confirm = None,
             _ => {}
-        }
-    }
-
-    /// Keeps the window the same apparent size when it moves to a monitor with a
-    /// different display scale. Dragging a window across such monitors can leave
-    /// it shrunken on Windows; once the scale settles, the size from before the
-    /// move is restored.
-    fn keep_size_across_monitors(&mut self, ctx: &egui::Context) {
-        let (scale, size, fixed, now) = ctx.input(|i| {
-            let v = i.viewport();
-            (
-                v.native_pixels_per_point.unwrap_or(1.0),
-                v.inner_rect.map(|r| r.size()),
-                v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false) || v.minimized.unwrap_or(false),
-                i.time,
-            )
-        });
-        if self.display_scale == 0.0 {
-            self.display_scale = scale;
-        }
-        if scale != self.display_scale {
-            self.display_scale = scale;
-            self.scale_changed_at = Some(now);
-        }
-        match self.scale_changed_at {
-            Some(changed) if now - changed < 0.6 => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(200));
-            }
-            Some(_) => {
-                self.scale_changed_at = None;
-                if let (Some(want), Some(have), false) = (self.steady_size, size, fixed) {
-                    if (have - want).abs().max_elem() > 8.0 {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
-                    }
-                }
-            }
-            None if !fixed => self.steady_size = size,
-            None => {}
         }
     }
 
@@ -1919,7 +1875,11 @@ impl SharkPaintApp {
 }
 
 impl eframe::App for SharkPaintApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !self.window_hooked {
+            self.window_hooked = true;
+            crate::dpi_fix::install(frame);
+        }
         let ctx = ui.ctx().clone();
         let mut commands = Vec::new();
         self.keyboard_commands(&ctx, &mut commands);
@@ -1955,7 +1915,6 @@ impl eframe::App for SharkPaintApp {
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
-        self.keep_size_across_monitors(&ctx);
         for command in commands {
             self.run(command, &ctx);
         }
