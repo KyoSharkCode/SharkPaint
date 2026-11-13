@@ -1514,7 +1514,7 @@ impl SharkPaintApp {
         }
         if ui
             .small_button("Importar de Photoshop (.abr)…")
-            .on_hover_text("Añade las puntas de un archivo de pinceles de Photoshop.\nSe importan la forma, el tamaño y el espaciado; el resto se ajusta aquí.\nTambién puedes arrastrar el archivo a la ventana.")
+            .on_hover_text("Añade los pinceles de un archivo de Photoshop.\nSe importan la forma, el tamaño, la dureza y el espaciado; el resto se ajusta aquí.\nTambién puedes arrastrar el archivo a la ventana.")
             .clicked()
         {
             if let Some(path) = rfd::FileDialog::new()

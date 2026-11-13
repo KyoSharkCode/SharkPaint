@@ -1203,10 +1203,19 @@ fn photoshop_brush_files_are_read() {
     old.extend((body.len() as u32).to_be_bytes());
     old.extend(&body);
     let brushes = read_abr(&old).expect("an old-style file");
-    assert_eq!(brushes.len(), 1);
+    assert_eq!(brushes.len(), 1, "a computed brush cut short is skipped");
     assert_eq!(brushes[0].name.as_deref(), Some("Ok"));
     assert_eq!((brushes[0].width, brushes[0].height, brushes[0].spacing), (3, 2, Some(0.4)));
     assert_eq!(brushes[0].coverage, [1, 2, 3, 4, 5, 6]);
+
+    // A complete computed brush: spacing, diameter, roundness, angle, hardness.
+    let mut old = vec![0, 1, 0, 1, 0, 1, 0, 0, 0, 14, 0, 0, 0, 0];
+    for value in [25u16, 40, 100, 0, 60] {
+        old.extend(value.to_be_bytes());
+    }
+    let brushes = read_abr(&old).expect("an old-style round brush");
+    assert!(brushes[0].is_round());
+    assert_eq!((brushes[0].diameter, brushes[0].hardness, brushes[0].spacing), (Some(40.0), Some(0.6), Some(0.25)));
 }
 
 #[test]
@@ -1224,4 +1233,104 @@ fn damaged_brush_files_are_rejected_without_panicking() {
     let mut file = vec![0, 6, 0, 1];
     file.extend(abr_block(b"samp", &huge));
     assert!(read_abr(&file).is_err());
+}
+
+/// Builders for the tree of named values Photoshop keeps brush settings in.
+mod abr_tree {
+    pub fn name(name: &str) -> Vec<u8> {
+        let mut out = if name.len() == 4 { vec![0, 0, 0, 0] } else { (name.len() as u32).to_be_bytes().to_vec() };
+        out.extend(name.bytes());
+        out
+    }
+    pub fn text(value: &str) -> Vec<u8> {
+        let units: Vec<u16> = value.encode_utf16().chain([0]).collect();
+        let mut out = b"TEXT".to_vec();
+        out.extend((units.len() as u32).to_be_bytes());
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    }
+    pub fn unit(unit: &str, value: f64) -> Vec<u8> {
+        let mut out = b"UntF".to_vec();
+        out.extend(unit.bytes());
+        out.extend(value.to_be_bytes());
+        out
+    }
+    pub fn flag(value: bool) -> Vec<u8> {
+        vec![b'b', b'o', b'o', b'l', value as u8]
+    }
+    pub fn long(value: i32) -> Vec<u8> {
+        let mut out = b"long".to_vec();
+        out.extend(value.to_be_bytes());
+        out
+    }
+    /// An object without its type tag, as the block itself starts.
+    pub fn bare(class: &str, items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 1, 0, 0];
+        out.extend(name(class));
+        out.extend((items.len() as u32).to_be_bytes());
+        for (key, value) in items {
+            out.extend(name(key));
+            out.extend(value);
+        }
+        out
+    }
+    pub fn object(class: &str, items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"Objc".to_vec();
+        out.extend(bare(class, items));
+        out
+    }
+    pub fn list(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"VlLs".to_vec();
+        out.extend((items.len() as u32).to_be_bytes());
+        out.extend(items.concat());
+        out
+    }
+}
+
+#[test]
+fn photoshop_round_brushes_and_names_come_from_the_settings() {
+    use abr_tree::*;
+    let round = object("brushPreset", &[
+        ("Nm  ", text("Line Art")),
+        ("Brsh", object("computedBrush", &[
+            ("Dmtr", unit("#Pxl", 123.0)),
+            ("Hrdn", unit("#Prc", 100.0)),
+            ("Spcn", unit("#Prc", 5.0)),
+        ])),
+        ("useTipDynamics", flag(false)),
+    ]);
+    let sampled = object("brushPreset", &[
+        ("Nm  ", text("Boceto")),
+        ("Brsh", object("sampledBrush", &[
+            ("Dmtr", unit("#Pxl", 80.0)),
+            ("Nm  ", text("Sampled Brush 519")),
+            ("Spcn", unit("#Prc", 10.0)),
+            ("sampledData", text("uno-1111")),
+        ])),
+        ("useTipDynamics", flag(true)),
+        ("minimumDiameter", unit("#Prc", 20.0)),
+        ("szVr", object("brVr", &[("bVTy", long(2))])),
+        ("usePaintDynamics", flag(true)),
+        ("opVr", object("brVr", &[("bVTy", long(2))])),
+    ]);
+    let mut settings = vec![0, 0, 0, 16];
+    settings.extend(bare("null", &[("Brsh", list(&[round, sampled.clone(), sampled]))]));
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"samp", &abr_sample("uno-1111", 4, 2, 8, false, &[9, 9, 9, 9, 9, 9, 9, 9])));
+    file.extend(abr_block(b"desc", &settings));
+
+    let brushes = read_abr(&file).expect("a file with a settings tree");
+    // In the order listed, round ones included, and a picture may be shared.
+    assert_eq!(brushes.len(), 3);
+    assert!(brushes[0].is_round());
+    assert_eq!(brushes[0].name.as_deref(), Some("Line Art"));
+    assert_eq!((brushes[0].diameter, brushes[0].hardness, brushes[0].spacing), (Some(123.0), Some(1.0), Some(0.05)));
+    assert!(!brushes[0].pressure_size && !brushes[0].pressure_flow);
+    for brush in &brushes[1..] {
+        // The brush's own name, not the name of its picture.
+        assert_eq!(brush.name.as_deref(), Some("Boceto"));
+        assert_eq!((brush.width, brush.height, brush.diameter), (4, 2, Some(80.0)));
+        assert!(brush.pressure_size && brush.pressure_flow);
+        assert_eq!(brush.min_size, Some(0.2));
+    }
 }

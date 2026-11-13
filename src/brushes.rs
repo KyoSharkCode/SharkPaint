@@ -350,9 +350,10 @@ impl BrushLibrary {
         self.store_tip(&stem, w, h, &coverage).map(|(tip, _)| tip)
     }
 
-    /// Reads a Photoshop brush file and adds a brush for each tip drawn in it.
-    /// Returns how many were added. Only the shape, size, spacing, angle and
-    /// roundness carry over; Photoshop's dynamics have no equivalent here.
+    /// Reads a Photoshop brush file and adds each of its brushes. Returns how
+    /// many were added. The shape, size, hardness, spacing, angle, roundness
+    /// and the pressure switches carry over; the rest of Photoshop's dynamics
+    /// have no equivalent here.
     pub fn import_abr(&mut self, path: &Path) -> Result<usize, String> {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
         let file = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "abr".into());
@@ -362,19 +363,28 @@ impl BrushLibrary {
                 Some(name) => name.clone(),
                 None => format!("{file} {}", i + 1),
             };
-            // The number keeps tips with the same name in one file apart.
-            let stem = format!("{file} {:03} {name}", i + 1);
-            let Ok((tip, side)) = self.store_tip(&stem, brush.width, brush.height, &brush.coverage) else {
-                continue; // an empty picture
+            let size = brush.diameter.filter(|d| *d > 0.0);
+            let (tip, size, hardness) = if brush.is_round() {
+                (BrushTip::Round, size.unwrap_or(20.0), brush.hardness.unwrap_or(1.0))
+            } else {
+                // The number keeps tips with the same name in one file apart.
+                let stem = format!("{file} {:03} {name}", i + 1);
+                let Ok((tip, side)) = self.store_tip(&stem, brush.width, brush.height, &brush.coverage) else {
+                    continue; // an empty picture
+                };
+                (BrushTip::Image(tip), size.unwrap_or(side as f32), 1.0)
             };
-            let size = brush.diameter.unwrap_or(side as f32).clamp(4.0, 500.0);
             let settings = BrushSettings {
-                tip: BrushTip::Image(tip),
+                tip,
+                hardness: hardness.clamp(0.0, 1.0),
                 spacing: brush.spacing.unwrap_or(0.25).clamp(0.02, 5.0),
                 angle: brush.angle.unwrap_or(0.0).clamp(-360.0, 360.0),
                 roundness: brush.roundness.unwrap_or(1.0).clamp(0.02, 1.0),
+                pressure_size: brush.pressure_size,
+                min_size: brush.min_size.unwrap_or(0.0).clamp(0.0, 1.0),
+                pressure_flow: brush.pressure_flow,
                 smoothing: 0.2,
-                ..BrushSettings::round(size)
+                ..BrushSettings::round(size.clamp(1.0, 500.0))
             };
             // Importing a file again replaces its brushes rather than doubling them.
             match self.brushes.iter_mut().find(|b| b.name == name && b.settings.tip == settings.tip) {
@@ -384,7 +394,7 @@ impl BrushLibrary {
             added += 1;
         }
         if added == 0 {
-            return Err("el archivo no contiene puntas que se puedan usar".into());
+            return Err("el archivo no contiene pinceles que se puedan usar".into());
         }
         Ok(added)
     }
