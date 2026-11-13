@@ -1,0 +1,30 @@
+[package]
+name = "sharkpaint"
+version = "0.1.0"
+edition = "2021"
+description = "Aplicación nativa de dibujo y pintura digital"
+license = "MIT"
+
+[lib]
+name = "sharkpaint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "SharkPaint"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37"
+png = "0.18"
+rfd = "0.18"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
