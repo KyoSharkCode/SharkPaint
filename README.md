@@ -12,6 +12,14 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Borrador, cuentagotas, deshacer y rehacer (200 pasos).
 - Exportación a PNG.
 
+## Pendiente
+
+- Capas con modos de fusión.
+- Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
+  de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
+  referencia. No se incluyen al exportar.
+- Guardado de proyecto e instalador.
+
 ## Atajos
 
 | Atajo | Acción |
