@@ -12,13 +12,36 @@ pub struct TipImage {
     pub size: usize,
     /// `size * size` coverage values, row-major.
     pub alpha: Vec<u8>,
+    /// Successively halved copies of the shape, so that small dabs are
+    /// averaged from it rather than picked from scattered pixels.
+    smaller: Vec<(usize, Vec<u8>)>,
 }
 
 impl TipImage {
-    /// Coverage (0..=1) at a position given in 0..=1 across the tip, with
-    /// bilinear filtering; outside the tip there is none.
-    pub fn sample(&self, u: f32, v: f32) -> f32 {
-        let n = self.size as f32;
+    pub fn new(id: impl Into<String>, name: impl Into<String>, size: usize, alpha: Vec<u8>) -> Self {
+        assert_eq!(alpha.len(), size * size, "tip image does not match its size");
+        let mut smaller: Vec<(usize, Vec<u8>)> = Vec::new();
+        let (mut side, mut level) = (size, alpha.clone());
+        while side > 2 {
+            let half = side.div_ceil(2);
+            let mut next = Vec::with_capacity(half * half);
+            for y in 0..half {
+                for x in 0..half {
+                    let at = |dx: usize, dy: usize| {
+                        level[(y * 2 + dy).min(side - 1) * side + (x * 2 + dx).min(side - 1)] as u32
+                    };
+                    next.push(((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8);
+                }
+            }
+            smaller.push((half, next.clone()));
+            (side, level) = (half, next);
+        }
+        TipImage { id: id.into(), name: name.into(), size, alpha, smaller }
+    }
+
+    /// Bilinear coverage (0..=255) of one level at a position in 0..=1.
+    fn sample_level(side: usize, data: &[u8], u: f32, v: f32) -> f32 {
+        let n = side as f32;
         let (x, y) = (u * n - 0.5, v * n - 0.5);
         let (x0, y0) = (x.floor(), y.floor());
         let (tx, ty) = (x - x0, y - y0);
@@ -26,12 +49,34 @@ impl TipImage {
             if ix < 0.0 || iy < 0.0 || ix >= n || iy >= n {
                 0.0
             } else {
-                self.alpha[iy as usize * self.size + ix as usize] as f32
+                data[iy as usize * side + ix as usize] as f32
             }
         };
         let top = at(x0, y0) + (at(x0 + 1.0, y0) - at(x0, y0)) * tx;
         let bottom = at(x0, y0 + 1.0) + (at(x0 + 1.0, y0 + 1.0) - at(x0, y0 + 1.0)) * tx;
-        (top + (bottom - top) * ty) / 255.0
+        top + (bottom - top) * ty
+    }
+
+    /// Coverage (0..=1) at a position given in 0..=1 across the tip; outside
+    /// the tip there is none. `texels` is how many pixels of the tip one
+    /// canvas pixel spans: above 1 the shape is being shrunk, and the answer
+    /// blends the two nearest reduced copies.
+    pub fn sample(&self, u: f32, v: f32, texels: f32) -> f32 {
+        let detail = texels.max(1.0).log2().min(self.smaller.len() as f32);
+        let level = |index: usize| -> f32 {
+            match index.checked_sub(1) {
+                None => Self::sample_level(self.size, &self.alpha, u, v),
+                Some(i) => Self::sample_level(self.smaller[i].0, &self.smaller[i].1, u, v),
+            }
+        };
+        let lower = detail.floor() as usize;
+        let blend = detail - lower as f32;
+        let value = if blend < 0.01 || lower >= self.smaller.len() {
+            level(lower)
+        } else {
+            level(lower) + (level(lower + 1) - level(lower)) * blend
+        };
+        value / 255.0
     }
 }
 

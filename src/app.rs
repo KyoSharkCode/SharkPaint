@@ -20,6 +20,26 @@ use crate::view::View;
 
 const DEFAULT_SIZE: [usize; 2] = [3000, 2000];
 const MAX_BRUSH_SIZE: f32 = 500.0;
+/// How many half-size copies of the canvas are kept for zoomed-out display.
+const REDUCED_LEVELS: usize = 3;
+
+/// An RGBA image at half the size, each pixel the average of the four (or, at
+/// an odd edge, fewer) it replaces.
+fn halved(rgba: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
+    let (w, h) = (width.div_ceil(2), height.div_ceil(2));
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let (y0, y1) = (y * 2, (y * 2 + 1).min(height - 1));
+        for x in 0..w {
+            let (x0, x1) = (x * 2, (x * 2 + 1).min(width - 1));
+            for c in 0..4 {
+                let at = |px: usize, py: usize| rgba[(py * width + px) * 4 + c] as u32;
+                out.push(((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8);
+            }
+        }
+    }
+    (out, w, h)
+}
 /// Seconds between automatic recovery saves.
 const AUTOSAVE_SECONDS: f64 = 120.0;
 /// Letters that move, rotate and flip the canvas, so tools cannot take them.
@@ -262,6 +282,9 @@ pub struct SharkPaintApp {
     doc: Document,
     view: View,
     texture: Option<TextureHandle>,
+    /// The canvas at 1/2, 1/4 and 1/8 size, each pixel the average of the ones
+    /// it stands for, shown when zoomed out so strokes stay smooth.
+    reduced: Vec<TextureHandle>,
     texture_options: TextureOptions,
     /// Layer previews by layer id, with the layer version they were made from.
     thumbnails: HashMap<u64, (u64, TextureHandle)>,
@@ -381,6 +404,7 @@ impl SharkPaintApp {
             doc: Document::new(DEFAULT_SIZE[0], DEFAULT_SIZE[1]),
             view: View::default(),
             texture: None,
+            reduced: Vec::new(),
             texture_options: TextureOptions::default(),
             thumbnails: HashMap::new(),
             viewport: Rect::ZERO,
@@ -652,6 +676,7 @@ impl SharkPaintApp {
         self.pending_start = None;
         // Layer ids start over in every document, so old previews must go.
         self.thumbnails.clear();
+        self.reduced.clear();
         self.ref_texture = None;
         self.xform = None;
         self.xform_empty = None;
@@ -1892,17 +1917,47 @@ impl SharkPaintApp {
             ..Default::default()
         };
         let size = [self.doc.width, self.doc.height];
-        let stale = self.texture.as_ref().is_none_or(|t| t.size() != size);
-        if stale {
+        let stale = self.texture.as_ref().is_none_or(|t| t.size() != size) || self.reduced.len() != REDUCED_LEVELS;
+        let dirty = if stale {
             self.doc.take_dirty();
-            let image = ColorImage::from_rgba_unmultiplied(size, &self.doc.render_rgba8(self.doc.bounds()));
-            self.texture = Some(ctx.load_texture("lienzo", image, options));
-        } else if let (Some(texture), Some(dirty)) = (&mut self.texture, self.doc.take_dirty()) {
-            let image = ColorImage::from_rgba_unmultiplied(
-                [dirty.width(), dirty.height()],
-                &self.doc.render_rgba8(dirty),
+            Some(self.doc.bounds())
+        } else {
+            self.doc.take_dirty()
+        };
+        if let Some(dirty) = dirty {
+            // Whole blocks of the coarsest level, so every level can be rebuilt
+            // from the pixels fetched here.
+            let block = 1 << REDUCED_LEVELS;
+            let area = IRect::new(
+                dirty.x0 / block * block,
+                dirty.y0 / block * block,
+                ((dirty.x1 + block - 1) / block * block).min(size[0] as i32),
+                ((dirty.y1 + block - 1) / block * block).min(size[1] as i32),
             );
-            texture.set_partial([dirty.x0 as usize, dirty.y0 as usize], image, options);
+            let mut pixels = self.doc.render_rgba8(area);
+            let (mut w, mut h) = (area.width(), area.height());
+            let (mut x, mut y) = (area.x0 as usize, area.y0 as usize);
+            let image = ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+            match (&mut self.texture, stale) {
+                (Some(texture), false) => texture.set_partial([x, y], image, options),
+                _ => self.texture = Some(ctx.load_texture("lienzo", image, options)),
+            }
+            if stale {
+                self.reduced.clear();
+            }
+            for level in 0..REDUCED_LEVELS {
+                (pixels, w, h) = halved(&pixels, w, h);
+                (x, y) = (x / 2, y / 2);
+                let image = ColorImage::from_rgba_unmultiplied([w, h], &pixels);
+                match self.reduced.get_mut(level) {
+                    Some(texture) => texture.set_partial([x, y], image, TextureOptions::LINEAR),
+                    None => self.reduced.push(ctx.load_texture(
+                        format!("lienzo_reducido_{level}"),
+                        image,
+                        TextureOptions::LINEAR,
+                    )),
+                }
+            }
         } else if let Some(texture) = &mut self.texture {
             if self.texture_options != options {
                 // Filtering changes with zoom; re-upload a single pixel to apply it.
@@ -2361,9 +2416,34 @@ impl SharkPaintApp {
             Pos2::new(0.0, doc_size.y),
         ]
         .map(|c| self.view.to_screen(c, viewport, doc_size));
-        if let Some(texture) = &self.texture {
+        // Zoomed out, each screen pixel covers several canvas pixels: draw the
+        // reduced copy whose pixels are closest to screen size.
+        let on_screen = self.view.zoom * ctx.pixels_per_point();
+        let level = match on_screen {
+            s if s >= 0.75 => 0,
+            s if s >= 0.375 => 1,
+            s if s >= 0.19 => 2,
+            _ => 3,
+        };
+        let shown = match level {
+            0 => self.texture.as_ref(),
+            n => self.reduced.get(n - 1).or(self.texture.as_ref()),
+        };
+        if let Some(texture) = shown {
+            // A reduced copy may be a pixel larger than the canvas it stands for.
+            let reach = Vec2::new(
+                doc_size.x / (texture.size()[0] << level) as f32,
+                doc_size.y / (texture.size()[1] << level) as f32,
+            );
+            let (reach_x, reach_y) = if std::ptr::eq(texture, self.texture.as_ref().unwrap_or(texture)) {
+                (1.0, 1.0)
+            } else {
+                (reach.x.min(1.0), reach.y.min(1.0))
+            };
             let mut mesh = Mesh::with_texture(texture.id());
-            for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
+            for (corner, uv) in
+                corners.iter().zip([(0.0, 0.0), (reach_x, 0.0), (reach_x, reach_y), (0.0, reach_y)])
+            {
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: *corner,
                     uv: Pos2::new(uv.0, uv.1),

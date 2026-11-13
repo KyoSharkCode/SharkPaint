@@ -11,6 +11,9 @@ use sharkpaint::engine::{builtin_tips, BrushPreset, BrushSettings, BrushTip, Tip
 
 use crate::settings::config_dir;
 
+/// Raised whenever the set of default brushes grows.
+const LIBRARY_VERSION: u32 = 2;
+
 /// Side of the square an imported tip is stored at, at most.
 const MAX_TIP_SIDE: u32 = 256;
 
@@ -42,8 +45,24 @@ impl BrushLibrary {
         }
         let mut library = BrushLibrary { brushes: Vec::new(), tips };
         let saved = config_dir().and_then(|dir| std::fs::read_to_string(dir.join("pinceles.txt")).ok());
+        let version = saved
+            .as_deref()
+            .and_then(|text| text.lines().find_map(|line| line.strip_prefix("version=")))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(1);
         library.brushes = match saved.map(|text| library.brushes_from_text(&text)) {
-            Some(brushes) if !brushes.is_empty() => brushes,
+            Some(mut brushes) if !brushes.is_empty() => {
+                // A library saved by an earlier version gains the brushes added
+                // since, without touching the ones already there.
+                if version < LIBRARY_VERSION {
+                    for brush in library.default_brushes() {
+                        if !brushes.iter().any(|b| b.name == brush.name) {
+                            brushes.push(brush);
+                        }
+                    }
+                }
+                brushes
+            }
             _ => library.default_brushes(),
         };
         library
@@ -71,6 +90,15 @@ impl BrushLibrary {
             settings: BrushSettings { tip: self.tip(tip), ..settings },
         };
         brushes.extend([
+            // Crisp, strongly tapered line for clean line art.
+            shaped("Pluma", "redonda", BrushSettings {
+                hardness: 1.0,
+                spacing: 0.03,
+                smoothing: 0.6,
+                pressure_size: true,
+                min_size: 0.02,
+                ..BrushSettings::round(12.0)
+            }),
             shaped("Caligrafía", "redonda", BrushSettings {
                 hardness: 1.0,
                 spacing: 0.04,
@@ -81,28 +109,38 @@ impl BrushLibrary {
                 ..BrushSettings::round(28.0)
             }),
             shaped("Carboncillo", "carbon", BrushSettings {
-                flow: 0.45,
-                spacing: 0.12,
+                flow: 0.5,
+                spacing: 0.18,
                 angle_jitter: 1.0,
                 pressure_flow: true,
                 pressure_size: true,
                 min_size: 0.6,
                 ..BrushSettings::round(36.0)
             }),
-            shaped("Pincel seco", "cerdas", BrushSettings {
-                flow: 0.8,
-                spacing: 0.05,
+            // Separate hairs that follow the stroke and gather as pressure drops.
+            shaped("Cabello", "cerdas", BrushSettings {
+                spacing: 0.02,
+                smoothing: 0.5,
                 follow_direction: true,
-                angle: 90.0,
                 pressure_size: true,
-                min_size: 0.35,
-                ..BrushSettings::round(48.0)
+                min_size: 0.08,
+                ..BrushSettings::round(44.0)
+            }),
+            shaped("Pincel seco", "cerdas", BrushSettings {
+                flow: 0.6,
+                spacing: 0.03,
+                follow_direction: true,
+                angle_jitter: 0.01,
+                pressure_size: true,
+                pressure_flow: true,
+                min_size: 0.4,
+                ..BrushSettings::round(60.0)
             }),
             shaped("Tiza", "tiza", BrushSettings {
-                flow: 0.7,
-                spacing: 0.08,
+                flow: 0.75,
+                spacing: 0.1,
                 follow_direction: true,
-                angle_jitter: 0.04,
+                angle: 90.0,
                 pressure_flow: true,
                 ..BrushSettings::round(34.0)
             }),
@@ -135,7 +173,7 @@ impl BrushLibrary {
     }
 
     pub fn to_text(&self) -> String {
-        let mut text = String::new();
+        let mut text = format!("version={LIBRARY_VERSION}\n");
         for brush in &self.brushes {
             let s = &brush.settings;
             text.push_str("[pincel]\n");
@@ -245,12 +283,8 @@ impl BrushLibrary {
             let _ = std::fs::create_dir_all(&dir);
             square.save(dir.join(format!("{stem}.png"))).map_err(|e| e.to_string())?;
         }
-        let tip = Arc::new(TipImage {
-            id: format!("archivo:{stem}"),
-            name: stem,
-            size: square.width() as usize,
-            alpha: square.into_raw(),
-        });
+        let side = square.width() as usize;
+        let tip = Arc::new(TipImage::new(format!("archivo:{stem}"), stem, side, square.into_raw()));
         // Importing the same name again replaces the earlier shape.
         self.tips.retain(|t| t.id != tip.id);
         self.tips.push(tip.clone());
@@ -266,12 +300,8 @@ fn read_tip(path: &Path) -> Option<Arc<TipImage>> {
         image = image::imageops::resize(&image, side, side, image::imageops::FilterType::Triangle);
     }
     let stem = path.file_stem()?.to_string_lossy().into_owned();
-    Some(Arc::new(TipImage {
-        id: format!("archivo:{stem}"),
-        name: stem,
-        size: image.width() as usize,
-        alpha: image.into_raw(),
-    }))
+    let side = image.width() as usize;
+    Some(Arc::new(TipImage::new(format!("archivo:{stem}"), stem, side, image.into_raw())))
 }
 
 #[cfg(test)]
@@ -318,8 +348,8 @@ mod tests {
         assert_eq!((tip.id.as_str(), tip.name.as_str()), ("archivo:mi punta_", "mi punta_"));
         assert_eq!(tip.size, 80); // trimmed to the bar and squared
         assert_eq!(tip.alpha.len(), 80 * 80);
-        assert!(tip.sample(0.5, 0.5) > 0.9, "the bar crosses the centre");
-        assert!(tip.sample(0.9, 0.1) < 0.1 && tip.sample(0.1, 0.9) < 0.1, "the corners off the bar are empty");
+        assert!(tip.sample(0.5, 0.5, 1.0) > 0.9, "the bar crosses the centre");
+        assert!(tip.sample(0.9, 0.1, 1.0) < 0.1 && tip.sample(0.1, 0.9, 1.0) < 0.1, "the corners off the bar are empty");
 
         // A brush using it survives saving and a fresh start.
         library.brushes = vec![Brush {

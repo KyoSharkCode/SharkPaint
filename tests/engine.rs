@@ -885,7 +885,7 @@ fn image_tips_stamp_their_shape() {
     doc.end_stroke();
     assert_eq!(pixel(&doc, 100, 100), [0, 0, 0, 255]); // the centre is solid
     assert_eq!(pixel(&doc, 100, 52), [0, 0, 0, 255]); // the upper point
-    assert_eq!(pixel(&doc, 142, 58), [255, 255, 255, 255]); // the gap between two points
+    assert_eq!(pixel(&doc, 130, 62), [255, 255, 255, 255]); // the gap between two points
     // The star covers clearly less than the disc of the same size would.
     let covered = ink(&doc, 0, 0, 200, 200);
     assert!(covered > 2500.0 && covered < 0.6 * std::f64::consts::PI * 3600.0, "covered {covered}");
@@ -896,7 +896,7 @@ fn image_tips_stamp_their_shape() {
     let mut doc = Document::new(300, 100);
     line(&mut doc, &brush, [0, 0, 0], false, (30.0, 50.0), (270.0, 50.0));
     let greys = doc.render_rgba8(IRect::new(60, 40, 240, 60)).chunks(4).filter(|p| p[0] > 20 && p[0] < 235).count();
-    assert!(greys > 200, "expected a grainy texture, found {greys} mid-tone pixels");
+    assert!(greys > 60, "expected a grainy texture, found {greys} mid-tone pixels");
 }
 
 #[test]
@@ -937,4 +937,34 @@ fn tips_can_follow_the_stroke_direction() {
     doc.end_stroke();
     assert!(ink(&doc, 112, 100, 130, 260) < 1.0, "the tip should not stick out sideways");
     assert!(ink(&doc, 96, 100, 104, 260) > 300.0);
+}
+
+#[test]
+fn shrunken_tips_are_averaged_not_speckled() {
+    // A tip of alternating one-pixel stripes: sampled naively at a small size it
+    // would give pure black or white at random; averaged, it gives an even grey.
+    let stripes: Vec<u8> = (0..256 * 256).map(|i| if (i / 256) % 2 == 0 { 255 } else { 0 }).collect();
+    let tip = sharkpaint::engine::TipImage::new("rayas", "Rayas", 256, stripes);
+    for i in 0..40 {
+        let (u, v) = (0.1 + i as f32 * 0.02, 0.13 + i as f32 * 0.019);
+        let small = tip.sample(u, v, 16.0);
+        assert!((small - 0.5).abs() < 0.08, "at ({u}, {v}) got {small}");
+    }
+    // At full size the stripes are still there.
+    let (dark, light) = (tip.sample(0.5, 1.5 / 256.0, 1.0), tip.sample(0.5, 0.5 / 256.0, 1.0));
+    assert!(light > 0.95 && dark < 0.05, "light {light}, dark {dark}");
+}
+
+#[test]
+fn built_in_tips_have_clean_edges() {
+    // Shapes meant to be crisp are almost entirely black or white: few
+    // in-between pixels, all of them along the outline.
+    for id in ["estrella", "hoja", "salpicadura", "cerdas"] {
+        let tips = builtin_tips();
+        let tip = tips.iter().find(|t| t.id == id).unwrap();
+        let soft = tip.alpha.iter().filter(|&&a| a > 20 && a < 235).count();
+        let solid = tip.alpha.iter().filter(|&&a| a >= 235).count();
+        assert!(solid > 1500, "{id} is nearly empty");
+        assert!((soft as f64) < 0.35 * solid as f64, "{id} is blurry: {soft} soft pixels against {solid} solid");
+    }
 }

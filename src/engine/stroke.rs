@@ -278,9 +278,11 @@ impl ActiveStroke {
                                     let c = ((outer - (lx * lx + ly * ly).sqrt()) / falloff).clamp(0.0, 1.0);
                                     if soft { c * c * (3.0 - 2.0 * c) } else { c }
                                 }
-                                BrushTip::Image(image) => {
-                                    image.sample(lx / radius * 0.5 + 0.5, ly / radius * 0.5 + 0.5)
-                                }
+                                BrushTip::Image(image) => image.sample(
+                                    lx / radius * 0.5 + 0.5,
+                                    ly / radius * 0.5 + 0.5,
+                                    image.size as f32 / (2.0 * radius),
+                                ),
                             }
                         };
                         if c <= 0.0 {

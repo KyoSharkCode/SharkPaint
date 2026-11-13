@@ -7,9 +7,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 - Lienzo con zoom, desplazamiento, rotación y volteo horizontal.
 - Pincel con sensibilidad a la presión del lápiz (tamaño y flujo).
-- Once pinceles iniciales, de punta redonda (Lápiz, Tinta, Marcador, Aerógrafo,
-  Caligrafía) y con forma (Carboncillo, Pincel seco, Tiza, Salpicadura, Hojas,
-  Estrellas).
+- Trece pinceles iniciales, de punta redonda (Lápiz, Tinta, Pluma, Marcador,
+  Aerógrafo, Caligrafía) y con forma (Carboncillo, Cabello, Pincel seco, Tiza,
+  Salpicadura, Hojas, Estrellas).
 - Editor de pinceles con muestra del trazo: tamaño, opacidad, flujo, dureza,
   espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión y
   variación al azar. Los pinceles propios se guardan en una biblioteca.

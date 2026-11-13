@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use super::brush::TipImage;
 
-const SIZE: usize = 128;
+const SIZE: usize = 256;
+/// Each pixel averages this many samples per side, for clean edges.
+const SAMPLES: usize = 3;
 
 /// Small deterministic generator, so the tips are the same on every run.
 struct Noise(u32);
@@ -18,77 +20,132 @@ impl Noise {
     }
 }
 
-fn tip(id: &str, name: &str, shade: impl Fn(f32, f32, &mut Noise) -> f32) -> Arc<TipImage> {
-    let mut noise = Noise(0x9E37_79B9 ^ id.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)));
-    let mut alpha = Vec::with_capacity(SIZE * SIZE);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            // Position from -1 to 1 across the tip.
-            let (u, v) = ((x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0, (y as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0);
-            alpha.push((shade(u, v, &mut noise).clamp(0.0, 1.0) * 255.0) as u8);
-        }
-    }
-    Arc::new(TipImage { id: id.to_owned(), name: name.to_owned(), size: SIZE, alpha })
+/// A repeatable value in 0..1 for a point of an integer lattice.
+fn lattice(x: i32, y: i32, seed: u32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x85EB_CA6B) ^ (y as u32).wrapping_mul(0xC2B2_AE35) ^ seed;
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    (h & 0xFFFF) as f32 / 65535.0
 }
 
-/// Fades from 1 inside `radius` to 0 at `radius + edge`.
-fn disc(d: f32, radius: f32, edge: f32) -> f32 {
-    ((radius + edge - d) / edge).clamp(0.0, 1.0)
+/// Smooth noise in 0..1 whose blotches are `1 / frequency` wide.
+fn smooth_noise(x: f32, y: f32, frequency: f32, seed: u32) -> f32 {
+    let (x, y) = (x * frequency, y * frequency);
+    let (x0, y0) = (x.floor(), y.floor());
+    let ease = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (tx, ty) = (ease(x - x0), ease(y - y0));
+    let (ix, iy) = (x0 as i32, y0 as i32);
+    let top = lattice(ix, iy, seed) + (lattice(ix + 1, iy, seed) - lattice(ix, iy, seed)) * tx;
+    let bottom = lattice(ix, iy + 1, seed) + (lattice(ix + 1, iy + 1, seed) - lattice(ix, iy + 1, seed)) * tx;
+    top + (bottom - top) * ty
+}
+
+/// Paper-like grain in 0..1: coarse blotches broken up by finer ones.
+fn grain(u: f32, v: f32, seed: u32) -> f32 {
+    0.6 * smooth_noise(u, v, 9.0, seed) + 0.4 * smooth_noise(u, v, 23.0, seed ^ 0x5bd1_e995)
+}
+
+/// 0 below `edge`, 1 above it, with a short ramp of width `soft` in between.
+fn step(value: f32, edge: f32, soft: f32) -> f32 {
+    ((value - edge) / soft + 0.5).clamp(0.0, 1.0)
+}
+
+fn tip(id: &str, name: &str, shade: impl Fn(f32, f32) -> f32) -> Arc<TipImage> {
+    let mut alpha = Vec::with_capacity(SIZE * SIZE);
+    let scale = 2.0 / (SIZE * SAMPLES) as f32;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let mut sum = 0.0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    // Position from -1 to 1 across the tip.
+                    let u = ((x * SAMPLES + sx) as f32 + 0.5) * scale - 1.0;
+                    let v = ((y * SAMPLES + sy) as f32 + 0.5) * scale - 1.0;
+                    sum += shade(u, v).clamp(0.0, 1.0);
+                }
+            }
+            alpha.push((sum / (SAMPLES * SAMPLES) as f32 * 255.0).round() as u8);
+        }
+    }
+    Arc::new(TipImage::new(id, name, SIZE, alpha))
+}
+
+/// 1 inside a circle of this radius, 0 outside.
+fn inside(d: f32, radius: f32) -> f32 {
+    if d <= radius { 1.0 } else { 0.0 }
 }
 
 /// The tips every installation has, in menu order.
 pub fn builtin_tips() -> Vec<Arc<TipImage>> {
+    // Strands of a bristle brush: where each runs, how thick, and how far.
+    let mut seed = Noise(0x2F6E_2B15);
+    let strands: Vec<(f32, f32, f32, f32)> = (0..15)
+        .map(|i| {
+            let v = -0.86 + i as f32 * 0.123 + (seed.next() - 0.5) * 0.05;
+            let reach = (1.0 - v * v).max(0.0).sqrt();
+            (v, 0.018 + seed.next() * 0.03, -reach * (0.7 + 0.3 * seed.next()), reach * (0.7 + 0.3 * seed.next()))
+        })
+        .collect();
+    let mut seed = Noise(0x51ED_270B);
+    let drops: Vec<(f32, f32, f32)> = (0..22)
+        .map(|_| {
+            let (a, r) = (seed.next() * std::f32::consts::TAU, seed.next().sqrt() * 0.8);
+            (a.cos() * r, a.sin() * r, 0.03 + seed.next() * 0.12)
+        })
+        .collect();
+    // A five-pointed star with straight edges, as its ten corners.
+    let star: Vec<(f32, f32)> = (0..10)
+        .map(|i| {
+            let angle = i as f32 * std::f32::consts::PI / 5.0 - std::f32::consts::FRAC_PI_2;
+            let radius = if i % 2 == 0 { 0.94 } else { 0.38 };
+            (angle.cos() * radius, angle.sin() * radius)
+        })
+        .collect();
+
     vec![
-        // Grainy disc: charcoal and pastel.
-        tip("carbon", "Carboncillo", |u, v, noise| {
+        // Charcoal: a disc eaten away by the grain of the paper.
+        tip("carbon", "Carboncillo", |u, v| {
             let d = (u * u + v * v).sqrt();
-            let grain = if noise.next() < 0.55 { 1.0 } else { 0.15 };
-            disc(d, 0.75, 0.25) * grain
+            let body = step(0.82 - d, 0.0, 0.1);
+            body * step(grain(u, v, 11) + 0.25 * (1.0 - d), 0.5, 0.12)
         }),
-        // Parallel streaks: a dry bristle brush.
-        tip("cerdas", "Cerdas", |u, v, noise| {
-            let d = (u * u + v * v).sqrt();
-            let streak = ((v * 21.0).sin() * 0.5 + 0.5).powf(1.6);
-            let gap = if noise.next() < 0.12 { 0.0 } else { 1.0 };
-            disc(d, 0.8, 0.18) * streak * gap
+        // Separate hairs of varying thickness: for hair, grass and dry strokes.
+        tip("cerdas", "Cerdas", move |u, v| {
+            strands
+                .iter()
+                .map(|&(sv, half, from, to)| if (v - sv).abs() <= half && u >= from && u <= to { 1.0 } else { 0.0 })
+                .fold(0.0, f32::max)
         }),
-        // Rough block: chalk and crayon.
-        tip("tiza", "Tiza", |u, v, noise| {
-            let edge = (1.0 - u.abs().max(v.abs() * 1.6)).clamp(0.0, 1.0);
-            let grain = 0.35 + 0.65 * noise.next();
-            (edge * 6.0).min(1.0) * grain
+        // Chalk: a block with a ragged edge and a rough face.
+        tip("tiza", "Tiza", |u, v| {
+            let ragged = 0.06 * (smooth_noise(u, v, 14.0, 5) - 0.5);
+            let body = if u.abs() <= 0.9 + ragged && v.abs() <= 0.58 + ragged { 1.0 } else { 0.0 };
+            body * step(grain(u, v, 29), 0.36, 0.1)
         }),
         // Scattered droplets.
-        tip("salpicadura", "Salpicadura", {
-            let mut seed = Noise(0x51ED_270B);
-            let drops: Vec<(f32, f32, f32)> = (0..22)
-                .map(|_| {
-                    let (a, r) = (seed.next() * std::f32::consts::TAU, seed.next().sqrt() * 0.8);
-                    (a.cos() * r, a.sin() * r, 0.03 + seed.next() * 0.12)
-                })
-                .collect();
-            move |u, v, _| {
-                drops
-                    .iter()
-                    .map(|&(x, y, r)| disc(((u - x).powi(2) + (v - y).powi(2)).sqrt(), r, 0.03))
-                    .fold(0.0, f32::max)
-            }
+        tip("salpicadura", "Salpicadura", move |u, v| {
+            drops
+                .iter()
+                .map(|&(x, y, r)| inside(((u - x).powi(2) + (v - y).powi(2)).sqrt(), r))
+                .fold(0.0, f32::max)
         }),
-        // A leaf, pointing right.
-        tip("hoja", "Hoja", |u, v, _| {
+        // A leaf, pointing right, with its midrib left unpainted.
+        tip("hoja", "Hoja", |u, v| {
             let width = 0.42 * (1.0 - u * u).max(0.0).sqrt() * (1.0 - 0.35 * u);
-            let body = ((width - v.abs()) / 0.04).clamp(0.0, 1.0);
-            let vein = if v.abs() < 0.025 && u.abs() < 0.85 { 0.45 } else { 1.0 };
-            body * vein
+            if v.abs() <= width && !(v.abs() < 0.022 && u.abs() < 0.8) { 1.0 } else { 0.0 }
         }),
-        // Five-pointed star.
-        tip("estrella", "Estrella", |u, v, _| {
-            let (angle, d) = (v.atan2(u) + std::f32::consts::FRAC_PI_2, (u * u + v * v).sqrt());
-            let fifth = std::f32::consts::TAU / 5.0;
-            let within = (angle.rem_euclid(fifth) - fifth / 2.0).abs() / (fifth / 2.0);
-            // Radius of the outline between a point (0.9) and a notch (0.38).
-            let radius = 0.38 + (0.9 - 0.38) * within.powf(1.4);
-            disc(d, radius - 0.04, 0.05)
+        // Five-pointed star with straight edges and sharp points.
+        tip("estrella", "Estrella", move |u, v| {
+            // Even-odd test against the star's outline.
+            let mut inside = false;
+            for i in 0..star.len() {
+                let (a, b) = (star[i], star[(i + 1) % star.len()]);
+                if (a.1 > v) != (b.1 > v) && u < a.0 + (v - a.1) / (b.1 - a.1) * (b.0 - a.0) {
+                    inside = !inside;
+                }
+            }
+            if inside { 1.0 } else { 0.0 }
         }),
     ]
 }
