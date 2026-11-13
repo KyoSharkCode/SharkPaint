@@ -28,7 +28,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   referencia. No se incluyen al exportar.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
-- Instalador con asociación de archivos `.spaint` y descarga fija (versión 0.1.0).
 
 ## Atajos
 
@@ -67,8 +66,18 @@ Requiere [Rust](https://rustup.rs).
 cargo run --release
 ```
 
-El ejecutable queda en `target/release/SharkPaint.exe`. Cada push también genera el
-ejecutable de Windows en GitHub Actions (artefacto `SharkPaint-windows-x64`).
+El ejecutable queda en `target/release/SharkPaint.exe`. Cada push también genera en
+GitHub Actions el ejecutable (artefacto `SharkPaint-windows-x64`) y el instalador
+(artefacto `SharkPaint-instalador`).
+
+## Publicar una versión
+
+1. Actualizar `version` en `Cargo.toml` y escribir `docs/novedades/<versión>.md`.
+2. Crear y subir la etiqueta `v<versión>` sobre `main`.
+
+La integración continua compila el instalador (`installer/SharkPaint.iss`, que asocia
+los `.spaint`) y el `.zip` portable, y los publica en GitHub Releases. La página de
+descarga (`web/`, publicada en GitHub Pages) muestra siempre la última versión.
 
 ```bash
 cargo test

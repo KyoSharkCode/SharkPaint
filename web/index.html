@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SharkPaint · Descargar</title>
+<meta name="description" content="SharkPaint: aplicación gratuita de dibujo y pintura digital para Windows, con capas y sensibilidad a la presión del lápiz.">
+<link rel="icon" href="icono.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@700&family=Cherry+Bomb+One&family=Fredoka:wght@500;600;700&family=M+PLUS+Rounded+1c:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --abisal: #0A1030; --indigo: #2B2F7A; --aleta: #3A7BD5; --bioluz: #6FE3F0;
+    --espuma: #C9E6F2; --lavanda: #BDB0E6; --perla: #F5F3FB; --oro: #F4C542;
+    --pegatina: #0f1a4a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    background: radial-gradient(ellipse at 50% 0%, #1a2470 0%, var(--abisal) 60%) fixed, var(--abisal);
+    color: var(--perla);
+    font-family: "M PLUS Rounded 1c", system-ui, sans-serif;
+    overflow-x: hidden;
+  }
+  /* Cielo: estrellas que titilan y la luna con su halo */
+  .cielo { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
+  .estrella { position: absolute; width: 3px; height: 3px; border-radius: 50%;
+    background: var(--espuma); animation: titilar 3s ease-in-out infinite; }
+  @keyframes titilar { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+  .luna { position: absolute; top: 48px; right: 9vw; width: 96px; height: 96px; border-radius: 50%;
+    background: radial-gradient(circle at 38% 38%, #fff 0%, var(--espuma) 55%, #9cc6dc 100%);
+    box-shadow: 0 0 40px 14px rgba(201, 230, 242, .35), 0 0 120px 40px rgba(111, 227, 240, .12); }
+  /* Mar: olas con borde pegatina y una aleta que nada */
+  .mar { position: fixed; left: 0; right: 0; bottom: 0; height: 120px; z-index: 0; pointer-events: none; }
+  .mar svg { position: absolute; bottom: 0; width: 200%; height: 120px; animation: oleaje 18s linear infinite; }
+  .mar svg.lejos { opacity: .5; animation-duration: 28s; bottom: 18px; }
+  @keyframes oleaje { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+  .aleta-nada { position: absolute; bottom: 70px; width: 46px; animation: nadar 22s linear infinite; }
+  @keyframes nadar { from { left: -60px; } to { left: 105vw; } }
+
+  main { position: relative; z-index: 1; max-width: 920px; margin: 0 auto; padding: 56px 20px 180px; }
+  .marca { display: flex; align-items: center; gap: 18px; justify-content: center; }
+  .marca img { width: 84px; height: 84px; border-radius: 20px;
+    box-shadow: 0 0 0 5px var(--lavanda), 0 0 0 9px var(--abisal), 0 9px 0 9px var(--abisal); transform: rotate(-3deg); }
+  h1 { font-family: "Cherry Bomb One", cursive; font-weight: 400; font-size: clamp(48px, 9vw, 84px);
+    margin: 0; letter-spacing: 1px; color: var(--perla);
+    -webkit-text-stroke: 3px var(--abisal); paint-order: stroke fill;
+    text-shadow: 0 6px 0 var(--abisal), 0 0 24px rgba(111, 227, 240, .45); }
+  .lema { text-align: center; font-family: "Fredoka", sans-serif; font-weight: 600; font-size: 20px;
+    color: var(--espuma); margin: 14px 0 34px; }
+
+  .tarjeta { background: var(--pegatina); border-radius: 28px; padding: 30px;
+    box-shadow: 0 0 0 6px #fff, 0 0 0 11px var(--abisal), 0 11px 0 11px var(--abisal);
+    transform: rotate(-1deg); animation: aparecer .7s cubic-bezier(.34, 1.56, .64, 1) both; }
+  @keyframes aparecer { from { transform: rotate(-1deg) scale(.85); opacity: 0; } }
+  .descarga { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px; }
+  .chip { display: inline-block; font-family: "Chakra Petch", sans-serif; font-weight: 700; font-size: 13px;
+    letter-spacing: 1.5px; text-transform: uppercase; color: var(--abisal); background: var(--bioluz);
+    padding: 5px 12px; border-radius: 999px; }
+  .chip.oro { background: var(--oro); }
+  .version { font-family: "Fredoka", sans-serif; font-weight: 700; font-size: 34px; margin: 10px 0 4px; }
+  .detalle { color: var(--espuma); font-size: 14px; }
+  .boton { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; cursor: pointer;
+    font-family: "Fredoka", sans-serif; font-weight: 700; font-size: 22px; color: var(--abisal);
+    background: var(--bioluz); padding: 18px 30px; border-radius: 20px; border: none;
+    box-shadow: 0 0 0 4px #fff, 0 0 0 8px var(--abisal), 0 8px 0 8px var(--abisal);
+    transition: transform .2s cubic-bezier(.34, 1.56, .64, 1); }
+  .boton:hover { transform: translateY(-3px) rotate(-1deg); }
+  .boton[aria-disabled="true"] { background: var(--lavanda); cursor: default; }
+  .boton svg { width: 26px; height: 26px; }
+  .secundario { margin-top: 14px; font-size: 14px; color: var(--espuma); }
+  .secundario a { color: var(--bioluz); }
+
+  h2 { font-family: "Cherry Bomb One", cursive; font-weight: 400; font-size: 34px; text-align: center;
+    margin: 64px 0 24px; -webkit-text-stroke: 2px var(--abisal); paint-order: stroke fill;
+    text-shadow: 0 4px 0 var(--abisal); }
+  .rejilla { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 26px; }
+  .funcion { background: var(--pegatina); border-radius: 22px; padding: 20px;
+    box-shadow: 0 0 0 4px #fff, 0 0 0 8px var(--abisal), 0 8px 0 8px var(--abisal); }
+  .funcion:nth-child(odd) { transform: rotate(1deg); }
+  .funcion:nth-child(even) { transform: rotate(-1deg); }
+  .funcion h3 { font-family: "Fredoka", sans-serif; font-weight: 700; margin: 0 0 6px; font-size: 19px; color: var(--lavanda); }
+  .funcion p { margin: 0; font-size: 14px; line-height: 1.5; color: var(--espuma); }
+  .nota { background: rgba(43, 47, 122, .55); border: 2px solid var(--indigo); border-radius: 18px;
+    padding: 18px 22px; font-size: 14px; line-height: 1.6; color: var(--espuma); }
+  .nota b { color: var(--perla); }
+  .novedades { margin-top: 22px; font-size: 14px; line-height: 1.6; color: var(--espuma); }
+  .novedades h1, .novedades h2, .novedades h3 { all: unset; display: block; font-family: "Fredoka", sans-serif;
+    font-weight: 700; color: var(--perla); margin: 10px 0 4px; font-size: 16px; }
+  .capturas { display: grid; gap: 26px; }
+  .capturas img { width: 100%; border-radius: 18px;
+    box-shadow: 0 0 0 4px #fff, 0 0 0 8px var(--abisal), 0 8px 0 8px var(--abisal); }
+  .requisitos { margin: 0; padding-left: 20px; }
+  .ruta-aviso { text-align: center; }
+  .ruta-aviso p { margin: 0 0 22px; }
+  .apoyo { text-align: center; }
+  .apoyo p { color: var(--espuma); font-size: 15px; margin: 0 0 22px; }
+  .boton.oro { background: var(--oro); }
+  footer { text-align: center; margin-top: 56px; font-size: 13px; line-height: 1.7; color: var(--espuma); }
+  footer a { color: var(--bioluz); }
+  .legal { max-width: 640px; margin: 10px auto 0; font-size: 12px; opacity: .85; }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; } }
+  @media (max-width: 600px) { .luna { top: 12px; right: 12px; width: 44px; height: 44px; } }
+</style>
+</head>
+<body>
+<div class="cielo" id="cielo"><div class="luna"></div></div>
+<div class="mar">
+  <svg class="lejos" viewBox="0 0 1440 120" preserveAspectRatio="none">
+    <path d="M0 60 Q90 30 180 60 T360 60 T540 60 T720 60 T900 60 T1080 60 T1260 60 T1440 60 V120 H0Z" fill="#2B2F7A"/>
+  </svg>
+  <svg class="aleta-nada" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M3 18c4-1 7-6 9-14 1 6 4 11 9 14z" fill="#3A7BD5" stroke="#0A1030" stroke-width="1.6" stroke-linejoin="round"/>
+  </svg>
+  <svg viewBox="0 0 1440 120" preserveAspectRatio="none">
+    <path d="M0 70 Q90 40 180 70 T360 70 T540 70 T720 70 T900 70 T1080 70 T1260 70 T1440 70 V120 H0Z"
+          fill="#3A7BD5" stroke="#fff" stroke-width="5"/>
+    <path d="M0 70 Q90 40 180 70 T360 70 T540 70 T720 70 T900 70 T1080 70 T1260 70 T1440 70"
+          fill="none" stroke="#0A1030" stroke-width="2.5" transform="translate(0 4)"/>
+  </svg>
+</div>
+
+<main>
+  <div class="marca">
+    <img src="icono.png" alt="">
+    <h1>SharkPaint</h1>
+  </div>
+  <p class="lema">Dibujo y pintura digital con capas y presión de lápiz, gratis para Windows 🦈🎨</p>
+
+  <section class="tarjeta">
+    <div class="descarga">
+      <div>
+        <span class="chip" id="estado">EARLY ACCESS</span>
+        <div class="version" id="version">Buscando la última versión…</div>
+        <div class="detalle" id="detalle">Windows 10 y 11 (64 bits)</div>
+      </div>
+      <a class="boton" id="boton" href="https://github.com/KyoSharkCode/SharkPaint/releases/latest" aria-disabled="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#0A1030" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M4 19h16"/></svg>
+        <span id="textoBoton">Descargar para Windows</span>
+      </a>
+    </div>
+    <div class="secundario" id="secundario">
+      ¿Prefieres sin instalar? <a id="zip" href="https://github.com/KyoSharkCode/SharkPaint/releases/latest">Versión portable (.zip)</a>
+      · <a href="https://github.com/KyoSharkCode/SharkPaint/releases">Todas las versiones</a>
+    </div>
+    <div class="novedades" id="novedades"></div>
+  </section>
+
+  <h2>¿Qué trae? ✨</h2>
+  <div class="rejilla">
+    <div class="funcion"><h3>Trazo con presión</h3><p>Tu tableta gráfica controla el grosor y el flujo de cada pincel, con estabilizador para líneas limpias.</p></div>
+    <div class="funcion"><h3>Capas de verdad</h3><p>Opacidad, modos de fusión, bloqueo de transparencia y una miniatura de cada capa.</p></div>
+    <div class="funcion"><h3>Pinceles a tu medida</h3><p>Lápiz, Tinta, Marcador y Aerógrafo, con tamaño, dureza, flujo y espaciado ajustables.</p></div>
+    <div class="funcion"><h3>Herramientas de pintura</h3><p>Borrador, difuminar, relleno que respeta tus líneas, cuentagotas y mover capa.</p></div>
+    <div class="funcion"><h3>Lienzo libre</h3><p>Zoom, rotación y volteo para dibujar desde el ángulo cómodo, también con dos dedos.</p></div>
+    <div class="funcion"><h3>Tus dibujos, en tu PC</h3><p>Proyectos <i>.spaint</i> con todas sus capas y exportación a PNG. Nada sale de tu equipo.</p></div>
+  </div>
+
+  <!-- Capturas: añadir las imágenes en web/capturas/ y quitar «hidden». -->
+  <section id="capturas" hidden>
+    <h2>Así se ve 📸</h2>
+    <div class="capturas">
+      <!-- <img src="capturas/lienzo.png" alt="El lienzo de SharkPaint con un dibujo por capas"> -->
+    </div>
+  </section>
+
+  <h2>Requisitos 🖥️</h2>
+  <div class="nota">
+    <ul class="requisitos">
+      <li><b>Windows 10 u 11</b> de 64 bits.</li>
+      <li><b>Recomendado:</b> una tableta gráfica con <b>Windows Ink</b> activado en su controlador, para la presión del lápiz. Con ratón también funciona.</li>
+    </ul>
+  </div>
+
+  <h2>Antes de instalar 💙</h2>
+  <div class="nota">
+    <b>Windows puede avisar</b> («Windows protegió tu PC») porque SharkPaint aún no tiene firma digital:
+    pulsa <b>Más información → Ejecutar de todas formas</b>.<br>
+    Es software libre: <a style="color:var(--bioluz)" href="https://github.com/KyoSharkCode/SharkPaint">código en GitHub</a>,
+    bajo la licencia GPL 3.0.
+  </div>
+
+  <!-- Se muestra solo si ENLACE_KOFI (en el script de abajo) tiene una dirección. -->
+  <section class="apoyo" id="apoyo" hidden>
+    <h2>Apoya SharkPaint 💛</h2>
+    <p>SharkPaint es gratis y siempre lo será. Si te ayuda, puedes invitarme a un café.</p>
+    <a class="boton oro" id="botonKofi" href="#" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#0A1030" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10z"/></svg>
+      <span>Apoya SharkPaint</span>
+    </a>
+  </section>
+
+  <footer>
+    Hecho con 💙 por <b>@KyoSumiVT</b> · <a href="https://github.com/KyoSharkCode/SharkPaint/issues">¿Algo falla? Cuéntanoslo</a><br>
+    <a href="https://github.com/KyoSharkCode/SharkPaint/blob/main/LICENSE">Licencia</a> ·
+    <a href="https://github.com/KyoSharkCode/SharkPaint/blob/main/MARCA.md">Marca</a>
+    <p class="legal">© 2026 KyoSumiVT. SharkPaint es software libre bajo la licencia GPL 3.0.
+      El nombre «SharkPaint», el logotipo y el icono no están cubiertos por esa licencia:
+      una versión modificada debe llevar otro nombre y otro icono.</p>
+  </footer>
+</main>
+
+<script>
+  // Estrellas del cielo (posición y ritmo al azar).
+  const cielo = document.getElementById("cielo");
+  for (let i = 0; i < 70; i++) {
+    const e = document.createElement("div");
+    e.className = "estrella";
+    e.style.left = Math.random() * 100 + "%";
+    e.style.top = Math.random() * 65 + "%";
+    e.style.animationDelay = (Math.random() * 3).toFixed(2) + "s";
+    const lado = Math.random() < .2 ? 4 : 2;
+    e.style.width = e.style.height = lado + "px";
+    cielo.appendChild(e);
+  }
+
+  const $ = (id) => document.getElementById(id);
+
+  // Página de Ko-fi. Mientras esté vacía, la sección «Apoya SharkPaint» no se muestra.
+  const ENLACE_KOFI = "";
+  if (ENLACE_KOFI) {
+    $("botonKofi").href = ENLACE_KOFI;
+    $("apoyo").hidden = false;
+  }
+
+  // La última versión publicada (GitHub Releases): su instalador, su .zip y sus novedades.
+  const megas = (bytes) => (bytes / 1048576).toFixed(0) + " MB";
+  const textoSeguro = (texto) => texto.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  // Markdown sencillo de las novedades (títulos, listas, negritas).
+  function markdown(md) {
+    return md.split(/\r?\n/).map((linea) => {
+      let l = textoSeguro(linea).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+      if (/^#+\s/.test(l)) return "<h3>" + l.replace(/^#+\s/, "") + "</h3>";
+      if (/^[-*]\s/.test(l)) return "• " + l.replace(/^[-*]\s/, "") + "<br>";
+      return l ? l + "<br>" : "";
+    }).join("");
+  }
+  fetch("https://api.github.com/repos/KyoSharkCode/SharkPaint/releases/latest")
+    .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+    .then((release) => {
+      const version = release.tag_name.replace(/^v/, "");
+      $("version").textContent = "SharkPaint " + version;
+      const instalador = release.assets.find((a) => /-Setup\.exe$/i.test(a.name));
+      const zip = release.assets.find((a) => /\.zip$/i.test(a.name));
+      if (instalador) {
+        $("boton").href = instalador.browser_download_url;
+        $("detalle").textContent = "Windows 10 y 11 (64 bits) · " + megas(instalador.size) + " · " +
+          new Date(release.published_at).toLocaleDateString("es", { day: "numeric", month: "long", year: "numeric" });
+      }
+      if (!instalador) {
+        // La versión acaba de salir y GitHub aún está preparando el instalador (unos minutos).
+        $("textoBoton").textContent = "Preparando…";
+        $("boton").setAttribute("aria-disabled", "true");
+        $("boton").removeAttribute("href");
+        $("detalle").textContent = "El instalador estará listo en unos minutos: vuelve a cargar la página.";
+      }
+      if (zip) $("zip").href = zip.browser_download_url;
+      else $("secundario").style.display = "none";
+      if (release.body) $("novedades").innerHTML = "<h3>Novedades</h3>" + markdown(release.body);
+    })
+    .catch(() => {
+      // Aún no hay ninguna versión publicada.
+      $("estado").textContent = "MUY PRONTO";
+      $("estado").classList.add("oro");
+      $("version").textContent = "¡Casi listo!";
+      $("textoBoton").textContent = "Muy pronto";
+      $("boton").setAttribute("aria-disabled", "true");
+      $("boton").removeAttribute("href");
+      $("secundario").style.display = "none";
+    });
+</script>
+</body>
+</html>

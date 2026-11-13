@@ -563,6 +563,9 @@ impl SharkPaintApp {
                 }
             });
             ui.menu_button("Ayuda", |ui| {
+                ui.strong(concat!("SharkPaint ", env!("CARGO_PKG_VERSION")));
+                ui.label("Software libre bajo la licencia GPL 3.0");
+                ui.separator();
                 ui.label("Atajos del lienzo");
                 ui.separator();
                 egui::Grid::new("atajos").num_columns(2).show(ui, |ui| {
