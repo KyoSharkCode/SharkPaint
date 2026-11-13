@@ -426,3 +426,40 @@ fn trim_edges(layer: &Layer, tiles: &mut [Option<Arc<Tile>>]) {
         }
     }
 }
+
+// --- Inserting images -------------------------------------------------------
+
+impl Document {
+    /// Adds a layer above the active one holding an image, with its top-left
+    /// corner at (`x`, `y`) on the canvas; parts outside the canvas are dropped.
+    /// `rgba` is 8-bit, not premultiplied, row-major, `width * height * 4` bytes.
+    pub fn add_image_layer(&mut self, name: &str, width: usize, height: usize, rgba: &[u8], x: i32, y: i32) {
+        assert_eq!(rgba.len(), width * height * 4, "image buffer does not match its size");
+        self.add_layer();
+        let li = self.active_layer;
+        let layer = &mut self.layers[li];
+        layer.props.name = name.to_owned();
+        let area = IRect::new(x, y, x + width as i32, y + height as i32).intersect(&layer.bounds());
+        for cy in area.y0..area.y1 {
+            for cx in area.x0..area.x1 {
+                let i = ((cy - y) as usize * width + (cx - x) as usize) * 4;
+                let alpha = rgba[i + 3] as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let a15 = (alpha * ONE + 127) / 255;
+                let px: Px = [
+                    (((rgba[i] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                    (((rgba[i + 1] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                    (((rgba[i + 2] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                    a15 as u16,
+                ];
+                let (ux, uy) = (cx as usize, cy as usize);
+                let idx = layer.tile_index(ux / TILE, uy / TILE);
+                let tile = Arc::make_mut(layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())));
+                tile.0[(uy % TILE) * TILE + ux % TILE] = px;
+            }
+        }
+        self.mark_dirty(self.bounds());
+    }
+}

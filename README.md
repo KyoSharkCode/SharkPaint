@@ -14,6 +14,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas y mover capa.
+- Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
+  pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
 - Deshacer y rehacer (200 pasos, incluidos los cambios de capas).
 - Gestos táctiles con dos dedos: mover, rotar y hacer zoom.
 - Proyectos en formato propio (`.spaint`) que conservan la precisión completa del
@@ -51,6 +53,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `Ctrl+O` | Abrir proyecto |
 | `Ctrl+S` / `Ctrl+Mayús+S` | Guardar / Guardar como |
 | `Ctrl+E` | Exportar PNG |
+| `Ctrl+V` | Pegar una imagen del portapapeles |
 | `Ctrl+N` | Nuevo lienzo |
 
 ## Tableta gráfica

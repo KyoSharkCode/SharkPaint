@@ -58,6 +58,8 @@ impl Tool {
 enum Command {
     NewDialog,
     Open,
+    InsertImage,
+    PasteImage,
     Save,
     SaveAs,
     ExportPng,
@@ -223,8 +225,14 @@ impl SharkPaintApp {
             scale_changed_at: None,
             brush_window_open: true,
         };
+        // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
-            app.load_project(path);
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+                app.load_project(path);
+            } else {
+                app.insert_image_file(&path);
+                app.saved_revision = app.doc.revision();
+            }
         }
         app
     }
@@ -534,6 +542,9 @@ impl SharkPaintApp {
                 if ui.add(egui::Button::new("Guardar como…").shortcut_text("Ctrl+Mayús+S")).clicked() {
                     commands.push(Command::SaveAs);
                 }
+                if ui.button("Insertar imagen…").clicked() {
+                    commands.push(Command::InsertImage);
+                }
                 if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+E")).clicked() {
                     commands.push(Command::ExportPng);
                 }
@@ -550,6 +561,10 @@ impl SharkPaintApp {
                 let redo = egui::Button::new("Rehacer").shortcut_text("Ctrl+Mayús+Z");
                 if ui.add_enabled(self.doc.can_redo(), redo).clicked() {
                     commands.push(Command::Redo);
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Pegar imagen").shortcut_text("Ctrl+V")).clicked() {
+                    commands.push(Command::PasteImage);
                 }
             });
             ui.menu_button("Capa", |ui| {
@@ -1032,6 +1047,98 @@ impl SharkPaintApp {
         }
     }
 
+    /// Puts an image on a new layer, centred, shrunk to fit if it is larger
+    /// than the canvas. `rgba` is 8-bit and not premultiplied.
+    fn insert_image(&mut self, name: &str, width: usize, height: usize, rgba: Vec<u8>) {
+        if width == 0 || height == 0 || rgba.len() != width * height * 4 {
+            self.status = "La imagen no se pudo leer.".into();
+            return;
+        }
+        let fit = (self.doc.width as f64 / width as f64).min(self.doc.height as f64 / height as f64);
+        let (mut width, mut height, mut rgba) = (width, height, rgba);
+        let mut note = String::new();
+        if fit < 1.0 {
+            let (w, h) = (
+                ((width as f64 * fit).round() as u32).max(1),
+                ((height as f64 * fit).round() as u32).max(1),
+            );
+            let Some(source) = image::RgbaImage::from_raw(width as u32, height as u32, rgba) else { return };
+            let scaled = image::imageops::resize(&source, w, h, image::imageops::FilterType::Lanczos3);
+            (width, height, rgba) = (w as usize, h as usize, scaled.into_raw());
+            note = format!(" (reducida al {:.0} % para caber en el lienzo)", fit * 100.0);
+        }
+        let x = (self.doc.width as i32 - width as i32) / 2;
+        let y = (self.doc.height as i32 - height as i32) / 2;
+        self.doc.add_image_layer(name, width, height, &rgba, x, y);
+        // The move tool is what comes next: placing the image.
+        self.tool = Tool::Mover;
+        self.status = format!("Imagen insertada en una capa nueva{note}. Arrástrala para colocarla.");
+    }
+
+    fn insert_image_file(&mut self, path: &std::path::Path) {
+        match image::open(path) {
+            Ok(decoded) => {
+                let rgba = decoded.into_rgba8();
+                let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Imagen".into());
+                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                self.insert_image(&name, w, h, rgba.into_raw());
+            }
+            Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+        }
+    }
+
+    fn pick_image_file(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Insertar imagen")
+            .add_filter("Imágenes", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.insert_image_file(&path);
+        }
+    }
+
+    /// Pastes the image on the system clipboard, if there is one.
+    fn paste_clipboard_image(&mut self) {
+        let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+        match image {
+            Ok(image) => self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned()),
+            Err(_) => self.status = "No hay ninguna imagen en el portapapeles.".into(),
+        }
+    }
+
+    /// Images arriving by Ctrl+V or by dropping files on the window.
+    fn incoming_images(&mut self, ctx: &egui::Context) {
+        let (events, dropped) = ctx.input(|i| (i.events.clone(), i.raw.dropped_files.clone()));
+        for event in events {
+            match event {
+                Event::PasteImage(image) => {
+                    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                    self.insert_image("Imagen pegada", image.size[0], image.size[1], rgba);
+                }
+                // The clipboard also had text, which wins; look for an image anyway
+                // unless the text is headed for a text field.
+                Event::Paste(_) if !ctx.text_edit_focused() => {
+                    let image = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+                    if let Ok(image) = image {
+                        self.insert_image("Imagen pegada", image.width, image.height, image.bytes.into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        for file in dropped {
+            let path = file.path().to_path_buf();
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+                self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            } else {
+                self.insert_image_file(&path);
+            }
+        }
+    }
+
     fn pick_color(&mut self, canvas: Pos2) {
         let (x, y) = (canvas.x.floor() as i32, canvas.y.floor() as i32);
         let rect = IRect::new(x, y, x + 1, y + 1);
@@ -1357,6 +1464,8 @@ impl SharkPaintApp {
         match command {
             Command::NewDialog => self.discarding(Discarding::New, ctx),
             Command::Open => self.discarding(Discarding::Open, ctx),
+            Command::InsertImage => self.pick_image_file(),
+            Command::PasteImage => self.paste_clipboard_image(),
             Command::Save => {
                 self.save_project(false);
             }
@@ -1410,6 +1519,7 @@ impl eframe::App for SharkPaintApp {
         let ctx = ui.ctx().clone();
         let mut commands = Vec::new();
         self.keyboard_commands(&ctx, &mut commands);
+        self.incoming_images(&ctx);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut commands));
         egui::Panel::bottom("estado").show(ui, |ui| self.status_bar(ui));

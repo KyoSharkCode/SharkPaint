@@ -514,3 +514,31 @@ fn smudge_drags_paint_and_is_one_undo_step() {
     assert_eq!(doc.render_rgba8(doc.bounds()), before);
     assert!(!doc.can_undo() || { doc.undo(); !doc.can_undo() });
 }
+
+#[test]
+fn inserted_images_become_an_undoable_layer() {
+    let mut doc = Document::new(100, 80);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 40.0), (90.0, 40.0));
+    let before = doc.render_rgba8(doc.bounds());
+    // A 4 × 2 image: opaque red, half-transparent green, opaque blue, fully transparent.
+    let mut image = Vec::new();
+    for _ in 0..2 {
+        image.extend_from_slice(&[255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 9, 9, 9, 0]);
+    }
+    doc.add_image_layer("foto.png", 4, 2, &image, 20, 10);
+    assert_eq!((doc.layers().len(), doc.active_layer()), (2, 1));
+    assert_eq!(doc.active().props.name, "foto.png");
+    assert_eq!(pixel(&doc, 20, 10), [255, 0, 0, 255]);
+    let green = pixel(&doc, 21, 11);
+    assert!((126..=129).contains(&green[0]) && green[1] == 255, "{green:?}"); // 50 % over white
+    assert_eq!(pixel(&doc, 22, 10), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 23, 10), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 50, 40), [0, 0, 0, 255]); // the drawing underneath is intact
+    doc.undo();
+    assert_eq!(doc.layers().len(), 1);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // An image hanging off the canvas is clipped rather than rejected.
+    doc.add_image_layer("borde", 4, 2, &image, 98, -1);
+    assert_eq!(pixel(&doc, 98, 0), [255, 0, 0, 255]);
+}
