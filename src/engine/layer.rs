@@ -192,7 +192,9 @@ impl LayerProps {
 }
 
 /// A named set of neighbouring layers that are shown, hidden and faded
-/// together. The layers still blend with the rest of the picture one by one.
+/// together. With the normal blend mode its layers blend with the rest of
+/// the picture one by one; with any other, they are combined among
+/// themselves first and the result is blended in as a single layer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerGroup {
     /// Unique within a document; never zero.
@@ -201,6 +203,7 @@ pub struct LayerGroup {
     pub visible: bool,
     /// 0..=1, on top of each layer's own opacity.
     pub opacity: f32,
+    pub blend: BlendMode,
     /// The group's layers are folded away in the layer list.
     pub collapsed: bool,
 }

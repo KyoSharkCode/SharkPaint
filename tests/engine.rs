@@ -1570,3 +1570,43 @@ fn a_brush_can_paint_in_a_blend_mode() {
     assert_eq!((lit[0], lit[1], lit[2]), (128, 128, 255), "grey screened with blue");
     assert_eq!(doc.layers()[0].pixel(50, 95)[3], 0, "locked transparency stays empty");
 }
+
+#[test]
+fn a_layer_group_can_blend_as_one() {
+    // Grey underneath; above it a group holding red, and white over part of the red.
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(90.0), [128, 128, 128], false, (40.0, 50.0), (160.0, 50.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (60.0, 50.0), (140.0, 50.0));
+    let id = doc.group_active_layer().unwrap();
+    doc.add_layer();
+    line(&mut doc, &hard_brush(20.0), [255, 255, 255], false, (120.0, 50.0), (140.0, 50.0));
+    assert_eq!(doc.layers()[2].group, id);
+    assert_eq!(pixel(&doc, 70, 50), [255, 0, 0, 255], "normal: the red covers the grey");
+
+    let mut group = doc.group(id).unwrap().clone();
+    group.blend = BlendMode::Multiply;
+    doc.set_group(group.clone(), false);
+    assert_eq!(pixel(&doc, 70, 50), [128, 0, 0, 255], "the group multiplies the grey");
+    // Inside the group white still covers red; only the result is multiplied.
+    assert_eq!(pixel(&doc, 130, 50), [128, 128, 128, 255], "white times grey");
+    assert_eq!(pixel(&doc, 70, 12), [128, 128, 128, 255], "where the group is empty nothing changes");
+    assert_eq!(pixel(&doc, 5, 5), [255, 255, 255, 255]);
+
+    // The group's opacity fades the combined result.
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let half = pixel(&doc, 70, 50);
+    assert_eq!(half[0], 128);
+    assert!((62..=66).contains(&half[1]), "halfway between grey and its product with red: {half:?}");
+
+    // Saved and read back, it looks the same.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.groups()[0].blend, BlendMode::Multiply);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    doc.undo();
+    doc.undo();
+    assert_eq!(pixel(&doc, 70, 50), [255, 0, 0, 255]);
+}

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::brush::BrushSettings;
-use super::layer::{blend_over, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
+use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
 use super::stroke::{ActiveStroke, StrokePoint};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
@@ -25,6 +25,14 @@ enum HistoryEntry {
     Props { layer: usize, props: LayerProps },
     /// The selection as it was.
     Selection(Option<Arc<Selection>>),
+}
+
+/// A group whose layers are combined apart and blended in as one.
+#[derive(Clone, Copy)]
+struct Isolated {
+    id: u64,
+    opacity: u32,
+    blend: BlendMode,
 }
 
 /// A reference image kept alongside the drawing: shown in its own panel,
@@ -244,6 +252,10 @@ impl Document {
     pub fn layer_display(&self, layer: &Layer) -> (bool, u32) {
         let opacity = layer.props.opacity15();
         match self.group(layer.group) {
+            // A group blended as one applies its opacity to the combined result.
+            Some(group) if group.blend != BlendMode::Normal => {
+                (layer.props.visible && group.visible && opacity > 0 && group.opacity > 0.0, opacity)
+            }
             Some(group) => {
                 let faded = (opacity as f32 * group.opacity.clamp(0.0, 1.0)).round() as u32;
                 (layer.props.visible && group.visible && faded > 0, faded)
@@ -267,7 +279,7 @@ impl Document {
         self.checkpoint_layers();
         let id = self.stamp();
         let number = self.groups.len() + 1;
-        self.groups.push(LayerGroup { id, name: format!("Grupo {number}"), visible: true, opacity: 1.0, collapsed: false });
+        self.groups.push(LayerGroup { id, name: format!("Grupo {number}"), visible: true, opacity: 1.0, blend: BlendMode::Normal, collapsed: false });
         self.layers[index].group = id;
         self.prune_groups();
         self.mark_dirty(self.bounds());
@@ -676,6 +688,18 @@ impl Document {
 
         // Whether each layer shows and how strongly, groups counted in.
         let display: Vec<(bool, u32)> = self.layers.iter().map(|layer| self.layer_display(layer)).collect();
+        // The group each layer is gathered into, if its group blends as one.
+        let isolated: Vec<Option<Isolated>> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                self.group(layer.group).filter(|g| g.blend != BlendMode::Normal).map(|g| Isolated {
+                    id: g.id,
+                    opacity: (g.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
+                    blend: g.blend,
+                })
+            })
+            .collect();
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
         for ty in ty0..=ty1 {
@@ -687,21 +711,22 @@ impl Document {
                 let y1 = rect.y1.min(oy + TILE as i32);
                 // Each drawable layer's tile, with the tile and opacity of the
                 // layer it is clipped to, if any.
-                let mut tiles: Vec<(&Tile, &LayerProps, u32, Option<(&Tile, u32)>)> = Vec::new();
+                let mut tiles: Vec<(&Tile, &LayerProps, u32, Option<(&Tile, u32)>, Option<Isolated>)> = Vec::new();
                 let mut clip_base: Option<(&Tile, u32)> = None;
                 for (index, layer) in self.layers.iter().enumerate() {
                     let props = &layer.props;
                     let (shown, opacity) = display[index];
+                    let isolated = isolated[index];
                     let tile = layer.tiles[layer.tile_index(tx, ty)].as_deref();
                     if props.clip && index > 0 {
                         if let (true, Some(tile), Some(base)) = (shown, tile, clip_base) {
-                            tiles.push((tile, props, opacity, Some(base)));
+                            tiles.push((tile, props, opacity, Some(base), isolated));
                         }
                     } else {
                         // A hidden or empty base hides everything clipped to it.
                         clip_base = tile.filter(|_| shown).map(|t| (t, opacity));
                         if let (true, Some(tile)) = (shown, tile) {
-                            tiles.push((tile, props, opacity, None));
+                            tiles.push((tile, props, opacity, None, isolated));
                         }
                     }
                 }
@@ -716,13 +741,31 @@ impl Document {
                         }
                         let i = row + (x - ox) as usize;
                         let mut c = [paper[0], paper[1], paper[2], ONE];
-                        for (tile, props, opacity, base) in &tiles {
+                        // A group blended as one gathers its layers apart, then
+                        // goes over the picture when the next thing comes up.
+                        let mut apart: Option<(Isolated, [u32; 4])> = None;
+                        let flush = |c: &mut [u32; 4], apart: &mut Option<(Isolated, [u32; 4])>| {
+                            if let Some((group, gathered)) = apart.take() {
+                                blend_over(c, gathered.map(|v| v as u16), group.opacity, group.blend);
+                            }
+                        };
+                        for (tile, props, opacity, base, isolated) in &tiles {
                             let mut opacity = *opacity;
                             if let Some((base, base_opacity)) = base {
                                 opacity = (opacity * ((base.0[i][3] as u32 * base_opacity) >> 15)) >> 15;
                             }
-                            blend_over(&mut c, tile.0[i], opacity, props.blend);
+                            if apart.as_ref().map(|(group, _)| group.id) != isolated.map(|group| group.id) {
+                                flush(&mut c, &mut apart);
+                            }
+                            match isolated {
+                                Some(group) => {
+                                    let (_, gathered) = apart.get_or_insert((*group, [0; 4]));
+                                    blend_over(gathered, tile.0[i], opacity, props.blend);
+                                }
+                                None => blend_over(&mut c, tile.0[i], opacity, props.blend),
+                            }
                         }
+                        flush(&mut c, &mut apart);
                         out[o] = to8(c[0]);
                         out[o + 1] = to8(c[1]);
                         out[o + 2] = to8(c[2]);

@@ -2179,12 +2179,23 @@ impl SharkPaintApp {
                 let name = ui.add(egui::TextEdit::singleline(&mut group.name).desired_width(150.0));
                 continuous |= name.has_focus();
                 ui.end_row();
+                ui.label("Modo");
+                egui::ComboBox::from_id_salt("modo_fusion_grupo").selected_text(group.blend.name()).show_ui(ui, |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut group.blend, mode, mode.name());
+                    }
+                });
+                ui.end_row();
                 ui.label("Opacidad");
                 let slider = ui.add(egui::Slider::new(&mut group.opacity, 0.0..=1.0).custom_formatter(percent));
                 continuous |= slider.dragged();
                 ui.end_row();
             });
-            ui.label("La opacidad y la visibilidad del grupo se aplican a todas sus capas.");
+            ui.label(if group.blend == BlendMode::Normal {
+                "En modo normal, cada capa del grupo se mezcla por su cuenta con lo de abajo."
+            } else {
+                "Las capas del grupo se combinan entre sí y el resultado se mezcla con lo de abajo."
+            });
             if group != before {
                 self.doc.set_group(group, self.prop_edit_active);
                 self.prop_edit_active = continuous;
@@ -2285,6 +2296,9 @@ impl SharkPaintApp {
                         let mut label = group.name.clone();
                         if group.collapsed {
                             label.push_str(&format!(" ({members})"));
+                        }
+                        if group.blend != BlendMode::Normal {
+                            label.push_str(&format!(" · {}", group.blend.name()));
                         }
                         if group.opacity < 1.0 {
                             label.push_str(&format!(" · {:.0} %", group.opacity * 100.0));

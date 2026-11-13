@@ -49,6 +49,7 @@
 //!   name     u32 length + UTF-8 bytes
 //!   flags    u8       bit 0 = visible, bit 1 = folded in the layer list
 //!   opacity  u16      0..=32768
+//!   blend    u8       0 = normal: the layers blend one by one
 //! per layer, in file order:
 //!   group    u32      0 = none, otherwise 1 + position in the list above
 //! ```
@@ -184,6 +185,7 @@ impl ProjectSnapshot {
                 w.write_all(&[group.visible as u8 | (group.collapsed as u8) << 1])?;
                 let opacity = (group.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u16;
                 w.write_all(&opacity.to_le_bytes())?;
+                w.write_all(&[group.blend.id()])?;
             }
             for layer in &self.layers {
                 let place = self.groups.iter().position(|g| g.id == layer.group).map_or(0, |i| i as u32 + 1);
@@ -304,11 +306,13 @@ impl Document {
                     let name = String::from_utf8(name).map_err(|_| invalid("nombre de grupo no válido"))?;
                     let flags = read_u8(r)?;
                     let opacity = read_u16(r)?.min(ONE as u16) as f32 / ONE as f32;
+                    let blend = BlendMode::from_id(read_u8(r)?).ok_or_else(|| invalid("modo de fusión de grupo no válido"))?;
                     groups.push(LayerGroup {
                         id: place as u64,
                         name,
                         visible: flags & 1 != 0,
                         opacity,
+                        blend,
                         collapsed: flags & 2 != 0,
                     });
                 }
