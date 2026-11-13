@@ -50,6 +50,7 @@ enum Command {
     Rotate(f32),
     ResetRotation,
     Flip,
+    ToggleBrushWindow,
     Quit,
 }
 
@@ -117,6 +118,8 @@ pub struct SharkPaintApp {
     /// The window may close even with unsaved changes (the user chose to).
     allow_close: bool,
     window_title: String,
+    /// The floating brush settings window is showing.
+    brush_window_open: bool,
 }
 
 impl SharkPaintApp {
@@ -159,6 +162,7 @@ impl SharkPaintApp {
             confirm: None,
             allow_close: false,
             window_title: String::new(),
+            brush_window_open: true,
         };
         if let Some(path) = open_path {
             app.load_project(path);
@@ -384,6 +388,9 @@ impl SharkPaintApp {
             if hit(none, Key::M) {
                 commands.push(Command::Flip);
             }
+            if hit(none, Key::F5) {
+                commands.push(Command::ToggleBrushWindow);
+            }
             if hit(none, Key::B) {
                 self.tool = Tool::Pincel;
             }
@@ -493,6 +500,10 @@ impl SharkPaintApp {
                 if item(ui, "Voltear horizontalmente", "M") {
                     commands.push(Command::Flip);
                 }
+                ui.separator();
+                if item(ui, "Ajustes del pincel", "F5") {
+                    commands.push(Command::ToggleBrushWindow);
+                }
             });
             ui.menu_button("Ayuda", |ui| {
                 ui.label("Atajos del lienzo");
@@ -501,6 +512,7 @@ impl SharkPaintApp {
                     for (keys, what) in [
                         ("B / E", "Pincel / Borrador"),
                         ("[ / ]", "Tamaño del pincel"),
+                        ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
                         ("R + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
@@ -518,24 +530,62 @@ impl SharkPaintApp {
         });
     }
 
-    fn tool_panel(&mut self, ui: &mut egui::Ui) {
+    /// The narrow tool bar: one icon per tool. Clicking the tool that is already
+    /// selected shows or hides its settings window.
+    fn tool_bar(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
         ui.add_space(4.0);
-        let text = ui.visuals().text_color();
-        ui.columns(2, |columns| {
-            for (column, (tool, name, label, tip)) in columns.iter_mut().zip([
-                (Tool::Pincel, "pincel", "Pincel", "Pincel (B)"),
-                (Tool::Borrador, "borrador", "Borrador", "Borrador (E)"),
-            ]) {
-                let button = egui::Button::image_and_text(icon(name, 18.0, text), label)
-                    .selected(self.tool == tool)
-                    .min_size(Vec2::new(column.available_width(), 32.0));
-                if column.add(button).on_hover_text(tip).clicked() {
+        let text = ui.visuals().strong_text_color();
+        let size = Vec2::splat(ui.available_width());
+        for (tool, name, tip) in [
+            (Tool::Pincel, "pincel", "Pincel (B)\nClic de nuevo: ajustes"),
+            (Tool::Borrador, "borrador", "Borrador (E)\nClic de nuevo: ajustes"),
+        ] {
+            let button = egui::Button::image(icon(name, 20.0, text)).selected(self.tool == tool).min_size(size);
+            if ui.add(button).on_hover_text(tip).clicked() {
+                if self.tool == tool {
+                    commands.push(Command::ToggleBrushWindow);
+                } else {
                     self.tool = tool;
                 }
             }
-        });
+        }
         ui.separator();
-        self.brush_panel(ui);
+        let button = egui::Button::image(icon("ajustes", 20.0, text))
+            .selected(self.brush_window_open)
+            .min_size(size);
+        if ui.add(button).on_hover_text("Ajustes del pincel (F5)").clicked() {
+            commands.push(Command::ToggleBrushWindow);
+        }
+        ui.separator();
+        let faint = ui.visuals().weak_text_color().gamma_multiply(0.5);
+        for (name, enabled, tip, command) in [
+            ("deshacer", self.doc.can_undo(), "Deshacer (Ctrl+Z)", Command::Undo),
+            ("rehacer", self.doc.can_redo(), "Rehacer (Ctrl+Mayús+Z)", Command::Redo),
+        ] {
+            let color = if enabled { text } else { faint };
+            let button = egui::Button::image(icon(name, 20.0, color)).min_size(size);
+            if ui.add_enabled(enabled, button).on_hover_text(tip).clicked() {
+                commands.push(command);
+            }
+        }
+    }
+
+    /// Floating, movable window with the settings of the current tool.
+    fn brush_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.brush_window_open;
+        let title = match self.tool {
+            Tool::Pincel => "Pincel",
+            Tool::Borrador => "Borrador",
+        };
+        egui::Window::new(title)
+            .id(egui::Id::unique("ajustes_herramienta"))
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(false)
+            .default_pos(self.viewport.left_top() + Vec2::new(12.0, 12.0))
+            .default_width(250.0)
+            .show(ctx, |ui| self.brush_panel(ui));
+        self.brush_window_open = open;
     }
 
     fn color_panel(&mut self, ui: &mut egui::Ui) {
@@ -1188,6 +1238,7 @@ impl SharkPaintApp {
                 self.view.rotate_about(viewport.center(), -self.view.rotation, viewport, doc_size)
             }
             Command::Flip => self.view.flip = !self.view.flip,
+            Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
             Command::Quit => self.discarding(Discarding::Quit, ctx),
         }
     }
@@ -1201,16 +1252,11 @@ impl eframe::App for SharkPaintApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut commands));
         egui::Panel::bottom("estado").show(ui, |ui| self.status_bar(ui));
-        // Left: tools and their settings. Right: colour and layers.
+        // Left: a slim bar of tool icons. Right: colour and layers.
         egui::Panel::left("herramientas")
             .resizable(false)
-            .default_size(250.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("ajustes_pincel")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.tool_panel(ui));
-            });
+            .exact_size(52.0)
+            .show(ui, |ui| self.tool_bar(ui, &mut commands));
         egui::Panel::right("ajustes")
             .resizable(false)
             .default_size(260.0)
@@ -1227,6 +1273,9 @@ impl eframe::App for SharkPaintApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.modified() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm = Some(Discarding::Quit);
+        }
+        if self.brush_window_open {
+            self.brush_window(&ctx);
         }
         self.new_canvas_window(&ctx);
         self.confirm_window(&ctx);

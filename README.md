@@ -35,6 +35,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `B` / `E` | Pincel / Borrador |
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |
+| `F5`, o clic en la herramienta activa | Mostrar u ocultar los ajustes del pincel |
 | `Ctrl+Z` / `Ctrl+Mayús+Z` | Deshacer / Rehacer |
 | `R` + arrastrar, `Espacio` + arrastrar, botón central | Mover el lienzo |
 | Rueda del ratón, `Ctrl` + `+` / `-` | Zoom del lienzo |
