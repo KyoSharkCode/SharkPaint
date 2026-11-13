@@ -11,5 +11,5 @@ pub use brush::{BrushPreset, BrushSettings};
 pub use document::Document;
 pub use export::write_png;
 pub use project::PROJECT_EXTENSION;
-pub use layer::{IRect, Layer, Px, Tile, ONE, TILE};
+pub use layer::{BlendMode, IRect, Layer, LayerProps, Px, Tile, ONE, TILE};
 pub use stroke::StrokePoint;

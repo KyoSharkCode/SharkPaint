@@ -12,7 +12,7 @@
 //! active     u32      index of the active layer
 //! per layer:
 //!   name     u32 length + UTF-8 bytes
-//!   visible  u8
+//!   flags    u8       bit 0 = visible, bit 1 = transparency locked
 //!   opacity  u16      0..=32768
 //!   blend    u8       0 = normal
 //!   tiles    u32      number of stored tiles
@@ -22,8 +22,7 @@
 //!     data   zlib stream of 64×64 premultiplied RGBA pixels, u16 per channel
 //! ```
 //!
-//! Tiles that are fully transparent are not stored. The name, visibility,
-//! opacity and blend fields are written with defaults until layers gain them.
+//! Tiles that are fully transparent are not stored. Layers are listed bottom first.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -35,7 +34,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use super::document::Document;
-use super::layer::{Layer, Tile, ONE, TILE};
+use super::layer::{BlendMode, Layer, Tile, ONE, TILE};
 
 /// File extension of SharkPaint projects, without the dot.
 pub const PROJECT_EXTENSION: &str = "spaint";
@@ -99,16 +98,16 @@ impl Document {
         w.write_all(&(self.width as u32).to_le_bytes())?;
         w.write_all(&(self.height as u32).to_le_bytes())?;
         w.write_all(&self.paper)?;
-        w.write_all(&(self.layers.len() as u32).to_le_bytes())?;
-        w.write_all(&(self.active_layer as u32).to_le_bytes())?;
+        w.write_all(&(self.layers().len() as u32).to_le_bytes())?;
+        w.write_all(&(self.active_layer() as u32).to_le_bytes())?;
         let mut raw = vec![0u8; TILE_BYTES];
-        for (i, layer) in self.layers.iter().enumerate() {
-            let name = format!("Capa {}", i + 1);
-            w.write_all(&(name.len() as u32).to_le_bytes())?;
-            w.write_all(name.as_bytes())?;
-            w.write_all(&[1])?; // visible
-            w.write_all(&(ONE as u16).to_le_bytes())?; // opacity
-            w.write_all(&[0])?; // blend mode: normal
+        for layer in self.layers() {
+            let props = &layer.props;
+            w.write_all(&(props.name.len() as u32).to_le_bytes())?;
+            w.write_all(props.name.as_bytes())?;
+            w.write_all(&[props.visible as u8 | (props.alpha_lock as u8) << 1])?;
+            w.write_all(&(props.opacity15() as u16).to_le_bytes())?;
+            w.write_all(&[props.blend.id()])?;
 
             let stored: Vec<(usize, &Tile)> = layer
                 .tiles
@@ -149,15 +148,16 @@ impl Document {
         if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE {
             return Err(invalid("tamaño de lienzo no válido"));
         }
-        let mut doc = Document::new(width as usize, height as usize);
-        r.read_exact(&mut doc.paper)?;
+        let (width, height) = (width as usize, height as usize);
+        let mut paper = [0u8; 3];
+        r.read_exact(&mut paper)?;
         let layer_count = read_u32(r)? as usize;
         let active = read_u32(r)? as usize;
         if layer_count == 0 || layer_count > 4096 || active >= layer_count {
             return Err(invalid("lista de capas no válida"));
         }
 
-        doc.layers.clear();
+        let mut layers = Vec::with_capacity(layer_count);
         let mut raw = vec![0u8; TILE_BYTES];
         for _ in 0..layer_count {
             let name_len = read_u32(r)? as usize;
@@ -166,9 +166,14 @@ impl Document {
             }
             let mut name = vec![0u8; name_len];
             r.read_exact(&mut name)?;
-            let (_visible, _opacity, _blend) = (read_u8(r)?, read_u16(r)?, read_u8(r)?);
+            let name = String::from_utf8(name).map_err(|_| invalid("nombre de capa no válido"))?;
+            let (flags, opacity, blend) = (read_u8(r)?, read_u16(r)?, read_u8(r)?);
 
-            let mut layer = Layer::new(doc.width, doc.height);
+            let mut layer = Layer::new(width, height, name);
+            layer.props.visible = flags & 1 != 0;
+            layer.props.alpha_lock = flags & 2 != 0;
+            layer.props.opacity = (opacity as f32 / ONE as f32).min(1.0);
+            layer.props.blend = BlendMode::from_id(blend).ok_or_else(|| invalid("modo de fusión desconocido"))?;
             let tile_count = read_u32(r)? as usize;
             if tile_count > layer.tiles.len() {
                 return Err(invalid("número de mosaicos no válido"));
@@ -198,9 +203,10 @@ impl Document {
                 }
                 layer.tiles[idx] = Some(Arc::new(tile));
             }
-            doc.layers.push(layer);
+            layers.push(layer);
         }
-        doc.active_layer = active;
+        let mut doc = Document::from_layers(width, height, layers, active);
+        doc.paper = paper;
         Ok(doc)
     }
 }

@@ -3,20 +3,24 @@
 Aplicación nativa de dibujo y pintura digital para Windows, escrita en Rust.
 No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
-## Estado actual (fase 1)
+## Estado actual
 
 - Lienzo con zoom, desplazamiento, rotación y volteo horizontal.
 - Pincel con sensibilidad a la presión del lápiz (tamaño y flujo).
 - Cuatro pinceles iniciales: Lápiz, Tinta, Marcador y Aerógrafo, todos ajustables
   (tamaño, opacidad, flujo, dureza, espaciado y estabilizador).
-- Borrador, cuentagotas, deshacer y rehacer (200 pasos).
+- Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
+  bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
+  Oscurecer, Aclarar y Sumar).
+- Borrador, cuentagotas, deshacer y rehacer (200 pasos, incluidos los cambios de capas).
+- Gestos táctiles con dos dedos: mover, rotar y hacer zoom.
 - Proyectos en formato propio (`.spaint`) que conservan la precisión completa del
   dibujo, y exportación a PNG.
 - Aviso antes de descartar cambios sin guardar.
 
 ## Pendiente
 
-- Capas con modos de fusión.
+- Máscaras de recorte y grupos de capas.
 - Panel de referencias: imágenes de consulta en un panel propio, fuera del lienzo y
   de las capas, con zoom y desplazamiento independientes y cuentagotas sobre la
   referencia. No se incluyen al exportar.
@@ -32,9 +36,11 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |
 | `Ctrl+Z` / `Ctrl+Mayús+Z` | Deshacer / Rehacer |
-| `Espacio` + arrastrar, botón central | Mover el lienzo |
+| `R` + arrastrar, `Espacio` + arrastrar, botón central | Mover el lienzo |
 | Rueda del ratón, `Ctrl` + `+` / `-` | Zoom del lienzo |
-| `R` + arrastrar, `4` / `6` | Rotar el lienzo |
+| `Mayús` + `R` + arrastrar, `4` / `6` | Rotar el lienzo |
+| Dos dedos (pantalla táctil) | Mover, rotar y hacer zoom |
+| `Ctrl+Mayús+N` / `Ctrl+J` | Nueva capa / Duplicar capa |
 | `5` | Restablecer la rotación |
 | `M` | Voltear horizontalmente |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |

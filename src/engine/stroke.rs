@@ -36,6 +36,8 @@ pub(crate) struct ActiveStroke {
     /// Paint colour, 15-bit per channel, not premultiplied.
     color: [u32; 3],
     erase: bool,
+    /// Keep the layer's existing alpha; paint only where it already has pixels.
+    alpha_lock: bool,
     opacity: u32,
     tiles: Vec<Option<StrokeTile>>,
     /// Last point actually drawn to (after smoothing).
@@ -61,6 +63,7 @@ impl ActiveStroke {
             brush: brush.clone(),
             color: [to15(color[0]), to15(color[1]), to15(color[2])],
             erase,
+            alpha_lock: layer.props.alpha_lock,
             opacity: (brush.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
             tiles: (0..layer.tiles.len()).map(|_| None).collect(),
             pen: p,
@@ -91,6 +94,19 @@ impl ActiveStroke {
     pub fn finish(&mut self, layer: &mut Layer) -> IRect {
         let raw = self.raw;
         self.segment_to(layer, raw)
+    }
+
+    /// Puts back every tile the stroke touched, as if it had never started.
+    pub fn revert(self, layer: &mut Layer) -> IRect {
+        let tiles_x = layer.tiles_x;
+        let mut rect = IRect::new(0, 0, 0, 0);
+        for (idx, orig) in self.into_saved() {
+            layer.tiles[idx] = orig;
+            let (tx, ty) = ((idx % tiles_x) as i32, (idx / tiles_x) as i32);
+            let t = TILE as i32;
+            rect = rect.union(&IRect::new(tx * t, ty * t, (tx + 1) * t, (ty + 1) * t));
+        }
+        rect
     }
 
     /// Pre-stroke contents of every tile the stroke modified.
@@ -210,8 +226,11 @@ impl ActiveStroke {
             for tx in tx0..=tx1 {
                 let idx = layer.tile_index(tx, ty);
                 let Some(st) = &self.tiles[idx] else { continue };
-                if self.erase && st.orig.is_none() {
-                    continue; // nothing to erase
+                if st.orig.is_none() && (self.erase || self.alpha_lock) {
+                    continue; // nothing to erase or to paint onto
+                }
+                if self.erase && self.alpha_lock {
+                    continue; // erasing would change the locked transparency
                 }
                 let dst = Arc::make_mut(
                     layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())),
@@ -236,6 +255,16 @@ impl ActiveStroke {
                         };
                         dst.0[i] = if self.erase {
                             [mix(o[0], 0), mix(o[1], 0), mix(o[2], 0), mix(o[3], 0)]
+                        } else if self.alpha_lock {
+                            // Paint scaled by the pixel's own alpha, which stays put.
+                            let own = o[3] as u32;
+                            let paint = |c: u32| (c * own + ONE / 2) >> 15;
+                            [
+                                mix(o[0], paint(self.color[0])),
+                                mix(o[1], paint(self.color[1])),
+                                mix(o[2], paint(self.color[2])),
+                                o[3],
+                            ]
                         } else {
                             [
                                 mix(o[0], self.color[0]),

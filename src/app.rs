@@ -5,10 +5,12 @@ use eframe::egui::{
     Shape, Stroke, TextureFilter, TextureHandle, TextureOptions, TouchPhase, Vec2,
 };
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use sharkpaint::engine::{
-    write_png, BrushPreset, BrushSettings, Document, IRect, StrokePoint, PROJECT_EXTENSION,
+    write_png, BlendMode, BrushPreset, BrushSettings, Document, IRect, StrokePoint,
+    PROJECT_EXTENSION,
 };
 
 use crate::view::View;
@@ -33,6 +35,11 @@ enum Command {
     Undo,
     Redo,
     ClearLayer,
+    LayerAdd,
+    LayerDuplicate,
+    LayerDelete,
+    LayerMove(bool),
+    LayerMerge,
     Fit,
     ActualSize,
     Zoom(f32),
@@ -76,8 +83,19 @@ pub struct SharkPaintApp {
     pending_start: Option<Pos2>,
     /// Latest pen pressure reported since the current press began.
     contact_pressure: Option<f32>,
-    /// A pen or finger is currently touching the tablet.
+    /// The pen or first finger is currently touching the tablet.
     touch_active: bool,
+    /// Every pen or finger contact currently down.
+    touches: HashSet<u64>,
+    /// The contact that started first; only it drives painting and pressure.
+    primary_touch: Option<u64>,
+    /// Two fingers are moving, zooming or rotating the canvas.
+    gesture_active: bool,
+    /// When the current press began, to tell a second finger from a resting palm.
+    press_time: f64,
+    /// The layer property widgets are mid-edit (slider drag or typing), so
+    /// further changes join the same undo step.
+    prop_edit_active: bool,
     /// The current press came from a pen or finger rather than the mouse.
     press_is_touch: bool,
     pen_seen: bool,
@@ -118,6 +136,11 @@ impl SharkPaintApp {
             pending_start: None,
             contact_pressure: None,
             touch_active: false,
+            touches: HashSet::new(),
+            primary_touch: None,
+            gesture_active: false,
+            press_time: 0.0,
+            prop_edit_active: false,
             press_is_touch: false,
             pen_seen: false,
             fit_pending: true,
@@ -320,8 +343,14 @@ impl SharkPaintApp {
             if hit(cmd, Key::E) {
                 commands.push(Command::ExportPng);
             }
+            if hit(cmd | egui::Modifiers::SHIFT, Key::N) {
+                commands.push(Command::LayerAdd);
+            }
             if hit(cmd, Key::N) {
                 commands.push(Command::NewDialog);
+            }
+            if hit(cmd, Key::J) {
+                commands.push(Command::LayerDuplicate);
             }
             if hit(cmd, Key::Num0) {
                 commands.push(Command::Fit);
@@ -399,9 +428,32 @@ impl SharkPaintApp {
                 if ui.add_enabled(self.doc.can_redo(), redo).clicked() {
                     commands.push(Command::Redo);
                 }
+            });
+            ui.menu_button("Capa", |ui| {
+                let many = self.doc.layers().len() > 1;
+                let active = self.doc.active_layer();
+                if ui.add(egui::Button::new("Nueva capa").shortcut_text("Ctrl+Mayús+N")).clicked() {
+                    commands.push(Command::LayerAdd);
+                }
+                if ui.add(egui::Button::new("Duplicar capa").shortcut_text("Ctrl+J")).clicked() {
+                    commands.push(Command::LayerDuplicate);
+                }
+                if ui.add_enabled(active > 0, egui::Button::new("Fusionar con la inferior")).clicked() {
+                    commands.push(Command::LayerMerge);
+                }
+                ui.separator();
+                if ui.add_enabled(active + 1 < self.doc.layers().len(), egui::Button::new("Subir")).clicked() {
+                    commands.push(Command::LayerMove(true));
+                }
+                if ui.add_enabled(active > 0, egui::Button::new("Bajar")).clicked() {
+                    commands.push(Command::LayerMove(false));
+                }
                 ui.separator();
                 if ui.button("Limpiar capa").clicked() {
                     commands.push(Command::ClearLayer);
+                }
+                if ui.add_enabled(many, egui::Button::new("Eliminar capa")).clicked() {
+                    commands.push(Command::LayerDelete);
                 }
             });
             ui.menu_button("Ver", |ui| {
@@ -442,10 +494,12 @@ impl SharkPaintApp {
                         ("B / E", "Pincel / Borrador"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
+                        ("R + arrastrar", "Mover el lienzo"),
                         ("Espacio + arrastrar", "Mover el lienzo"),
                         ("Botón central", "Mover el lienzo"),
                         ("Rueda del ratón", "Zoom"),
-                        ("R + arrastrar", "Rotar el lienzo"),
+                        ("Mayús + R + arrastrar", "Rotar el lienzo"),
+                        ("Dos dedos", "Mover, rotar y hacer zoom"),
                     ] {
                         ui.label(keys);
                         ui.label(what);
@@ -476,7 +530,7 @@ impl SharkPaintApp {
         let mut color = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
         ui.scope(|ui| {
             // The picker takes its width from the slider width; make it fill the panel.
-            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(120.0, 260.0);
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(120.0, 190.0);
             if egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque) {
                 self.color = [color.r(), color.g(), color.b()];
             }
@@ -545,6 +599,104 @@ impl SharkPaintApp {
             if self.preset.map(|p| p.settings()) != Some(self.brush.clone()) {
                 self.preset = None;
             }
+        }
+    }
+
+    fn layers_panel(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+        ui.strong("Capas");
+        let count = self.doc.layers().len();
+        let active = self.doc.active_layer();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.small_button("Nueva").on_hover_text("Nueva capa (Ctrl+Mayús+N)").clicked() {
+                commands.push(Command::LayerAdd);
+            }
+            if ui.small_button("Duplicar").on_hover_text("Duplicar capa (Ctrl+J)").clicked() {
+                commands.push(Command::LayerDuplicate);
+            }
+            if ui.add_enabled(active + 1 < count, egui::Button::new("Subir").small()).clicked() {
+                commands.push(Command::LayerMove(true));
+            }
+            if ui.add_enabled(active > 0, egui::Button::new("Bajar").small()).clicked() {
+                commands.push(Command::LayerMove(false));
+            }
+            let merge = egui::Button::new("Fusionar").small();
+            if ui.add_enabled(active > 0, merge).on_hover_text("Fusionar con la capa inferior").clicked() {
+                commands.push(Command::LayerMerge);
+            }
+            if ui.add_enabled(count > 1, egui::Button::new("Eliminar").small()).clicked() {
+                commands.push(Command::LayerDelete);
+            }
+        });
+
+        // Properties of the active layer.
+        let before = self.doc.active().props.clone();
+        let mut props = before.clone();
+        let mut continuous = false;
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        egui::Grid::new("capa_activa").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Nombre");
+            let name = ui.add(egui::TextEdit::singleline(&mut props.name).desired_width(150.0));
+            continuous |= name.has_focus();
+            ui.end_row();
+            ui.label("Modo");
+            egui::ComboBox::from_id_salt("modo_fusion")
+                .selected_text(props.blend.name())
+                .show_ui(ui, |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut props.blend, mode, mode.name());
+                    }
+                });
+            ui.end_row();
+            ui.label("Opacidad");
+            let slider = ui.add(egui::Slider::new(&mut props.opacity, 0.0..=1.0).custom_formatter(percent));
+            continuous |= slider.dragged();
+            ui.end_row();
+        });
+        ui.checkbox(&mut props.alpha_lock, "Bloquear transparencia")
+            .on_hover_text("Pinta solo sobre lo que ya está dibujado en la capa");
+        if props != before {
+            self.doc.set_layer_props(active, props, self.prop_edit_active);
+            self.prop_edit_active = continuous;
+        } else if !continuous {
+            self.prop_edit_active = false;
+        }
+
+        ui.add_space(4.0);
+        // The stack, top layer first.
+        let mut select = None;
+        let mut toggle = None;
+        egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
+            for (i, layer) in self.doc.layers().iter().enumerate().rev() {
+                ui.horizontal(|ui| {
+                    let eye = if layer.props.visible { "👁" } else { "–" };
+                    let tip = if layer.props.visible { "Ocultar capa" } else { "Mostrar capa" };
+                    if ui.add(egui::Button::new(eye).min_size(Vec2::new(26.0, 22.0))).on_hover_text(tip).clicked() {
+                        toggle = Some(i);
+                    }
+                    let mut label = layer.props.name.clone();
+                    if layer.props.blend != BlendMode::Normal || layer.props.opacity < 1.0 {
+                        label = format!(
+                            "{label}  ·  {} {:.0} %",
+                            layer.props.blend.name(),
+                            layer.props.opacity * 100.0
+                        );
+                    }
+                    let row = egui::Button::selectable(i == active, label)
+                        .min_size(Vec2::new(ui.available_width(), 22.0));
+                    if ui.add(row).clicked() {
+                        select = Some(i);
+                    }
+                });
+            }
+        });
+        if let Some(i) = toggle {
+            let mut props = self.doc.layers()[i].props.clone();
+            props.visible = !props.visible;
+            self.doc.set_layer_props(i, props, false);
+        }
+        if let Some(i) = select {
+            self.doc.set_active_layer(i);
         }
     }
 
@@ -626,26 +778,30 @@ impl SharkPaintApp {
         }
 
         let ctx = ui.ctx().clone();
-        let (space, rotate_key, alt, events, hover) = ctx.input(|i| {
+        let (space, nav_key, shift, alt, events, hover, now) = ctx.input(|i| {
             (
                 i.key_down(Key::Space),
                 i.key_down(Key::R),
+                i.modifiers.shift,
                 i.modifiers.alt,
                 i.events.clone(),
                 i.pointer.hover_pos(),
+                i.time,
             )
         });
         let typing = ctx.text_edit_focused();
-        let navigating = !typing && (space || rotate_key);
+        let navigating = !typing && (space || nav_key);
+        let rotating = nav_key && shift;
         // The pointer is over the canvas itself, not a menu or window on top of it.
         let over_canvas = |pos: Pos2| {
             viewport.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == response.layer_id)
         };
 
         // --- Navigation -----------------------------------------------------
-        if response.dragged_by(PointerButton::Middle) || (space && response.dragged_by(PointerButton::Primary)) {
+        let primary_drag = navigating && !self.gesture_active && response.dragged_by(PointerButton::Primary);
+        if response.dragged_by(PointerButton::Middle) || (primary_drag && !rotating) {
             self.view.pan += response.drag_delta();
-        } else if rotate_key && !typing && response.dragged_by(PointerButton::Primary) {
+        } else if primary_drag {
             if let Some(pos) = hover {
                 let center = self.view.center(viewport);
                 let now = pos - center;
@@ -656,9 +812,11 @@ impl SharkPaintApp {
                 }
             }
         }
+        let fingers = ctx.multi_touch();
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
+            // With two fingers down the pinch is applied by the gesture below.
             let (scroll, pinch) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-            let factor = (scroll * 0.0025).exp() * pinch;
+            let factor = (scroll * 0.0025).exp() * if fingers.is_some() { 1.0 } else { pinch };
             if factor != 1.0 {
                 self.view.zoom_about(pos, factor, viewport, doc_size);
             }
@@ -671,12 +829,41 @@ impl SharkPaintApp {
         let to_canvas = |pos: Pos2| view.to_canvas(pos, viewport, doc_size);
         for event in &events {
             match event {
-                Event::Touch { phase, force, .. } => match phase {
-                    TouchPhase::Start | TouchPhase::Move => {
-                        if *phase == TouchPhase::Start {
-                            self.touch_active = true;
-                            self.pen_pressure = None;
+                Event::Touch { id, phase, force, .. } => {
+                    let id = id.0;
+                    match phase {
+                        TouchPhase::Start => {
+                            if self.touches.is_empty() {
+                                self.primary_touch = Some(id);
+                                self.touch_active = true;
+                                self.pen_pressure = None;
+                            } else if !self.gesture_active {
+                                // A second contact right after the first is a two-finger
+                                // gesture: drop whatever the first one started to draw.
+                                // Later than that it is a palm resting while the pen draws.
+                                let drawing = self.pending_start.is_some() || self.doc.is_stroking();
+                                if !drawing || now - self.press_time < 0.25 {
+                                    self.gesture_active = true;
+                                    self.pending_start = None;
+                                    self.doc.cancel_stroke();
+                                }
+                            }
+                            self.touches.insert(id);
                         }
+                        TouchPhase::Move => {}
+                        TouchPhase::End | TouchPhase::Cancel => {
+                            self.touches.remove(&id);
+                            if self.primary_touch == Some(id) {
+                                self.primary_touch = None;
+                                self.touch_active = false;
+                                self.pen_pressure = None;
+                            }
+                            if self.touches.is_empty() {
+                                self.gesture_active = false;
+                            }
+                        }
+                    }
+                    if self.primary_touch == Some(id) {
                         match force {
                             Some(f) => {
                                 let f = f.clamp(0.0, 1.0);
@@ -690,18 +877,18 @@ impl SharkPaintApp {
                             None => {}
                         }
                     }
-                    TouchPhase::End | TouchPhase::Cancel => {
-                        self.touch_active = false;
-                        self.pen_pressure = None;
-                    }
-                },
+                }
                 Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => {
-                    if navigating || !over_canvas(*pos) {
+                    if navigating || self.gesture_active || !over_canvas(*pos) {
                         continue;
                     }
                     let c = to_canvas(*pos);
                     if alt {
                         self.pick_color(c);
+                        continue;
+                    }
+                    if !self.doc.active().props.visible {
+                        self.status = "La capa activa está oculta: muéstrala para pintar en ella.".into();
                         continue;
                     }
                     // The first dab waits for a real pressure reading: a pen touching
@@ -710,6 +897,7 @@ impl SharkPaintApp {
                     self.doc.end_stroke();
                     self.pending_start = Some(c);
                     self.press_is_touch = self.touch_active;
+                    self.press_time = now;
                     self.contact_pressure = self.pen_pressure;
                 }
                 Event::PointerMoved(pos) if self.pending_start.is_some() || self.doc.is_stroking() => {
@@ -746,6 +934,13 @@ impl SharkPaintApp {
             }
         }
 
+        // Two fingers move, zoom and rotate the canvas around the point between them.
+        if let Some(touch) = fingers.filter(|_| self.gesture_active) {
+            self.view.pan += touch.translation_delta;
+            self.view.zoom_about(touch.center_pos, touch.zoom_delta, viewport, doc_size);
+            self.view.rotate_about(touch.center_pos, touch.rotation_delta, viewport, doc_size);
+        }
+
         // --- Drawing --------------------------------------------------------
         self.sync_texture(&ctx);
         painter.rect_filled(viewport, 0.0, Color32::from_gray(38));
@@ -773,7 +968,7 @@ impl SharkPaintApp {
         // Brush outline in place of the system cursor.
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
-                ctx.set_cursor_icon(if space { CursorIcon::Grab } else { CursorIcon::Alias });
+                ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
             } else if alt {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else {
@@ -876,14 +1071,29 @@ impl SharkPaintApp {
                 self.doc.redo();
             }
             Command::ClearLayer => self.doc.clear_active_layer(),
+            Command::LayerAdd => self.doc.add_layer(),
+            Command::LayerDuplicate => self.doc.duplicate_layer(),
+            Command::LayerDelete => {
+                self.doc.delete_layer();
+            }
+            Command::LayerMove(up) => {
+                self.doc.move_layer(up);
+            }
+            Command::LayerMerge => {
+                self.doc.merge_down();
+            }
             Command::Fit => self.fit_pending = true,
             Command::ActualSize => {
                 self.view.zoom = 1.0;
                 self.view.pan = Vec2::ZERO;
             }
             Command::Zoom(factor) => self.view.zoom_about(viewport.center(), factor, viewport, doc_size),
-            Command::Rotate(degrees) => self.view.rotate_by(degrees.to_radians(), viewport, doc_size),
-            Command::ResetRotation => self.view.rotate_by(-self.view.rotation, viewport, doc_size),
+            Command::Rotate(degrees) => {
+                self.view.rotate_about(viewport.center(), degrees.to_radians(), viewport, doc_size)
+            }
+            Command::ResetRotation => {
+                self.view.rotate_about(viewport.center(), -self.view.rotation, viewport, doc_size)
+            }
             Command::Flip => self.view.flip = !self.view.flip,
             Command::Quit => self.discarding(Discarding::Quit, ctx),
         }
@@ -906,7 +1116,15 @@ impl eframe::App for SharkPaintApp {
             .resizable(false)
             .default_size(260.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
+                // Brush settings scroll on top; the layer list keeps the bottom.
+                let layers_height = (ui.available_height() * 0.36).clamp(210.0, 340.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("ajustes_pincel")
+                    .max_height(ui.available_height() - layers_height - 8.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.settings_panel(ui));
+                ui.separator();
+                self.layers_panel(ui, &mut commands);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)

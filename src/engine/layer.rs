@@ -64,7 +64,132 @@ impl IRect {
     }
 }
 
+/// How a layer's colours combine with the layers beneath it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    Add,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 7] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Add,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiplicar",
+            BlendMode::Screen => "Trama",
+            BlendMode::Overlay => "Superponer",
+            BlendMode::Darken => "Oscurecer",
+            BlendMode::Lighten => "Aclarar",
+            BlendMode::Add => "Sumar",
+        }
+    }
+
+    /// Stable identifier used in project files.
+    pub fn id(&self) -> u8 {
+        BlendMode::ALL.iter().position(|m| m == self).unwrap() as u8
+    }
+
+    pub fn from_id(id: u8) -> Option<BlendMode> {
+        BlendMode::ALL.get(id as usize).copied()
+    }
+
+    /// Blends two unpremultiplied channel values in 0..=1.
+    fn mix(&self, below: f32, above: f32) -> f32 {
+        match self {
+            BlendMode::Normal => above,
+            BlendMode::Multiply => below * above,
+            BlendMode::Screen => below + above - below * above,
+            BlendMode::Overlay => {
+                if below <= 0.5 {
+                    2.0 * below * above
+                } else {
+                    1.0 - 2.0 * (1.0 - below) * (1.0 - above)
+                }
+            }
+            BlendMode::Darken => below.min(above),
+            BlendMode::Lighten => below.max(above),
+            BlendMode::Add => (below + above).min(1.0),
+        }
+    }
+}
+
+/// Composites `src` at `opacity` (0..=ONE) over `dst` in place. Both are
+/// premultiplied; `dst` may itself be partly transparent.
+pub fn blend_over(dst: &mut [u32; 4], src: Px, opacity: u32, mode: BlendMode) {
+    let sa = (src[3] as u32 * opacity) >> 15;
+    if sa == 0 {
+        return;
+    }
+    if mode == BlendMode::Normal {
+        let keep = ONE - sa;
+        for ch in 0..4 {
+            let s = (src[ch] as u32 * opacity) >> 15;
+            dst[ch] = s + ((dst[ch] * keep + ONE / 2) >> 15);
+        }
+        return;
+    }
+    let one = ONE as f32;
+    let (sa, da) = (sa as f32 / one, dst[3] as f32 / one);
+    let src_alpha = src[3] as f32;
+    for ch in 0..3 {
+        let s = src[ch] as f32 / src_alpha; // unpremultiplied
+        let d_pm = dst[ch] as f32 / one;
+        let d = if da > 0.0 { d_pm / da } else { 0.0 };
+        let out = (1.0 - sa) * d_pm + (1.0 - da) * s * sa + sa * da * mode.mix(d, s);
+        dst[ch] = (out * one).round().clamp(0.0, one) as u32;
+    }
+    dst[3] = ((sa + da - sa * da) * one).round().clamp(0.0, one) as u32;
+    for ch in 0..3 {
+        dst[ch] = dst[ch].min(dst[3]);
+    }
+}
+
+/// Everything about a layer except its pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerProps {
+    pub name: String,
+    pub visible: bool,
+    /// 0..=1.
+    pub opacity: f32,
+    pub blend: BlendMode,
+    /// Painting keeps the layer's existing transparency.
+    pub alpha_lock: bool,
+}
+
+impl LayerProps {
+    pub fn named(name: impl Into<String>) -> Self {
+        LayerProps {
+            name: name.into(),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            alpha_lock: false,
+        }
+    }
+
+    pub fn opacity15(&self) -> u32 {
+        (self.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32
+    }
+}
+
+#[derive(Clone)]
 pub struct Layer {
+    pub props: LayerProps,
     pub width: usize,
     pub height: usize,
     pub tiles_x: usize,
@@ -73,10 +198,17 @@ pub struct Layer {
 }
 
 impl Layer {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize, name: impl Into<String>) -> Self {
         let tiles_x = width.div_ceil(TILE);
         let tiles_y = height.div_ceil(TILE);
-        Layer { width, height, tiles_x, tiles_y, tiles: vec![None; tiles_x * tiles_y] }
+        Layer {
+            props: LayerProps::named(name),
+            width,
+            height,
+            tiles_x,
+            tiles_y,
+            tiles: vec![None; tiles_x * tiles_y],
+        }
     }
 
     pub fn bounds(&self) -> IRect {

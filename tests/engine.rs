@@ -1,4 +1,4 @@
-use sharkpaint::engine::{BrushPreset, BrushSettings, Document, IRect, StrokePoint};
+use sharkpaint::engine::{BlendMode, BrushPreset, BrushSettings, Document, IRect, StrokePoint};
 
 fn hard_brush(size: f32) -> BrushSettings {
     BrushSettings {
@@ -164,7 +164,7 @@ fn project_round_trips_through_the_file_format() {
     assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
     // Full 15-bit precision survives, not just the 8-bit preview.
     for (x, y) in [(150, 100), (60, 60), (240, 140)] {
-        assert_eq!(loaded.layers[0].pixel(x, y), doc.layers[0].pixel(x, y));
+        assert_eq!(loaded.layers()[0].pixel(x, y), doc.layers()[0].pixel(x, y));
     }
     // A loaded project starts with a clean history.
     assert!(!loaded.can_undo());
@@ -196,4 +196,187 @@ fn revision_tracks_pixel_changes() {
     assert_ne!(r0, r1);
     doc.undo();
     assert_ne!(doc.revision(), r1);
+}
+
+#[test]
+fn layers_stack_in_order_and_can_be_hidden() {
+    let mut doc = Document::new(100, 100);
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (10.0, 50.0), (90.0, 50.0));
+    doc.add_layer();
+    assert_eq!((doc.layers().len(), doc.active_layer()), (2, 1));
+    line(&mut doc, &hard_brush(20.0), [0, 0, 255], false, (50.0, 10.0), (50.0, 90.0));
+    assert_eq!(pixel(&doc, 50, 50), [0, 0, 255, 255]); // top layer covers
+    assert_eq!(pixel(&doc, 20, 50), [255, 0, 0, 255]);
+
+    let mut props = doc.active().props.clone();
+    props.visible = false;
+    doc.set_layer_props(1, props, false);
+    assert_eq!(pixel(&doc, 50, 50), [255, 0, 0, 255]);
+    doc.undo();
+    assert_eq!(pixel(&doc, 50, 50), [0, 0, 255, 255]);
+
+    // Moving the blue layer under the red one hides it where they overlap.
+    assert!(doc.move_layer(false));
+    assert_eq!(pixel(&doc, 50, 50), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 50, 15), [0, 0, 255, 255]);
+    assert!(!doc.move_layer(false));
+}
+
+#[test]
+fn layer_opacity_and_blend_modes() {
+    let mut doc = Document::new(100, 100);
+    line(&mut doc, &hard_brush(60.0), [200, 100, 50], false, (10.0, 50.0), (90.0, 50.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(60.0), [100, 200, 250], false, (10.0, 50.0), (90.0, 50.0));
+
+    let set = |doc: &mut Document, opacity: f32, blend: BlendMode| {
+        let mut props = doc.active().props.clone();
+        props.opacity = opacity;
+        props.blend = blend;
+        doc.set_layer_props(1, props, false);
+    };
+    let near = |got: [u8; 4], want: [u8; 3]| {
+        (0..3).all(|i| (got[i] as i32 - want[i] as i32).abs() <= 1)
+    };
+    set(&mut doc, 0.5, BlendMode::Normal);
+    assert!(near(pixel(&doc, 50, 50), [150, 150, 150]), "{:?}", pixel(&doc, 50, 50));
+    set(&mut doc, 1.0, BlendMode::Multiply);
+    assert!(near(pixel(&doc, 50, 50), [78, 78, 49]), "{:?}", pixel(&doc, 50, 50));
+    set(&mut doc, 1.0, BlendMode::Screen);
+    assert!(near(pixel(&doc, 50, 50), [222, 222, 251]), "{:?}", pixel(&doc, 50, 50));
+    set(&mut doc, 1.0, BlendMode::Darken);
+    assert!(near(pixel(&doc, 50, 50), [100, 100, 50]));
+    set(&mut doc, 1.0, BlendMode::Lighten);
+    assert!(near(pixel(&doc, 50, 50), [200, 200, 250]));
+    set(&mut doc, 1.0, BlendMode::Add);
+    assert!(near(pixel(&doc, 50, 50), [255, 255, 255]));
+    // Multiply against bare paper (white) leaves the layer's own colour.
+    set(&mut doc, 1.0, BlendMode::Multiply);
+    doc.set_active_layer(0);
+    doc.clear_active_layer();
+    assert!(near(pixel(&doc, 50, 50), [100, 200, 250]));
+}
+
+#[test]
+fn merge_down_matches_the_stacked_result_and_undoes() {
+    let mut doc = Document::new(120, 120);
+    line(&mut doc, &hard_brush(50.0), [220, 60, 60], false, (10.0, 60.0), (110.0, 60.0));
+    doc.add_layer();
+    line(&mut doc, &BrushPreset::Aerografo.settings(), [40, 90, 200], false, (60.0, 10.0), (60.0, 110.0));
+    let mut props = doc.active().props.clone();
+    props.opacity = 0.7;
+    props.blend = BlendMode::Multiply;
+    doc.set_layer_props(1, props, false);
+    let stacked = doc.render_rgba8(doc.bounds());
+
+    assert!(doc.merge_down());
+    assert_eq!((doc.layers().len(), doc.active_layer()), (1, 0));
+    let merged = doc.render_rgba8(doc.bounds());
+    let worst = stacked.iter().zip(&merged).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(worst <= 1, "merge changed the picture by {worst} levels");
+    assert!(!doc.merge_down()); // nothing beneath the bottom layer
+
+    doc.undo();
+    assert_eq!(doc.layers().len(), 2);
+    assert_eq!(doc.render_rgba8(doc.bounds()), stacked);
+}
+
+#[test]
+fn layer_structure_changes_are_undoable() {
+    let mut doc = Document::new(80, 80);
+    line(&mut doc, &hard_brush(20.0), [0, 0, 0], false, (10.0, 40.0), (70.0, 40.0));
+    let original = doc.render_rgba8(doc.bounds());
+    assert!(!doc.delete_layer()); // the only layer stays
+
+    doc.duplicate_layer();
+    assert_eq!(doc.layers()[1].props.name, "Capa 1 copia");
+    doc.add_layer();
+    assert_eq!(doc.layers()[2].props.name, "Capa 2");
+    doc.set_active_layer(0);
+    assert!(doc.delete_layer());
+    assert_eq!(doc.layers().len(), 2);
+    assert_eq!(doc.render_rgba8(doc.bounds()), original); // the copy still shows it
+
+    for _ in 0..3 {
+        assert!(doc.undo());
+    }
+    assert_eq!(doc.layers().len(), 1);
+    assert_eq!(doc.layers()[0].props.name, "Capa 1");
+    for _ in 0..3 {
+        assert!(doc.redo());
+    }
+    assert_eq!(doc.layers().len(), 2);
+}
+
+#[test]
+fn slider_drags_coalesce_into_one_undo_step() {
+    let mut doc = Document::new(50, 50);
+    for (i, opacity) in [0.9, 0.7, 0.5, 0.3].into_iter().enumerate() {
+        let mut props = doc.active().props.clone();
+        props.opacity = opacity;
+        doc.set_layer_props(0, props, i > 0);
+    }
+    assert_eq!(doc.active().props.opacity, 0.3);
+    doc.undo();
+    assert_eq!(doc.active().props.opacity, 1.0);
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn alpha_lock_paints_only_existing_pixels() {
+    let mut doc = Document::new(100, 100);
+    line(&mut doc, &hard_brush(20.0), [255, 0, 0], false, (10.0, 50.0), (90.0, 50.0));
+    let mut props = doc.active().props.clone();
+    props.alpha_lock = true;
+    doc.set_layer_props(0, props, false);
+    line(&mut doc, &hard_brush(60.0), [0, 0, 255], false, (50.0, 5.0), (50.0, 95.0));
+    assert_eq!(pixel(&doc, 50, 50), [0, 0, 255, 255]); // recoloured inside the old stroke
+    assert_eq!(pixel(&doc, 50, 20), [255, 255, 255, 255]); // nothing outside it
+    assert_eq!(doc.layers()[0].pixel(50, 20), [0; 4]);
+    // The eraser cannot change locked transparency.
+    line(&mut doc, &hard_brush(60.0), [0, 0, 0], true, (50.0, 5.0), (50.0, 95.0));
+    assert_eq!(pixel(&doc, 50, 50), [0, 0, 255, 255]);
+}
+
+#[test]
+fn cancelled_stroke_leaves_no_trace() {
+    let mut doc = Document::new(100, 100);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 20.0), (90.0, 20.0));
+    let before = doc.render_rgba8(doc.bounds());
+    let revision = doc.revision();
+    doc.begin_stroke(&hard_brush(30.0), [255, 0, 0], false, StrokePoint::new(10.0, 60.0, 1.0));
+    doc.stroke_to(StrokePoint::new(90.0, 20.0, 1.0));
+    doc.cancel_stroke();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.revision(), revision);
+    doc.undo(); // undoes the first stroke, not a phantom step
+    assert_eq!(pixel(&doc, 50, 20), [255, 255, 255, 255]);
+}
+
+#[test]
+fn layers_survive_the_file_format() {
+    let mut doc = Document::new(90, 70);
+    line(&mut doc, &hard_brush(30.0), [200, 40, 40], false, (5.0, 35.0), (85.0, 35.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(30.0), [40, 40, 200], false, (45.0, 5.0), (45.0, 65.0));
+    let mut props = doc.active().props.clone();
+    props.name = "Sombras ✦".into();
+    props.opacity = 0.6;
+    props.blend = BlendMode::Multiply;
+    props.alpha_lock = true;
+    doc.set_layer_props(1, props.clone(), false);
+    let mut hidden = doc.layers()[0].props.clone();
+    hidden.visible = false;
+    doc.set_layer_props(0, hidden, false);
+
+    let mut bytes = Vec::new();
+    doc.write_to(&mut bytes).unwrap();
+    let loaded = Document::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(loaded.layers().len(), 2);
+    assert_eq!(loaded.active_layer(), 1);
+    assert!(!loaded.layers()[0].props.visible);
+    let got = &loaded.layers()[1].props;
+    assert_eq!((got.name.as_str(), got.blend, got.alpha_lock), ("Sombras ✦", BlendMode::Multiply, true));
+    assert!((got.opacity - 0.6).abs() < 1e-4);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
 }

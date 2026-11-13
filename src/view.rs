@@ -55,9 +55,8 @@ impl View {
         self.pan += anchor - self.to_screen(under, viewport, doc_size);
     }
 
-    /// Rotates the view around the viewport centre.
-    pub fn rotate_by(&mut self, delta: f32, viewport: Rect, doc_size: Vec2) {
-        let anchor = viewport.center();
+    /// Rotates the view, keeping the canvas point under `anchor` fixed on screen.
+    pub fn rotate_about(&mut self, anchor: Pos2, delta: f32, viewport: Rect, doc_size: Vec2) {
         let under = self.to_canvas(anchor, viewport, doc_size);
         self.rotation = (self.rotation + delta).rem_euclid(std::f32::consts::TAU);
         self.pan += anchor - self.to_screen(under, viewport, doc_size);
@@ -95,5 +94,9 @@ mod tests {
         view.zoom_about(anchor, 2.5, viewport, doc);
         let after = view.to_canvas(anchor, viewport, doc);
         assert!((after - before).length() < 0.01);
+        // So does rotating about it (two-finger rotation pivots between the fingers).
+        view.rotate_about(anchor, 1.1, viewport, doc);
+        let after = view.to_canvas(anchor, viewport, doc);
+        assert!((after - before).length() < 0.02);
     }
 }
