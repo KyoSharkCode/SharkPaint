@@ -17,7 +17,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   aparece según la presión del lápiz.
 - Editor de pinceles con muestra del trazo: tamaño, opacidad, flujo, dureza,
   espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión,
-  variación al azar, textura de papel y mezcla de color. Los pinceles propios se guardan en una biblioteca.
+  variación al azar, textura de papel y mezcla de color. La biblioteca muestra cada
+  pincel con su trazo, agrupado por categorías y con buscador. Los pinceles propios se guardan en una biblioteca.
 - Puntas importadas: cualquier imagen sirve como punta de pincel.
 - Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
