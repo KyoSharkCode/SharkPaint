@@ -6,6 +6,7 @@ mod export;
 mod layer;
 mod project;
 mod stroke;
+mod tools;
 
 pub use brush::{BrushPreset, BrushSettings};
 pub use document::Document;

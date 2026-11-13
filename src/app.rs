@@ -26,6 +26,31 @@ const ROW_HEIGHT: f32 = 46.0;
 enum Tool {
     Pincel,
     Borrador,
+    Difuminar,
+    Relleno,
+    Cuentagotas,
+    Mover,
+}
+
+impl Tool {
+    /// (tool, icon, name, shortcut letter) in tool bar order.
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 6] = [
+        (Tool::Pincel, "pincel", "Pincel", "B"),
+        (Tool::Borrador, "borrador", "Borrador", "E"),
+        (Tool::Difuminar, "difuminar", "Difuminar", "D"),
+        (Tool::Relleno, "relleno", "Relleno", "G"),
+        (Tool::Cuentagotas, "cuentagotas", "Cuentagotas", "I"),
+        (Tool::Mover, "mover", "Mover capa", "V"),
+    ];
+
+    fn name(self) -> &'static str {
+        Tool::ALL.iter().find(|t| t.0 == self).map_or("", |t| t.2)
+    }
+
+    /// The tool paints with a round tip whose size the cursor shows.
+    fn has_tip(self) -> bool {
+        matches!(self, Tool::Pincel | Tool::Borrador | Tool::Difuminar)
+    }
 }
 
 /// Menu and keyboard commands, applied once per frame after the UI is built.
@@ -80,6 +105,15 @@ pub struct SharkPaintApp {
     tool: Tool,
     brush: BrushSettings,
     eraser: BrushSettings,
+    smudge: BrushSettings,
+    /// How different a pixel may be and still be filled (0..=1).
+    fill_tolerance: f32,
+    /// The fill looks at the whole picture rather than only the active layer.
+    fill_all_layers: bool,
+    /// Canvas position where a layer move began.
+    move_origin: Option<Pos2>,
+    /// The eyedropper is being dragged.
+    picking: bool,
     preset: Option<BrushPreset>,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
@@ -140,6 +174,21 @@ impl SharkPaintApp {
             tool: Tool::Pincel,
             brush: BrushPreset::Tinta.settings(),
             eraser,
+            smudge: BrushSettings {
+                size: 60.0,
+                opacity: 1.0,
+                flow: 0.7,
+                hardness: 0.3,
+                spacing: 0.1,
+                smoothing: 0.0,
+                pressure_size: false,
+                pressure_flow: true,
+                min_size: 1.0,
+            },
+            fill_tolerance: 0.15,
+            fill_all_layers: true,
+            move_origin: None,
+            picking: false,
             preset: Some(BrushPreset::Tinta),
             color: [24, 24, 32],
             pen_pressure: None,
@@ -324,8 +373,9 @@ impl SharkPaintApp {
 
     fn active_brush(&mut self) -> &mut BrushSettings {
         match self.tool {
-            Tool::Pincel => &mut self.brush,
             Tool::Borrador => &mut self.eraser,
+            Tool::Difuminar => &mut self.smudge,
+            _ => &mut self.brush,
         }
     }
 
@@ -391,15 +441,22 @@ impl SharkPaintApp {
             if hit(none, Key::F5) {
                 commands.push(Command::ToggleBrushWindow);
             }
-            if hit(none, Key::B) {
-                self.tool = Tool::Pincel;
-            }
-            if hit(none, Key::E) {
-                self.tool = Tool::Borrador;
+            for (tool, key) in [
+                (Tool::Pincel, Key::B),
+                (Tool::Borrador, Key::E),
+                (Tool::Difuminar, Key::D),
+                (Tool::Relleno, Key::G),
+                (Tool::Cuentagotas, Key::I),
+                (Tool::Mover, Key::V),
+            ] {
+                if hit(none, key) {
+                    self.tool = tool;
+                }
             }
             let brush = match self.tool {
-                Tool::Pincel => &mut self.brush,
                 Tool::Borrador => &mut self.eraser,
+                Tool::Difuminar => &mut self.smudge,
+                _ => &mut self.brush,
             };
             if hit(none, Key::OpenBracket) {
                 brush.size = (brush.size / 1.15).max(1.0);
@@ -510,7 +567,8 @@ impl SharkPaintApp {
                 ui.separator();
                 egui::Grid::new("atajos").num_columns(2).show(ui, |ui| {
                     for (keys, what) in [
-                        ("B / E", "Pincel / Borrador"),
+                        ("B / E / D", "Pincel / Borrador / Difuminar"),
+                        ("G / I / V", "Relleno / Cuentagotas / Mover capa"),
                         ("[ / ]", "Tamaño del pincel"),
                         ("F5", "Mostrar u ocultar los ajustes del pincel"),
                         ("Alt + clic", "Tomar color del lienzo"),
@@ -536,10 +594,8 @@ impl SharkPaintApp {
         ui.add_space(4.0);
         let text = ui.visuals().strong_text_color();
         let size = Vec2::splat(ui.available_width());
-        for (tool, name, tip) in [
-            (Tool::Pincel, "pincel", "Pincel (B)\nClic de nuevo: ajustes"),
-            (Tool::Borrador, "borrador", "Borrador (E)\nClic de nuevo: ajustes"),
-        ] {
+        for (tool, name, label, key) in Tool::ALL {
+            let tip = format!("{label} ({key})\nClic de nuevo: ajustes");
             let button = egui::Button::image(icon(name, 20.0, text)).selected(self.tool == tool).min_size(size);
             if ui.add(button).on_hover_text(tip).clicked() {
                 if self.tool == tool {
@@ -573,11 +629,7 @@ impl SharkPaintApp {
     /// Floating, movable window with the settings of the current tool.
     fn brush_window(&mut self, ctx: &egui::Context) {
         let mut open = self.brush_window_open;
-        let title = match self.tool {
-            Tool::Pincel => "Pincel",
-            Tool::Borrador => "Borrador",
-        };
-        egui::Window::new(title)
+        egui::Window::new(self.tool.name())
             .id(egui::Id::unique("ajustes_herramienta"))
             .open(&mut open)
             .collapsible(true)
@@ -602,6 +654,7 @@ impl SharkPaintApp {
     }
 
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
             Tool::Pincel => {
                 ui.strong("Pinceles");
@@ -614,15 +667,32 @@ impl SharkPaintApp {
                     }
                 });
             }
-            Tool::Borrador => {
-                ui.strong("Borrador");
+            Tool::Borrador | Tool::Difuminar => {}
+            Tool::Relleno => {
+                ui.horizontal(|ui| {
+                    ui.label("Tolerancia");
+                    ui.add(egui::Slider::new(&mut self.fill_tolerance, 0.0..=1.0).custom_formatter(percent));
+                });
+                ui.checkbox(&mut self.fill_all_layers, "Tener en cuenta todas las capas")
+                    .on_hover_text("El relleno se detiene en las líneas de cualquier capa visible,\nno solo en las de la capa activa");
+                ui.label("Rellena la capa activa con el color elegido.");
+                return;
+            }
+            Tool::Cuentagotas => {
+                ui.label("Haz clic o arrastra sobre el lienzo para tomar un color.");
+                ui.label("Con cualquier otra herramienta: Alt + clic.");
+                return;
+            }
+            Tool::Mover => {
+                ui.label("Arrastra sobre el lienzo para mover el contenido de la capa activa.");
+                return;
             }
         }
 
         ui.add_space(4.0);
         let before = self.active_brush().clone();
+        let smudging = self.tool == Tool::Difuminar;
         let b = self.active_brush();
-        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Tamaño");
             ui.add(
@@ -632,19 +702,19 @@ impl SharkPaintApp {
                     .suffix(" px"),
             );
             ui.end_row();
-            for (label, value, max) in [
-                ("Opacidad", &mut b.opacity, 1.0),
-                ("Flujo", &mut b.flow, 1.0),
-                ("Dureza", &mut b.hardness, 1.0),
-                ("Espaciado", &mut b.spacing, 1.0),
-                ("Estabilizador", &mut b.smoothing, 0.95),
-            ] {
+            let rows: Vec<(&str, &mut f32, f32, f32)> = if smudging {
+                vec![("Intensidad", &mut b.flow, 0.01, 1.0), ("Dureza", &mut b.hardness, 0.0, 1.0)]
+            } else {
+                vec![
+                    ("Opacidad", &mut b.opacity, 0.01, 1.0),
+                    ("Flujo", &mut b.flow, 0.01, 1.0),
+                    ("Dureza", &mut b.hardness, 0.0, 1.0),
+                    ("Espaciado", &mut b.spacing, 0.01, 1.0),
+                    ("Estabilizador", &mut b.smoothing, 0.0, 0.95),
+                ]
+            };
+            for (label, value, min, max) in rows {
                 ui.label(label);
-                let min = if label == "Espaciado" || label == "Flujo" || label == "Opacidad" {
-                    0.01
-                } else {
-                    0.0
-                };
                 ui.add(egui::Slider::new(value, min..=max).custom_formatter(percent));
                 ui.end_row();
             }
@@ -658,7 +728,7 @@ impl SharkPaintApp {
                 ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
             });
         });
-        ui.checkbox(&mut b.pressure_flow, "Controla el flujo");
+        ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
         if self.tool == Tool::Pincel && self.brush != before {
             // Hand-tuned settings no longer match the preset they started from.
             if self.preset.map(|p| p.settings()) != Some(self.brush.clone()) {
@@ -896,9 +966,12 @@ impl SharkPaintApp {
     }
 
     fn begin_stroke(&mut self, at: Pos2, pressure: f32) {
-        let erase = self.tool == Tool::Borrador;
         let brush = self.active_brush().clone();
-        self.doc.begin_stroke(&brush, self.color, erase, StrokePoint::new(at.x, at.y, pressure));
+        let point = StrokePoint::new(at.x, at.y, pressure);
+        match self.tool {
+            Tool::Difuminar => self.doc.begin_smudge(&brush, point),
+            tool => self.doc.begin_stroke(&brush, self.color, tool == Tool::Borrador, point),
+        }
     }
 
     fn pick_color(&mut self, canvas: Pos2) {
@@ -988,6 +1061,8 @@ impl SharkPaintApp {
                                 if !drawing || now - self.press_time < 0.25 {
                                     self.gesture_active = true;
                                     self.pending_start = None;
+                                    self.move_origin = None;
+                                    self.picking = false;
                                     self.doc.cancel_stroke();
                                 }
                             }
@@ -1026,13 +1101,27 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
-                    if alt {
+                    if alt || self.tool == Tool::Cuentagotas {
                         self.pick_color(c);
+                        self.picking = self.tool == Tool::Cuentagotas;
                         continue;
                     }
                     if !self.doc.active().props.visible {
                         self.status = "La capa activa está oculta: muéstrala para pintar en ella.".into();
                         continue;
+                    }
+                    match self.tool {
+                        Tool::Relleno => {
+                            let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
+                            self.doc.flood_fill(x, y, self.color, self.fill_tolerance, self.fill_all_layers);
+                            continue;
+                        }
+                        Tool::Mover => {
+                            self.doc.begin_layer_move();
+                            self.move_origin = Some(c);
+                            continue;
+                        }
+                        _ => {}
                     }
                     // The first dab waits for a real pressure reading: a pen touching
                     // down reports no pressure at first, and assuming full pressure
@@ -1042,6 +1131,11 @@ impl SharkPaintApp {
                     self.press_is_touch = self.touch_active;
                     self.press_time = now;
                     self.contact_pressure = self.pen_pressure;
+                }
+                Event::PointerMoved(pos) if self.picking => self.pick_color(to_canvas(*pos)),
+                Event::PointerMoved(pos) if self.move_origin.is_some() => {
+                    let delta = to_canvas(*pos) - self.move_origin.unwrap_or_default();
+                    self.doc.move_layer_to(delta.x.round() as i32, delta.y.round() as i32);
                 }
                 Event::PointerMoved(pos) if self.pending_start.is_some() || self.doc.is_stroking() => {
                     let c = to_canvas(*pos);
@@ -1064,6 +1158,8 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
+                    self.picking = false;
+                    self.move_origin = None;
                     // A tap without movement still leaves one dab.
                     if let Some(start) = self.pending_start.take() {
                         let fallback = if self.press_is_touch { 0.0 } else { 1.0 };
@@ -1112,9 +1208,12 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
+            } else if self.tool == Tool::Mover {
+                ctx.set_cursor_icon(CursorIcon::Move);
             } else {
+                debug_assert!(self.tool.has_tip());
                 let radius = self.active_brush().size * 0.5 * self.view.zoom;
                 if radius >= 4.0 {
                     ctx.set_cursor_icon(CursorIcon::None);

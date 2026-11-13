@@ -418,3 +418,99 @@ fn layer_versions_track_pixel_changes_and_ids_stay_unique() {
     doc.set_layer_props(doc.active_layer(), props, false);
     assert_eq!(doc.active().version, v);
 }
+
+#[test]
+fn flood_fill_stays_inside_closed_shapes() {
+    let mut doc = Document::new(200, 200);
+    // A closed square outline.
+    let brush = hard_brush(6.0);
+    for (a, b) in [((50.0, 50.0), (150.0, 50.0)), ((150.0, 50.0), (150.0, 150.0)),
+                   ((150.0, 150.0), (50.0, 150.0)), ((50.0, 150.0), (50.0, 50.0))] {
+        line(&mut doc, &brush, [0, 0, 0], false, a, b);
+    }
+    assert!(doc.flood_fill(100, 100, [255, 0, 0], 0.1, false));
+    assert_eq!(pixel(&doc, 100, 100), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 60, 140), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 20, 20), [255, 255, 255, 255]); // outside untouched
+    assert_eq!(pixel(&doc, 50, 100), [0, 0, 0, 255]); // the outline survives
+    // No light fringe between fill and outline: scanning across the edge never
+    // gets brighter than the fill or the line.
+    for x in 50..100 {
+        let p = pixel(&doc, x, 100);
+        assert!(p[1] < 30 && p[2] < 30, "fringe at x={x}: {p:?}");
+    }
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 100), [255, 255, 255, 255]);
+
+    // Outside the canvas or on a hidden layer nothing happens.
+    assert!(!doc.flood_fill(-5, 10, [0, 0, 255], 0.1, false));
+}
+
+#[test]
+fn flood_fill_can_follow_lines_on_another_layer() {
+    let mut doc = Document::new(200, 200);
+    let brush = hard_brush(6.0);
+    for (a, b) in [((50.0, 50.0), (150.0, 50.0)), ((150.0, 50.0), (150.0, 150.0)),
+                   ((150.0, 150.0), (50.0, 150.0)), ((50.0, 150.0), (50.0, 50.0))] {
+        line(&mut doc, &brush, [0, 0, 0], false, a, b);
+    }
+    doc.add_layer();
+    doc.move_layer(false); // colour layer underneath the line art
+    // Judged on its own, the empty colour layer fills completely.
+    assert!(doc.flood_fill(100, 100, [0, 200, 0], 0.1, false));
+    assert_eq!(doc.layers()[0].pixel(20, 20)[3], 32768);
+    doc.undo();
+    // Looking at all layers, the fill stops at the lines.
+    assert!(doc.flood_fill(100, 100, [0, 200, 0], 0.1, true));
+    assert_eq!(pixel(&doc, 100, 100), [0, 200, 0, 255]);
+    assert_eq!(doc.layers()[0].pixel(20, 20), [0; 4]);
+    assert_eq!(doc.layers().len(), 2);
+}
+
+#[test]
+fn moving_a_layer_shifts_its_pixels_and_undoes() {
+    let mut doc = Document::new(300, 300);
+    line(&mut doc, &hard_brush(20.0), [255, 0, 0], false, (50.0, 50.0), (60.0, 50.0));
+    let before = doc.render_rgba8(doc.bounds());
+    for (dx, dy) in [(37, 81), (64, 128), (-13, 0)] {
+        doc.begin_layer_move();
+        doc.move_layer_to(5, 5); // intermediate drag positions do not accumulate
+        doc.move_layer_to(dx, dy);
+        doc.end_stroke();
+        assert_eq!(pixel(&doc, 55 + dx, 50 + dy), [255, 0, 0, 255], "offset {dx},{dy}");
+        assert_eq!(pixel(&doc, 55, 50), if (dx, dy) == (-13, 0) { [255, 0, 0, 255] } else { [255, 255, 255, 255] });
+        assert!(doc.undo());
+        assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    }
+    // Dragging off the canvas and back loses nothing until the move ends.
+    doc.begin_layer_move();
+    doc.move_layer_to(-500, 0);
+    assert_eq!(doc.layers()[0].tiles.iter().flatten().count(), 0);
+    doc.move_layer_to(0, 0);
+    doc.end_stroke();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    // A move that ends where it began is not a step: undo reaches the stroke itself.
+    doc.undo();
+    assert_eq!(pixel(&doc, 55, 50), [255, 255, 255, 255]);
+    assert!(!doc.can_undo());
+}
+
+#[test]
+fn smudge_drags_paint_and_is_one_undo_step() {
+    let mut doc = Document::new(300, 200);
+    line(&mut doc, &hard_brush(40.0), [0, 0, 255], false, (60.0, 100.0), (80.0, 100.0));
+    assert_eq!(pixel(&doc, 130, 100), [255, 255, 255, 255]);
+    let before = doc.render_rgba8(doc.bounds());
+    let mut finger = hard_brush(40.0);
+    finger.hardness = 0.5;
+    finger.flow = 0.9;
+    doc.begin_smudge(&finger, StrokePoint::new(70.0, 100.0, 1.0));
+    doc.stroke_to(StrokePoint::new(160.0, 100.0, 1.0));
+    doc.end_stroke();
+    let dragged = pixel(&doc, 130, 100);
+    assert!(dragged[2] > dragged[0] + 40, "no blue pulled to the right: {dragged:?}");
+    assert_eq!(pixel(&doc, 150, 30), [255, 255, 255, 255]); // far from the path
+    assert!(doc.undo());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert!(!doc.can_undo() || { doc.undo(); !doc.can_undo() });
+}
