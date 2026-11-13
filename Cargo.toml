@@ -1,6 +1,6 @@
 [package]
 name = "sharkpaint"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Aplicación nativa de dibujo y pintura digital"
 license = "GPL-3.0-only"
