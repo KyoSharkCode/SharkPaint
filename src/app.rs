@@ -248,6 +248,7 @@ enum Command {
     LayerDelete,
     LayerMove(bool),
     LayerMerge,
+    LayerGroup,
     Fit,
     ActualSize,
     Zoom(f32),
@@ -386,6 +387,8 @@ pub struct SharkPaintApp {
     brush_window_open: bool,
     /// The reference panel is showing.
     refs_open: bool,
+    /// The group chosen in the layer list, when a group rather than a layer is.
+    active_group: Option<u64>,
     /// The side panel shows the navigator (a small view of the whole canvas)
     /// in place of the colour picker.
     nav_open: bool,
@@ -490,6 +493,7 @@ impl SharkPaintApp {
             window_hooked: false,
             brush_window_open: true,
             refs_open: false,
+            active_group: None,
             nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
@@ -2093,6 +2097,9 @@ impl SharkPaintApp {
         let active = self.doc.active_layer();
         let text = ui.visuals().strong_text_color();
         let faint = ui.visuals().weak_text_color();
+        // The chosen group, if it still exists.
+        self.active_group = self.active_group.filter(|&id| self.doc.group(id).is_some());
+        let chosen_group = self.active_group;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let tool = |ui: &mut egui::Ui, name: &str, enabled: bool, tip: &str| {
@@ -2106,21 +2113,73 @@ impl SharkPaintApp {
             if tool(ui, "duplicar", true, "Duplicar capa (Ctrl+J)") {
                 commands.push(Command::LayerDuplicate);
             }
-            if tool(ui, "subir", active + 1 < count, "Subir capa") {
-                commands.push(Command::LayerMove(true));
+            if tool(ui, "carpeta", chosen_group.is_none(), "Agrupar: pone la capa en un grupo nuevo") {
+                commands.push(Command::LayerGroup);
             }
-            if tool(ui, "bajar", active > 0, "Bajar capa") {
-                commands.push(Command::LayerMove(false));
-            }
-            if tool(ui, "fusionar", active > 0, "Fusionar con la capa inferior") {
-                commands.push(Command::LayerMerge);
-            }
-            if tool(ui, "quitar", count > 1, "Eliminar capa") {
-                commands.push(Command::LayerDelete);
+            match chosen_group {
+                // A group is chosen: the arrows move all of it.
+                Some(id) => {
+                    if tool(ui, "subir", true, "Subir el grupo") {
+                        self.doc.move_group(id, true);
+                    }
+                    if tool(ui, "bajar", true, "Bajar el grupo") {
+                        self.doc.move_group(id, false);
+                    }
+                    if tool(ui, "quitar", true, "Desagrupar: las capas se quedan") {
+                        self.doc.ungroup(id);
+                        self.active_group = None;
+                    }
+                }
+                None => {
+                    let grouped = self.doc.active().group != 0;
+                    let tip = if grouped { "Subir capa (en el borde del grupo, sale de él)" } else { "Subir capa" };
+                    if tool(ui, "subir", active + 1 < count || grouped, tip) {
+                        commands.push(Command::LayerMove(true));
+                    }
+                    let tip = if grouped { "Bajar capa (en el borde del grupo, sale de él)" } else { "Bajar capa" };
+                    if tool(ui, "bajar", active > 0 || grouped, tip) {
+                        commands.push(Command::LayerMove(false));
+                    }
+                    if tool(ui, "fusionar", active > 0, "Fusionar con la capa inferior") {
+                        commands.push(Command::LayerMerge);
+                    }
+                    if tool(ui, "quitar", count > 1, "Eliminar capa") {
+                        commands.push(Command::LayerDelete);
+                    }
+                }
             }
         });
 
-        // Properties of the active layer.
+        // Properties of the chosen group, or of the active layer.
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        if let Some(before) = chosen_group.and_then(|id| self.doc.group(id).cloned()) {
+            let mut group = before.clone();
+            let mut continuous = false;
+            egui::Grid::new("grupo_activo").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Grupo");
+                let name = ui.add(egui::TextEdit::singleline(&mut group.name).desired_width(150.0));
+                continuous |= name.has_focus();
+                ui.end_row();
+                ui.label("Opacidad");
+                let slider = ui.add(egui::Slider::new(&mut group.opacity, 0.0..=1.0).custom_formatter(percent));
+                continuous |= slider.dragged();
+                ui.end_row();
+            });
+            ui.label("La opacidad y la visibilidad del grupo se aplican a todas sus capas.");
+            if group != before {
+                self.doc.set_group(group, self.prop_edit_active);
+                self.prop_edit_active = continuous;
+            } else if !continuous {
+                self.prop_edit_active = false;
+            }
+        } else {
+            self.active_layer_props(ui, active);
+        }
+        self.layer_list(ui, active, text, faint);
+    }
+
+    /// Name, blend mode, opacity and switches of the active layer.
+    fn active_layer_props(&mut self, ui: &mut egui::Ui, active: usize) {
         let before = self.doc.active().props.clone();
         let mut props = before.clone();
         let mut continuous = false;
@@ -2156,18 +2215,90 @@ impl SharkPaintApp {
         } else if !continuous {
             self.prop_edit_active = false;
         }
+    }
 
+    /// The stack, top layer first: visibility, preview, name. A group shows as
+    /// a heading above its layers, which are set in from the edge.
+    fn layer_list(&mut self, ui: &mut egui::Ui, active: usize, text: Color32, faint: Color32) {
+        let chosen_group = self.active_group;
         ui.add_space(4.0);
-        // The stack, top layer first: visibility, preview, name.
         let mut select = None;
         let mut toggle = None;
+        let mut select_group = None;
+        let mut toggle_group = None;
+        let mut fold_group = None;
         egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, layer) in self.doc.layers().iter().enumerate().rev() {
+            let layers = self.doc.layers();
+            for (i, layer) in layers.iter().enumerate().rev() {
+                let group = self.doc.group(layer.group);
+                // The heading goes above the group's topmost layer.
+                if let Some(group) = group.filter(|g| layers.get(i + 1).is_none_or(|above| above.group != g.id)) {
+                    let ink = if group.visible { text } else { faint };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let (eye, tip) = if group.visible { ("ojo", "Ocultar grupo") } else { ("ojoCerrado", "Mostrar grupo") };
+                        let button = egui::Button::image(icon(eye, 16.0, ink)).frame(false).min_size(Vec2::new(26.0, 26.0));
+                        if ui.add(button).on_hover_text(tip).clicked() {
+                            toggle_group = Some(group.id);
+                        }
+                        let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                        let painter = ui.painter().with_clip_rect(row);
+                        let selected = chosen_group == Some(group.id);
+                        if selected {
+                            painter.rect_filled(row, 4.0, ui.visuals().selection.bg_fill);
+                        } else if response.hovered() {
+                            painter.rect_filled(row, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                        }
+                        let ink = if selected { ui.visuals().selection.stroke.color } else { ink };
+                        // The arrow folds the group; the rest of the row chooses it.
+                        let arrow = Rect::from_min_size(row.min, Vec2::new(20.0, row.height()));
+                        painter.text(
+                            arrow.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if group.collapsed { "▶" } else { "▼" },
+                            egui::FontId::proportional(10.0),
+                            ink,
+                        );
+                        let folder = Rect::from_center_size(Pos2::new(row.left() + 30.0, row.center().y), Vec2::splat(16.0));
+                        icon("carpeta", 16.0, ink).paint_at(ui, folder);
+                        let members = layers.iter().filter(|l| l.group == group.id).count();
+                        let mut label = group.name.clone();
+                        if group.collapsed {
+                            label.push_str(&format!(" ({members})"));
+                        }
+                        if group.opacity < 1.0 {
+                            label.push_str(&format!(" · {:.0} %", group.opacity * 100.0));
+                        }
+                        painter.text(
+                            Pos2::new(row.left() + 44.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(13.0),
+                            ink,
+                        );
+                        if response.clicked() {
+                            let on_arrow = response.interact_pointer_pos().is_some_and(|pos| arrow.contains(pos));
+                            if on_arrow {
+                                fold_group = Some((group.id, !group.collapsed));
+                            } else {
+                                select_group = Some(group.id);
+                            }
+                        }
+                    });
+                }
+                if group.is_some_and(|g| g.collapsed) {
+                    continue;
+                }
                 let props = &layer.props;
-                let ink = if props.visible { text } else { faint };
+                let in_group = group.is_some();
+                let shown = props.visible && group.is_none_or(|g| g.visible);
+                let ink = if shown { text } else { faint };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    if in_group {
+                        ui.add_space(12.0);
+                    }
                     let (eye, tip) = if props.visible {
                         ("ojo", "Ocultar capa")
                     } else {
@@ -2183,7 +2314,7 @@ impl SharkPaintApp {
                     let size = Vec2::new(ui.available_width(), ROW_HEIGHT);
                     let (row, response) = ui.allocate_exact_size(size, Sense::click());
                     let painter = ui.painter().with_clip_rect(row);
-                    let selected = i == active;
+                    let selected = i == active && chosen_group.is_none();
                     if selected {
                         painter.rect_filled(row, 4.0, ui.visuals().selection.bg_fill);
                     } else if response.hovered() {
@@ -2256,6 +2387,17 @@ impl SharkPaintApp {
         }
         if let Some(i) = select {
             self.doc.set_active_layer(i);
+            self.active_group = None;
+        }
+        if let Some(id) = select_group {
+            self.active_group = Some(id);
+        }
+        if let Some((id, collapsed)) = fold_group {
+            self.doc.set_group_collapsed(id, collapsed);
+        }
+        if let Some(mut group) = toggle_group.and_then(|id| self.doc.group(id).cloned()) {
+            group.visible = !group.visible;
+            self.doc.set_group(group, false);
         }
     }
 
@@ -3038,6 +3180,10 @@ impl SharkPaintApp {
             Command::LayerMerge => {
                 self.doc.merge_down();
             }
+            Command::LayerGroup => match self.doc.group_active_layer() {
+                Some(id) => self.active_group = Some(id),
+                None => self.status = "Lleva la capa al borde de su grupo para sacarla a un grupo nuevo.".into(),
+            },
             Command::Fit => self.fit_pending = true,
             Command::ActualSize => {
                 self.view.zoom = 1.0;

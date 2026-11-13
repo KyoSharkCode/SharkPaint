@@ -38,6 +38,20 @@
 //!   size     u32      compressed byte count
 //!   data     zlib stream of width × height RGBA pixels, u8 per channel
 //! ```
+//!
+//! A second optional trailer, after the references if there are any, holds
+//! the layer groups (older readers stop before it and see loose layers):
+//!
+//! ```text
+//! magic      4 bytes  "GRPS"
+//! count      u32      group count
+//! per group:
+//!   name     u32 length + UTF-8 bytes
+//!   flags    u8       bit 0 = visible, bit 1 = folded in the layer list
+//!   opacity  u16      0..=32768
+//! per layer, in file order:
+//!   group    u32      0 = none, otherwise 1 + position in the list above
+//! ```
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -49,7 +63,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use super::document::{Document, ProjectSnapshot, Reference};
-use super::layer::{BlendMode, Layer, Tile, ONE, TILE};
+use super::layer::{BlendMode, Layer, LayerGroup, Tile, ONE, TILE};
 
 /// File extension of SharkPaint projects, without the dot.
 pub const PROJECT_EXTENSION: &str = "spaint";
@@ -60,6 +74,7 @@ const VERSION: u32 = 1;
 const MAX_SIDE: u32 = 32_768;
 const TILE_BYTES: usize = TILE * TILE * 8;
 const REFERENCES_MAGIC: &[u8; 4] = b"REFS";
+const GROUPS_MAGIC: &[u8; 4] = b"GRPS";
 /// Largest reference image side accepted when reading a file.
 const MAX_REFERENCE_SIDE: u32 = 16_384;
 
@@ -160,6 +175,21 @@ impl ProjectSnapshot {
                 w.write_all(&data)?;
             }
         }
+        if !self.groups.is_empty() {
+            w.write_all(GROUPS_MAGIC)?;
+            w.write_all(&(self.groups.len() as u32).to_le_bytes())?;
+            for group in &self.groups {
+                w.write_all(&(group.name.len() as u32).to_le_bytes())?;
+                w.write_all(group.name.as_bytes())?;
+                w.write_all(&[group.visible as u8 | (group.collapsed as u8) << 1])?;
+                let opacity = (group.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u16;
+                w.write_all(&opacity.to_le_bytes())?;
+            }
+            for layer in &self.layers {
+                let place = self.groups.iter().position(|g| g.id == layer.group).map_or(0, |i| i as u32 + 1);
+                w.write_all(&place.to_le_bytes())?;
+            }
+        }
         Ok(())
     }
 }
@@ -250,17 +280,50 @@ impl Document {
             }
             layers.push(layer);
         }
-        // Optional trailer with the reference images.
+        // Optional trailers: reference images, then layer groups.
         let mut references = Vec::new();
-        let mut magic = [0u8; 4];
-        let trailer = match r.read(&mut magic)? {
-            0 => false,
-            n => {
-                r.read_exact(&mut magic[n..])?;
-                &magic == REFERENCES_MAGIC
+        let mut groups: Vec<LayerGroup> = Vec::new();
+        loop {
+            let mut magic = [0u8; 4];
+            match r.read(&mut magic)? {
+                0 => break,
+                n => r.read_exact(&mut magic[n..])?,
             }
-        };
-        if trailer {
+            if &magic == GROUPS_MAGIC && groups.is_empty() {
+                let count = read_u32(r)?;
+                if count > 4096 {
+                    return Err(invalid("lista de grupos no válida"));
+                }
+                for place in 1..=count {
+                    let name_len = read_u32(r)? as usize;
+                    if name_len > 4096 {
+                        return Err(invalid("nombre de grupo no válido"));
+                    }
+                    let mut name = vec![0u8; name_len];
+                    r.read_exact(&mut name)?;
+                    let name = String::from_utf8(name).map_err(|_| invalid("nombre de grupo no válido"))?;
+                    let flags = read_u8(r)?;
+                    let opacity = read_u16(r)?.min(ONE as u16) as f32 / ONE as f32;
+                    groups.push(LayerGroup {
+                        id: place as u64,
+                        name,
+                        visible: flags & 1 != 0,
+                        opacity,
+                        collapsed: flags & 2 != 0,
+                    });
+                }
+                for layer in &mut layers {
+                    let place = read_u32(r)?;
+                    if place > count {
+                        return Err(invalid("grupo de capa no válido"));
+                    }
+                    layer.group = place as u64;
+                }
+                continue;
+            }
+            if &magic != REFERENCES_MAGIC || !references.is_empty() {
+                break; // something this version does not know
+            }
             let count = read_u32(r)?;
             if count > 1024 {
                 return Err(invalid("lista de referencias no válida"));
@@ -285,6 +348,6 @@ impl Document {
                 references.push(Reference { name, width: w as usize, height: h as usize, rgba: Arc::new(rgba) });
             }
         }
-        Ok(Document::from_snapshot(ProjectSnapshot { width, height, paper, layers, active_layer: active, references }))
+        Ok(Document::from_snapshot(ProjectSnapshot { width, height, paper, layers, groups, active_layer: active, references }))
     }
 }

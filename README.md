@@ -23,6 +23,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
+- Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
@@ -53,7 +54,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
-- Grupos de capas.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 

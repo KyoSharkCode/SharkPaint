@@ -1419,3 +1419,126 @@ fn the_magic_wand_selects_by_colour() {
     assert!(!doc.select_similar(-5, 50, 0.1, true, true, SelectMode::Replace));
     assert_eq!(doc.selection_stamp(), stamp);
 }
+
+/// Three stacked layers, bottom first: black, red and blue blocks side by side.
+fn three_layers() -> Document {
+    let mut doc = Document::new(192, 64);
+    line(&mut doc, &hard_brush(40.0), [0, 0, 0], false, (30.0, 32.0), (34.0, 32.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (94.0, 32.0), (98.0, 32.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [0, 0, 255], false, (158.0, 32.0), (162.0, 32.0));
+    doc
+}
+
+#[test]
+fn layer_groups_hide_and_fade_their_layers_together() {
+    let mut doc = three_layers();
+    let names = |doc: &Document| doc.layers().iter().map(|l| (l.props.name.clone(), l.group != 0)).collect::<Vec<_>>();
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().expect("a loose layer can start a group");
+    // The layer above steps down into the group.
+    doc.set_active_layer(2);
+    assert!(doc.move_layer(false));
+    assert_eq!(names(&doc), [("Capa 1".into(), false), ("Capa 2".into(), true), ("Capa 3".into(), true)]);
+    assert_eq!(doc.active_layer(), 2, "joining a group does not reorder");
+
+    let mut group = doc.group(id).unwrap().clone();
+    group.visible = false;
+    doc.set_group(group.clone(), false);
+    assert_eq!(pixel(&doc, 96, 32), [255, 255, 255, 255], "red is hidden with its group");
+    assert_eq!(pixel(&doc, 160, 32), [255, 255, 255, 255], "and so is blue");
+    assert_eq!(pixel(&doc, 32, 32), [0, 0, 0, 255], "the loose layer is not");
+
+    group.visible = true;
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let faded = pixel(&doc, 96, 32);
+    assert!((125..=130).contains(&faded[1]) && faded[0] == 255, "half-strength red over white: {faded:?}");
+
+    // Two undo steps: the fade, then the hiding.
+    doc.undo();
+    assert_eq!(pixel(&doc, 96, 32), [255, 255, 255, 255]);
+    doc.undo();
+    assert_eq!(pixel(&doc, 96, 32), [255, 0, 0, 255]);
+
+    // A layer added inside a group belongs to it; stepping past its edge leaves.
+    doc.add_layer();
+    assert_eq!(doc.layers()[3].group, id);
+    assert!(doc.move_layer(true), "at the top of the stack it can still step out");
+    assert_eq!(doc.layers()[3].group, 0);
+    assert_eq!(doc.active_layer(), 3);
+
+    // Dissolving keeps the layers.
+    assert!(doc.ungroup(id));
+    assert!(doc.groups().is_empty());
+    assert_eq!(doc.layers().len(), 4);
+    doc.undo();
+    assert_eq!(doc.groups().len(), 1);
+    assert_eq!(doc.layers()[1].group, id);
+}
+
+#[test]
+fn layer_groups_move_as_a_block_and_empty_ones_vanish() {
+    let mut doc = three_layers();
+    let order = |doc: &Document| doc.layers().iter().map(|l| l.props.name.clone()).collect::<Vec<_>>();
+    doc.set_active_layer(0);
+    let low = doc.group_active_layer().unwrap();
+    doc.set_active_layer(1);
+    assert!(doc.move_layer(false)); // Capa 2 joins the group under it
+    assert_eq!(doc.layers()[1].group, low);
+
+    assert!(doc.move_group(low, true));
+    assert_eq!(order(&doc), ["Capa 3", "Capa 1", "Capa 2"]);
+    assert_eq!(doc.active().props.name, "Capa 2", "the active layer is followed");
+    assert!(!doc.move_group(low, true), "already at the top");
+    assert!(doc.move_group(low, false));
+    assert_eq!(order(&doc), ["Capa 1", "Capa 2", "Capa 3"]);
+
+    // A second group; the first one steps past all of it at once.
+    doc.set_active_layer(2);
+    let high = doc.group_active_layer().unwrap();
+    assert!(doc.move_group(low, true));
+    assert_eq!(order(&doc), ["Capa 3", "Capa 1", "Capa 2"]);
+    assert_eq!(doc.layers()[0].group, high);
+
+    // A layer in the middle of a group cannot start its own: it would split it.
+    doc.set_active_layer(2);
+    doc.add_layer(); // Capa 4 joins `low`, above Capa 2
+    doc.set_active_layer(2);
+    assert!(doc.group_active_layer().is_none());
+
+    // Deleting a group's last layer removes the group.
+    doc.set_active_layer(0);
+    assert!(doc.delete_layer());
+    assert!(doc.group(high).is_none());
+    assert_eq!(doc.groups().len(), 1);
+}
+
+#[test]
+fn layer_groups_are_saved_with_the_project() {
+    let mut doc = three_layers();
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    doc.set_active_layer(2);
+    doc.move_layer(false);
+    let mut group = doc.group(id).unwrap().clone();
+    group.name = "Color".into();
+    group.opacity = 0.25;
+    group.collapsed = true;
+    doc.set_group(group, false);
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.groups().len(), 1);
+    let group = &loaded.groups()[0];
+    assert_eq!((group.name.as_str(), group.visible, group.collapsed), ("Color", true, true));
+    assert!((group.opacity - 0.25).abs() < 0.001);
+    let member = |i: usize| loaded.layers()[i].group == group.id;
+    assert!(!member(0) && member(1) && member(2));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    // Cut anywhere inside the groups, the file is refused or read without them.
+    for cut in file.len() - 30..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+}
