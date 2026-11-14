@@ -69,6 +69,10 @@ Para la 0.1.4:
 - Arrastrar capas en la lista para reordenarlas y meterlas en grupos.
 - Máscaras de capa: ocultar partes de una capa sin borrarlas.
 - Nombres reales de las fuentes en la herramienta de texto.
+- Simetría más completa: eje horizontal además del vertical, los dos a la vez, y eje
+  que se pueda mover.
+- Voltear el lienzo entero (todas las capas), en horizontal y en vertical, y voltear
+  la vista también en vertical.
 
 Más adelante:
 
