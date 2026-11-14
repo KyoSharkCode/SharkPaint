@@ -1,5 +1,5 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    builtin_papers, builtin_tips, read_abr, read_psd, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
     LayerTransform, Reference, SelectMode, StrokePoint,
 };
 
@@ -1609,4 +1609,63 @@ fn a_layer_group_can_blend_as_one() {
     doc.undo();
     doc.undo();
     assert_eq!(pixel(&doc, 70, 50), [255, 0, 0, 255]);
+}
+
+#[test]
+fn photoshop_documents_round_trip() {
+    // Three layers with a group, blend modes, clipping and a hidden layer.
+    let mut doc = three_layers();
+    doc.paper = [240, 230, 210];
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    doc.set_active_layer(2);
+    doc.move_layer(false);
+    let mut group = doc.group(id).unwrap().clone();
+    group.name = "Color ñ".into();
+    group.opacity = 0.6;
+    group.blend = BlendMode::Multiply;
+    doc.set_group(group, false);
+    let mut props = doc.layers()[2].props.clone();
+    props.blend = BlendMode::Screen;
+    props.opacity = 0.8;
+    props.clip = true;
+    doc.set_layer_props(2, props, false);
+    doc.add_layer();
+    doc.move_layer(true); // out of the group, on top
+    line(&mut doc, &BrushPreset::Aerografo.settings(), [20, 160, 90], false, (20.0, 20.0), (170.0, 50.0));
+    let mut props = doc.layers()[3].props.clone();
+    props.visible = false;
+    props.alpha_lock = true;
+    doc.set_layer_props(3, props, false);
+
+    let mut file = Vec::new();
+    doc.write_psd(&mut file).unwrap();
+    let loaded = read_psd(&file).expect("our own file reads back");
+    assert_eq!((loaded.width, loaded.height), (doc.width, doc.height));
+    // The paper travels as a filled layer and is taken back as the paper.
+    assert_eq!(loaded.paper, [240, 230, 210]);
+    let names: Vec<&str> = loaded.layers().iter().map(|l| l.props.name.as_str()).collect();
+    assert_eq!(names, ["Capa 1", "Capa 2", "Capa 3", "Capa 4"]);
+    assert_eq!(loaded.groups().len(), 1);
+    let group = &loaded.groups()[0];
+    assert_eq!((group.name.as_str(), group.blend, group.visible), ("Color ñ", BlendMode::Multiply, true));
+    assert!((group.opacity - 0.6).abs() < 0.003);
+    let member: Vec<bool> = loaded.layers().iter().map(|l| l.group == group.id).collect();
+    assert_eq!(member, [false, true, true, false]);
+    let top = &loaded.layers()[2].props;
+    assert_eq!((top.blend, top.clip), (BlendMode::Screen, true));
+    assert!((top.opacity - 0.8).abs() < 0.003);
+    let hidden = &loaded.layers()[3].props;
+    assert!(!hidden.visible && hidden.alpha_lock);
+    // The picture is the same to within 8-bit rounding.
+    let (before, after) = (doc.render_rgba8(doc.bounds()), loaded.render_rgba8(loaded.bounds()));
+    let worst = before.iter().zip(&after).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(worst <= 2, "largest difference {worst}");
+
+    // Damaged files are refused, never a crash.
+    assert!(read_psd(b"8BPS").is_err());
+    assert!(read_psd(b"not a photoshop file").is_err());
+    for cut in (0..file.len()).step_by(97) {
+        let _ = read_psd(&file[..cut]);
+    }
 }

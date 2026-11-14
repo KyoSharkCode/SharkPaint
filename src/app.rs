@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
     LayerTransform, Reference, SelectMode, StrokePoint, PROJECT_EXTENSION,
+    read_psd,
 };
 
 use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
@@ -240,6 +241,7 @@ enum Command {
     Save,
     SaveAs,
     ExportPng,
+    ExportPsd,
     Undo,
     Redo,
     ClearLayer,
@@ -533,7 +535,7 @@ impl SharkPaintApp {
         }
         // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
-            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION) || e.eq_ignore_ascii_case("psd")) {
                 app.load_project(path);
             } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
                 app.import_abr(&path);
@@ -726,6 +728,18 @@ impl SharkPaintApp {
     }
 
     fn load_project(&mut self, path: PathBuf) {
+        // A Photoshop document opens as a new, unsaved drawing: saving it
+        // makes a project file and leaves the original alone.
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("psd")) {
+            match std::fs::read(&path).and_then(|data| read_psd(&data)) {
+                Ok(doc) => {
+                    self.status = format!("Abierto desde Photoshop: {}. Al guardar se creará un proyecto de SharkPaint.", path.display());
+                    self.replace_document(doc, None);
+                }
+                Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+            }
+            return;
+        }
         match Document::load(&path) {
             Ok(doc) => {
                 self.status = format!("Abierto: {}", path.display());
@@ -793,8 +807,10 @@ impl SharkPaintApp {
             }
             Discarding::Open => {
                 let picked = rfd::FileDialog::new()
-                    .set_title("Abrir proyecto")
+                    .set_title("Abrir")
+                    .add_filter("Proyectos y documentos de Photoshop", &[PROJECT_EXTENSION, "psd"])
                     .add_filter("Proyecto de SharkPaint", &[PROJECT_EXTENSION])
+                    .add_filter("Documento de Photoshop", &["psd"])
                     .pick_file();
                 if let Some(path) = picked {
                     self.load_project(path);
@@ -1004,6 +1020,9 @@ impl SharkPaintApp {
                 }
                 if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+E")).clicked() {
                     commands.push(Command::ExportPng);
+                }
+                if ui.button("Exportar PSD…").on_hover_text("Documento de Photoshop, con capas y grupos").clicked() {
+                    commands.push(Command::ExportPsd);
                 }
                 ui.separator();
                 if ui.button("Salir").clicked() {
@@ -2685,8 +2704,8 @@ impl SharkPaintApp {
                 continue;
             }
             let on_references = self.pointer_on_references;
-            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
-                self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION) || e.eq_ignore_ascii_case("psd")) {
+                self.status = "Para abrir un proyecto o un documento de Photoshop usa Archivo → Abrir.".into();
             } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
                 self.import_abr(&path);
             } else if on_references {
@@ -3179,6 +3198,36 @@ impl SharkPaintApp {
         };
     }
 
+    /// Writes the drawing as a Photoshop document, layers and groups included.
+    fn export_psd(&mut self) {
+        self.doc.end_stroke();
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map_or("dibujo".to_owned(), |n| n.to_string_lossy().into_owned());
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title("Exportar como documento de Photoshop")
+            .add_filter("Documento de Photoshop", &["psd"])
+            .set_file_name(format!("{name}.psd"))
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("psd");
+        }
+        let written = std::fs::File::create(&path).and_then(|file| {
+            let mut file = std::io::BufWriter::new(file);
+            self.doc.write_psd(&mut file)?;
+            std::io::Write::flush(&mut file)
+        });
+        self.status = match written {
+            Ok(()) => format!("Exportado: {}", path.display()),
+            Err(e) => format!("No se pudo exportar: {e}"),
+        };
+    }
+
     fn run(&mut self, command: Command, ctx: &egui::Context) {
         let viewport = self.viewport;
         let doc_size = self.doc_size();
@@ -3195,6 +3244,7 @@ impl SharkPaintApp {
                 self.save_project(true);
             }
             Command::ExportPng => self.export_png(),
+            Command::ExportPsd => self.export_psd(),
             Command::Undo => {
                 self.doc.undo();
             }

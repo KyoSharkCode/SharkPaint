@@ -20,6 +20,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   variación al azar, textura de papel y mezcla de color. La biblioteca muestra cada
   pincel con su trazo, agrupado por categorías y con buscador. Los pinceles propios se guardan en una biblioteca.
 - Puntas importadas: cualquier imagen sirve como punta de pincel.
+- Documentos de Photoshop (`.psd`): abrir y exportar con capas, grupos, modos de fusión,
+  opacidad, visibilidad y recorte (sin máscaras, capas de ajuste ni efectos).
 - Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
@@ -139,6 +141,7 @@ cargo test
 - `examples/muestra.rs`, `examples/puntas.rs`, `examples/papeles.rs`, `examples/mezcla.rs`:
   generan hojas de muestra de los pinceles, las puntas, los papeles y la mezcla de
   color sin abrir ventana. `examples/abr.rs` lista y dibuja las puntas de un `.abr`.
+  `examples/psd.rs` lista las capas de un `.psd` y lo vuelve a escribir.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
 
 ## Licencia y contribuciones
