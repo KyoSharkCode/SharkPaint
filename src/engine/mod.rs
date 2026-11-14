@@ -9,7 +9,9 @@ mod papers;
 mod project;
 mod psd;
 mod selection;
+mod shapes;
 mod stroke;
+mod text;
 mod tips;
 mod tools;
 
@@ -23,5 +25,7 @@ pub use project::PROJECT_EXTENSION;
 pub use psd::read_psd;
 pub use layer::{BlendMode, IRect, Layer, LayerGroup, LayerProps, Px, Tile, ONE, TILE};
 pub use selection::{SelectMode, Selection};
+pub use shapes::Shape;
 pub use stroke::StrokePoint;
+pub use text::{render_text, TextFont};
 pub use tools::{brush_preview, LayerTransform};

@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, read_psd, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, StrokePoint,
+    builtin_papers, builtin_tips, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, SelectMode, Shape, StrokePoint, TextFont,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -1668,4 +1668,73 @@ fn photoshop_documents_round_trip() {
     for cut in (0..file.len()).step_by(97) {
         let _ = read_psd(&file[..cut]);
     }
+}
+
+#[test]
+fn shapes_are_drawn_with_clean_edges() {
+    let mut doc = Document::new(200, 200);
+    // A filled rectangle covers exactly its box.
+    assert!(doc.draw_shape(Shape::Rectangle, (20.0, 30.0), (80.0, 70.0), [255, 0, 0], 4.0, true, 1.0));
+    assert_eq!(pixel(&doc, 20, 30), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 79, 69), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 19, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 80, 50), [255, 255, 255, 255]);
+    // An outlined one is hollow, with a border of the asked thickness.
+    doc.draw_shape(Shape::Rectangle, (100.0, 30.0), (180.0, 90.0), [0, 0, 255], 6.0, false, 1.0);
+    assert_eq!(pixel(&doc, 100, 60), [0, 0, 255, 255], "on the border");
+    assert_eq!(pixel(&doc, 140, 60), [255, 255, 255, 255], "hollow inside");
+    assert_eq!(pixel(&doc, 104, 60), [255, 255, 255, 255], "three pixels in, past the border");
+    assert_eq!(pixel(&doc, 96, 60), [255, 255, 255, 255], "three pixels out, past the border");
+    // A filled ellipse reaches its box at the middle of each side, not the corners.
+    doc.draw_shape(Shape::Ellipse, (20.0, 110.0), (120.0, 170.0), [0, 0, 0], 1.0, true, 1.0);
+    assert_eq!(pixel(&doc, 70, 140), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 22, 140), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 70, 112), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 23, 113), [255, 255, 255, 255], "the corner of the box is empty");
+    // A line has the asked thickness and round ends.
+    doc.draw_shape(Shape::Line, (140.0, 120.0), (180.0, 160.0), [0, 128, 0], 8.0, false, 1.0);
+    assert_eq!(pixel(&doc, 160, 140), [0, 128, 0, 255]);
+    assert_eq!(pixel(&doc, 170, 130), [255, 255, 255, 255], "well off the line");
+    // Each shape is one undo step, and half opacity is half strength.
+    for _ in 0..4 {
+        assert!(doc.undo());
+    }
+    assert!(!doc.can_undo());
+    doc.draw_shape(Shape::Rectangle, (20.0, 30.0), (80.0, 70.0), [0, 0, 0], 1.0, true, 0.5);
+    let half = pixel(&doc, 50, 50);
+    assert!((126..=129).contains(&half[0]), "{half:?}");
+    // It keeps to the selection, and off the canvas nothing is drawn.
+    doc.select_polygon(&rect_points(0.0, 0.0, 100.0, 200.0));
+    doc.draw_shape(Shape::Line, (20.0, 150.0), (180.0, 150.0), [255, 0, 0], 10.0, false, 1.0);
+    assert_eq!(pixel(&doc, 50, 150), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 150, 150), [255, 255, 255, 255]);
+    assert!(!doc.draw_shape(Shape::Ellipse, (500.0, 500.0), (600.0, 600.0), [0, 0, 0], 2.0, true, 1.0));
+}
+
+#[test]
+fn text_is_drawn_in_the_bundled_font() {
+    let font = TextFont::builtin();
+    let (width, height, rgba) = render_text(&font, "Hola", 40.0, [200, 30, 60]).expect("text with letters");
+    assert_eq!(rgba.len(), width * height * 4);
+    assert!((60..140).contains(&width) && (25..50).contains(&height), "{width} x {height}");
+    assert!(rgba.chunks(4).any(|px| px[3] == 255), "solid ink somewhere");
+    assert!(rgba.chunks(4).all(|px| px[..3] == [200, 30, 60]), "one colour throughout");
+    // The margin around it is empty.
+    assert!(rgba.chunks(4).take(width).all(|px| px[3] == 0));
+    // Twice the size is about twice as big; two lines are about twice as tall.
+    let (big, _, _) = render_text(&font, "Hola", 80.0, [0, 0, 0]).unwrap();
+    assert!((big as f32 / width as f32 - 2.0).abs() < 0.15);
+    let (_, tall, _) = render_text(&font, "Hola\nHola", 40.0, [0, 0, 0]).unwrap();
+    assert!(tall > height * 2 - 4 && tall < height * 3);
+    // Nothing to draw.
+    assert!(render_text(&font, "", 40.0, [0, 0, 0]).is_none());
+    assert!(render_text(&font, "   \n ", 40.0, [0, 0, 0]).is_none());
+    assert!(TextFont::from_bytes("x", b"not a font".to_vec()).is_none());
+    // It goes onto the canvas as a layer of its own, in one undo step.
+    let mut doc = Document::new(300, 120);
+    doc.add_image_layer("Hola", width, height, &rgba, 20, 30);
+    assert_eq!(doc.layers().len(), 2);
+    assert_ne!(doc.render_rgba8(doc.bounds()), Document::new(300, 120).render_rgba8(IRect::new(0, 0, 300, 120)));
+    doc.undo();
+    assert_eq!(doc.layers().len(), 1);
 }

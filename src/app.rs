@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, StrokePoint, PROJECT_EXTENSION,
-    read_psd,
+    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, TextFont, PROJECT_EXTENSION,
+    read_psd, render_text,
 };
 
 use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
@@ -61,11 +61,13 @@ enum Tool {
     Mover,
     Transformar,
     Seleccion,
+    Forma,
+    Texto,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 8] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -74,6 +76,8 @@ impl Tool {
         (Tool::Mover, "mover", "Mover capa", "V"),
         (Tool::Transformar, "transformar", "Transformar", "T"),
         (Tool::Seleccion, "seleccion", "Selección", "S"),
+        (Tool::Forma, "forma", "Formas", "U"),
+        (Tool::Texto, "texto", "Texto", "A"),
     ];
 
     fn name(self) -> &'static str {
@@ -133,7 +137,73 @@ impl SelectShape {
     }
 }
 
-/// A selection being dragged out.
+/// The two ends of a shape dragged from `from` to `to`. `regular` makes
+/// rectangles square, ellipses round and lines snap to steps of 45°.
+fn shape_ends(shape: Figure, from: Pos2, to: Pos2, regular: bool) -> (Pos2, Pos2) {
+    if !regular {
+        return (from, to);
+    }
+    let delta = to - from;
+    match shape {
+        Figure::Line => {
+            let step = std::f32::consts::FRAC_PI_4;
+            let angle = (delta.y.atan2(delta.x) / step).round() * step;
+            (from, from + Vec2::new(angle.cos(), angle.sin()) * delta.length())
+        }
+        _ => {
+            let side = delta.x.abs().max(delta.y.abs());
+            (from, from + Vec2::new(side * delta.x.signum(), side * delta.y.signum()))
+        }
+    }
+}
+
+/// Text rendered for placing on the canvas.
+struct TextPreview {
+    /// Content, size, typeface and colour it was drawn from.
+    key: (String, u32, usize, [u8; 3]),
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    texture: TextureHandle,
+}
+
+/// Font files installed on this computer, by name, sorted.
+fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
+    let mut folders: Vec<PathBuf> = Vec::new();
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    if cfg!(windows) {
+        folders.extend(var("WINDIR").map(|dir| dir.join("Fonts")));
+        folders.extend(var("LOCALAPPDATA").map(|dir| dir.join("Microsoft").join("Windows").join("Fonts")));
+    } else {
+        folders.extend(["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts", "/System/Library/Fonts"].map(PathBuf::from));
+        folders.extend(var("HOME").map(|dir| dir.join(".fonts")));
+        folders.extend(var("HOME").map(|dir| dir.join(".local/share/fonts")));
+        folders.extend(var("HOME").map(|dir| dir.join("Library/Fonts")));
+    }
+    let mut found: Vec<(String, Option<PathBuf>)> = Vec::new();
+    // Folders nest a few levels deep on some systems.
+    let mut pending: Vec<(PathBuf, u32)> = folders.into_iter().map(|dir| (dir, 0)).collect();
+    while let Some((dir, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 {
+                    pending.push((path, depth + 1));
+                }
+                continue;
+            }
+            let is_font = path.extension().is_some_and(|e| ["ttf", "otf", "ttc"].iter().any(|kind| e.eq_ignore_ascii_case(kind)));
+            if let (true, Some(name)) = (is_font, path.file_stem()) {
+                found.push((name.to_string_lossy().into_owned(), Some(path)));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
+}
+
+/// A selection or a shape being dragged out.
 struct SelectDrag {
     from: Pos2,
     to: Pos2,
@@ -317,6 +387,25 @@ pub struct SharkPaintApp {
     xform_empty: Option<(u64, u64, u64)>,
     select_shape: SelectShape,
     select_drag: Option<SelectDrag>,
+    /// The shape tool: which shape, filled or outlined, how thick and how strong.
+    shape_kind: Figure,
+    shape_filled: bool,
+    shape_width: f32,
+    shape_opacity: f32,
+    /// The text tool: what to write, how tall, and in which typeface.
+    text_content: String,
+    text_size: f32,
+    /// Typefaces on offer: the bundled one first, then those installed.
+    text_fonts: Option<Vec<(String, Option<PathBuf>)>>,
+    text_font_index: usize,
+    /// The typeface in use, with its place in the list.
+    text_font: Option<(usize, TextFont)>,
+    /// Where on the canvas the text's top-left corner goes, once chosen.
+    text_anchor: Option<Pos2>,
+    /// The pointer is moving the text about.
+    text_dragging: bool,
+    /// The text as drawn, with what it was drawn from.
+    text_preview: Option<TextPreview>,
     /// How a new selection combines with the current one.
     select_mode: SelectMode,
     /// How far a colour may be from the one clicked for the magic wand to take it.
@@ -457,6 +546,18 @@ impl SharkPaintApp {
             xform_empty: None,
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
+            shape_kind: Figure::Rectangle,
+            shape_filled: false,
+            shape_width: 6.0,
+            shape_opacity: 1.0,
+            text_content: String::new(),
+            text_size: 96.0,
+            text_fonts: None,
+            text_font_index: 0,
+            text_font: None,
+            text_anchor: None,
+            text_dragging: false,
+            text_preview: None,
             select_mode: SelectMode::Replace,
             select_tolerance: 0.15,
             select_contiguous: true,
@@ -1903,6 +2004,106 @@ impl SharkPaintApp {
         ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
     }
 
+    /// Loads the chosen typeface if it is not the one in hand. A file that
+    /// cannot be used falls back to the bundled typeface.
+    fn text_font(&mut self) -> &TextFont {
+        let index = self.text_font_index;
+        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != index) {
+            let entry = self.text_fonts.as_ref().and_then(|fonts| fonts.get(index)).cloned();
+            let font = entry
+                .and_then(|(name, path)| TextFont::from_bytes(name, std::fs::read(path?).ok()?))
+                .unwrap_or_else(TextFont::builtin);
+            self.text_font = Some((index, font));
+        }
+        &self.text_font.as_ref().expect("just loaded").1
+    }
+
+    /// Redraws the text waiting to be placed when what it shows has changed.
+    fn sync_text_preview(&mut self, ctx: &egui::Context) {
+        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_index, self.color);
+        if self.text_preview.as_ref().is_some_and(|preview| preview.key == key) {
+            return;
+        }
+        let (size, color, content) = (self.text_size, self.color, self.text_content.clone());
+        self.text_preview = render_text(self.text_font(), &content, size, color).map(|(width, height, rgba)| {
+            let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+            let texture = ctx.load_texture("texto", image, TextureOptions::LINEAR);
+            TextPreview { key: key.clone(), width, height, rgba, texture }
+        });
+        if self.text_preview.is_none() && !self.text_content.trim().is_empty() && self.text_anchor.is_some() {
+            self.status = "El texto es demasiado grande para dibujarlo; reduce el tamaño.".into();
+        }
+    }
+
+    /// Puts the text on the canvas as a layer of its own.
+    fn place_text(&mut self, ctx: &egui::Context) {
+        self.sync_text_preview(ctx);
+        let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) else { return };
+        let name: String = self.text_content.lines().next().unwrap_or("Texto").chars().take(24).collect();
+        self.doc.add_image_layer(name.trim(), preview.width, preview.height, &preview.rgba, anchor.x as i32, anchor.y as i32);
+        self.note_color();
+        self.text_anchor = None;
+        self.status = "Texto colocado en una capa nueva. Muévelo o transfórmalo como cualquier capa.".into();
+    }
+
+    /// What to write, in which typeface and how tall.
+    fn text_panel(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(248.0);
+        let fonts = self.text_fonts.get_or_insert_with(|| {
+            let mut fonts = vec![("Ubuntu Light (incluida)".to_owned(), None)];
+            fonts.extend(installed_fonts());
+            fonts
+        });
+        self.text_font_index = self.text_font_index.min(fonts.len() - 1);
+        ui.add(
+            egui::TextEdit::multiline(&mut self.text_content)
+                .hint_text("Escribe aquí el texto")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        egui::Grid::new("texto").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Fuente");
+            let fonts = self.text_fonts.as_ref().expect("filled above");
+            egui::ComboBox::from_id_salt("fuente_texto")
+                .selected_text(fonts[self.text_font_index].0.as_str())
+                .width(170.0)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    for (i, (name, _)) in fonts.iter().enumerate() {
+                        ui.selectable_value(&mut self.text_font_index, i, name);
+                    }
+                });
+            ui.end_row();
+            ui.label("Tamaño");
+            ui.add(egui::Slider::new(&mut self.text_size, 8.0..=1000.0).logarithmic(true).fixed_decimals(0).suffix(" px"));
+            ui.end_row();
+        });
+        let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+                self.place_text(ui.ctx());
+            }
+            if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+                self.text_anchor = None;
+            }
+        });
+        ui.label(if self.text_anchor.is_some() {
+            "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
+        } else {
+            "Haz clic en el lienzo donde quieras el texto."
+        });
+        ui.label("Al colocarlo queda en una capa nueva, como imagen: después no se puede reescribir.");
+        // Shortcuts work while typing too.
+        let (place, cancel) = ui.input(|i| {
+            (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
+        });
+        if place && ready {
+            self.place_text(ui.ctx());
+        } else if cancel {
+            self.text_anchor = None;
+        }
+    }
+
     /// How much the brush mixes with the paint already on the canvas.
     fn mix_settings(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
@@ -1949,6 +2150,37 @@ impl SharkPaintApp {
             }
             Tool::Transformar => {
                 self.transform_panel(ui);
+                return;
+            }
+            Tool::Forma => {
+                ui.set_width(248.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (shape, name) in [(Figure::Line, "Línea"), (Figure::Rectangle, "Rectángulo"), (Figure::Ellipse, "Elipse")] {
+                        ui.selectable_value(&mut self.shape_kind, shape, name);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add_enabled_ui(self.shape_kind != Figure::Line, |ui| {
+                    ui.checkbox(&mut self.shape_filled, "Rellena").on_hover_text("Desmarcado, dibuja solo el contorno");
+                });
+                let outlined = self.shape_kind == Figure::Line || !self.shape_filled;
+                egui::Grid::new("forma").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Grosor");
+                    ui.add_enabled(
+                        outlined,
+                        egui::Slider::new(&mut self.shape_width, 1.0..=200.0).logarithmic(true).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                    ui.label("Opacidad");
+                    ui.add(egui::Slider::new(&mut self.shape_opacity, 0.01..=1.0).custom_formatter(percent));
+                    ui.end_row();
+                });
+                ui.label("Arrastra sobre el lienzo para dibujar con el color elegido.");
+                ui.label("Mayús: cuadrado, círculo o línea a 45°.");
+                return;
+            }
+            Tool::Texto => {
+                self.text_panel(ui);
                 return;
             }
             Tool::Seleccion => {
@@ -2855,6 +3087,12 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
+                    if self.tool == Tool::Texto && !alt {
+                        // Press to put the text there; keep holding to move it.
+                        self.text_anchor = Some(c.round());
+                        self.text_dragging = true;
+                        continue;
+                    }
                     if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
                         let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
                         self.doc.select_similar(
@@ -2867,7 +3105,7 @@ impl SharkPaintApp {
                         );
                         continue;
                     }
-                    if self.tool == Tool::Seleccion && !alt {
+                    if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
                         self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
                         continue;
                     }
@@ -2929,6 +3167,7 @@ impl SharkPaintApp {
                     }
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
+                Event::PointerMoved(pos) if self.text_dragging => self.text_anchor = Some(to_canvas(*pos).round()),
                 Event::PointerMoved(pos) if self.select_drag.is_some() => {
                     if let Some(drag) = &mut self.select_drag {
                         drag.to = to_canvas(*pos);
@@ -2962,6 +3201,10 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
+                    if self.text_dragging {
+                        self.text_dragging = false;
+                        continue;
+                    }
                     if self.tool == Tool::Transformar {
                         // The transform stays open between drags; only the drag ends.
                         if let Some(xform) = &mut self.xform {
@@ -2970,6 +3213,22 @@ impl SharkPaintApp {
                         continue;
                     }
                     if let Some(drag) = self.select_drag.take() {
+                        if self.tool == Tool::Forma {
+                            if drag.moved {
+                                let (from, to) = shape_ends(self.shape_kind, drag.from, drag.to, free);
+                                self.doc.draw_shape(
+                                    self.shape_kind,
+                                    (from.x, from.y),
+                                    (to.x, to.y),
+                                    self.color,
+                                    self.shape_width,
+                                    self.shape_filled,
+                                    self.shape_opacity,
+                                );
+                                self.note_color();
+                            }
+                            continue;
+                        }
                         if drag.moved {
                             let outline = self.select_shape.outline(drag.from, drag.to, &drag.trail, free);
                             self.doc.select_polygon_with(&outline, self.select_mode);
@@ -3073,7 +3332,35 @@ impl SharkPaintApp {
             painter.add(Shape::line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
             painter.extend(Shape::dashed_line(&points, Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
         };
-        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
+        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved && self.tool == Tool::Forma) {
+            // The shape being dragged out, as it will be drawn.
+            let (from, to) = shape_ends(self.shape_kind, drag.from, drag.to, free);
+            let screen = |p: Pos2| self.view.to_screen(p, viewport, doc_size);
+            let ink = Color32::from_rgb(self.color[0], self.color[1], self.color[2]).gamma_multiply(self.shape_opacity);
+            let stroke = Stroke::new((self.shape_width * self.view.zoom).max(1.0), ink);
+            let rect = Rect::from_two_pos(from, to);
+            let points: Vec<Pos2> = match self.shape_kind {
+                Figure::Line => vec![screen(from), screen(to)],
+                Figure::Rectangle => [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()].map(screen).to_vec(),
+                Figure::Ellipse => (0..72)
+                    .map(|i| {
+                        let a = i as f32 / 72.0 * std::f32::consts::TAU;
+                        screen(rect.center() + Vec2::new(rect.width() * 0.5 * a.cos(), rect.height() * 0.5 * a.sin()))
+                    })
+                    .collect(),
+            };
+            match self.shape_kind {
+                Figure::Line => {
+                    painter.line_segment([points[0], points[1]], stroke);
+                }
+                _ if self.shape_filled => {
+                    painter.add(Shape::convex_polygon(points, ink, Stroke::NONE));
+                }
+                _ => {
+                    painter.add(Shape::closed_line(points, stroke));
+                }
+            }
+        } else if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
             dashed(&self.select_shape.outline(drag.from, drag.to, &drag.trail, free));
         }
         if let Some(selection) = self.doc.selection() {
@@ -3095,6 +3382,30 @@ impl SharkPaintApp {
             }
         }
 
+        // Text waiting to be placed, shown where it will go.
+        if self.tool == Tool::Texto {
+            self.sync_text_preview(&ctx);
+            if let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) {
+                let size = Vec2::new(preview.width as f32, preview.height as f32);
+                let corners = [Vec2::ZERO, Vec2::new(size.x, 0.0), size, Vec2::new(0.0, size.y)]
+                    .map(|offset| self.view.to_screen(anchor + offset, viewport, doc_size));
+                let mut mesh = Mesh::with_texture(preview.texture.id());
+                for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
+                    mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                }
+                mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+                painter.add(Shape::mesh(mesh));
+                let mut outline = corners.to_vec();
+                outline.push(corners[0]);
+                painter.extend(Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_rgb(111, 227, 240)), 5.0, 5.0));
+            } else if let Some(anchor) = self.text_anchor {
+                // Nothing written yet: a mark where the text will start.
+                let at = self.view.to_screen(anchor, viewport, doc_size);
+                let height = (self.text_size * self.view.zoom).max(8.0);
+                painter.line_segment([at, at + Vec2::new(0.0, height)], Stroke::new(1.5, Color32::from_rgb(111, 227, 240)));
+            }
+        }
+
         // The transform box: outline and corner handles.
         if let Some(xform) = &self.xform {
             let points: Vec<Pos2> = xform.corners().iter().map(|c| self.view.to_screen(*c, viewport, doc_size)).collect();
@@ -3111,7 +3422,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion) {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);

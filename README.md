@@ -41,6 +41,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   puede sumar, restar, intersecar e invertir: pintar, borrar, rellenar, transformar y
   voltear afectan solo a lo seleccionado. Los cambios de selección se deshacen.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Formas: líneas, rectángulos y elipses, rellenas o de contorno.
+- Texto con la fuente incluida o las instaladas en el equipo; se coloca como capa.
 - Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
@@ -70,6 +72,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
+| `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
+| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela) |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |
@@ -136,6 +140,8 @@ cargo test
 - `src/settings.rs`: preferencias guardadas entre sesiones y archivo de recuperación.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
+- `src/engine/shapes.rs`, `src/engine/text.rs`: formas básicas y texto.
+- `src/engine/psd.rs`, `src/engine/abr.rs`: documentos y pinceles de Photoshop.
 - `src/engine/selection.rs`: máscara de selección.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
 - `examples/muestra.rs`, `examples/puntas.rs`, `examples/papeles.rs`, `examples/mezcla.rs`:

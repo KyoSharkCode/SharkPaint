@@ -16,12 +16,12 @@ pub(super) struct TileEdit {
 }
 
 impl TileEdit {
-    fn tile_mut<'a>(&mut self, layer: &'a mut Layer, idx: usize) -> &'a mut Tile {
+    pub(super) fn tile_mut<'a>(&mut self, layer: &'a mut Layer, idx: usize) -> &'a mut Tile {
         self.saved.entry(idx).or_insert_with(|| layer.tiles[idx].clone());
         Arc::make_mut(layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())))
     }
 
-    fn into_saved(self) -> Vec<(usize, Option<Arc<Tile>>)> {
+    pub(super) fn into_saved(self) -> Vec<(usize, Option<Arc<Tile>>)> {
         self.saved.into_iter().collect()
     }
 
