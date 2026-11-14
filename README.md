@@ -66,9 +66,14 @@ Para la 0.1.4:
 - Texto editable: una capa de texto sigue siendo texto (se puede reescribir, cambiar
   de fuente y de tamaño) hasta que se convierte en imagen.
 - Redimensionar y recortar el lienzo.
+- Arrastrar capas en la lista para reordenarlas y meterlas en grupos.
+- Máscaras de capa: ocultar partes de una capa sin borrarlas.
+- Nombres reales de las fuentes en la herramienta de texto.
 
 Más adelante:
 
+- Abrir y guardar `.ora` y `.kra`.
+- Importar papeles propios para la textura de los pinceles.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
