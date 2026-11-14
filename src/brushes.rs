@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
+    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, PaperTexture, TipImage,
 };
 
 use crate::settings::config_dir;
@@ -22,6 +22,8 @@ const MAX_TIP_SIDE: u32 = 256;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Brush {
     pub name: String,
+    /// Group the brush is listed under.
+    pub category: String,
     pub settings: BrushSettings,
 }
 
@@ -92,13 +94,14 @@ impl BrushLibrary {
     pub fn default_brushes(&self) -> Vec<Brush> {
         let mut brushes: Vec<Brush> = BrushPreset::ALL
             .iter()
-            .map(|preset| Brush { name: preset.name().to_owned(), settings: preset.settings() })
+            .map(|preset| Brush { name: preset.name().to_owned(), category: String::new(), settings: preset.settings() })
             .collect();
         // The pencil drags over fine paper.
         brushes[0].settings.paper = self.paper("fino");
         brushes[0].settings.grain = 0.75;
         let shaped = |name: &str, tip: &str, settings: BrushSettings| Brush {
             name: name.to_owned(),
+            category: String::new(),
             settings: BrushSettings { tip: self.tip(tip), ..settings },
         };
         brushes.extend([
@@ -253,6 +256,9 @@ impl BrushLibrary {
                 ..BrushSettings::round(40.0)
             }),
         ]);
+        for brush in &mut brushes {
+            brush.category = default_category(&brush.name).to_owned();
+        }
         brushes
     }
 
@@ -263,6 +269,7 @@ impl BrushLibrary {
             text.push_str("[pincel]\n");
             let mut put = |key: &str, value: String| text.push_str(&format!("{key}={value}\n"));
             put("nombre", brush.name.replace('\n', " "));
+            put("categoria", brush.category.replace('\n', " "));
             put("tamano", s.size.to_string());
             put("opacidad", s.opacity.to_string());
             put("flujo", s.flow.to_string());
@@ -284,6 +291,7 @@ impl BrushLibrary {
             put("escala_grano", s.grain_scale.to_string());
             put("mezcla", s.mix.to_string());
             put("arrastre", s.drag.to_string());
+            put("fusion", s.blend.id().to_string());
         }
         text
     }
@@ -293,7 +301,7 @@ impl BrushLibrary {
         let mut brushes: Vec<Brush> = Vec::new();
         for line in text.lines() {
             if line.trim() == "[pincel]" {
-                brushes.push(Brush { name: "Pincel".into(), settings: BrushSettings::round(20.0) });
+                brushes.push(Brush { name: "Pincel".into(), category: String::new(), settings: BrushSettings::round(20.0) });
                 continue;
             }
             let (Some(brush), Some((key, value))) = (brushes.last_mut(), line.split_once('=')) else { continue };
@@ -302,12 +310,14 @@ impl BrushLibrary {
             let flag = value.trim() == "1";
             match (key.trim(), number) {
                 ("nombre", _) => brush.name = value.trim().to_owned(),
+                ("categoria", _) => brush.category = value.trim().to_owned(),
                 ("punta", _) => s.tip = self.tip(value.trim()),
                 ("papel", _) => s.paper = self.paper(value.trim()),
                 ("grano", Some(v)) => s.grain = v.clamp(0.0, 1.0),
                 ("escala_grano", Some(v)) => s.grain_scale = v.clamp(0.1, 16.0),
                 ("mezcla", Some(v)) => s.mix = v.clamp(0.0, 1.0),
                 ("arrastre", Some(v)) => s.drag = v.clamp(0.0, 1.0),
+                ("fusion", Some(v)) => s.blend = BlendMode::from_id(v as u8).unwrap_or(BlendMode::Normal),
                 ("presion_tamano", _) => s.pressure_size = flag,
                 ("presion_flujo", _) => s.pressure_flow = flag,
                 ("seguir_direccion", _) => s.follow_direction = flag,
@@ -325,6 +335,10 @@ impl BrushLibrary {
                 ("redondez", Some(v)) => s.roundness = v.clamp(0.02, 1.0),
                 _ => {}
             }
+        }
+        // Libraries saved before brushes had groups.
+        for brush in brushes.iter_mut().filter(|b| b.category.is_empty()) {
+            brush.category = default_category(&brush.name).to_owned();
         }
         brushes
     }
@@ -350,41 +364,51 @@ impl BrushLibrary {
         self.store_tip(&stem, w, h, &coverage).map(|(tip, _)| tip)
     }
 
-    /// Reads a Photoshop brush file and adds a brush for each tip drawn in it.
-    /// Returns how many were added. Only the shape, size, spacing, angle and
-    /// roundness carry over; Photoshop's dynamics have no equivalent here.
+    /// Reads a Photoshop brush file and adds each of its brushes. Returns how
+    /// many were added. The shape, size, hardness, spacing, angle, roundness
+    /// and the pressure switches carry over; the rest of Photoshop's dynamics
+    /// have no equivalent here.
     pub fn import_abr(&mut self, path: &Path) -> Result<usize, String> {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let file = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "abr".into());
+        let file = path.file_stem().map(|s| s.to_string_lossy().replace('_', " ")).unwrap_or_else(|| "abr".into());
         let mut added = 0;
         for (i, brush) in read_abr(&data)?.into_iter().enumerate() {
             let name = match &brush.name {
                 Some(name) => name.clone(),
                 None => format!("{file} {}", i + 1),
             };
-            // The number keeps tips with the same name in one file apart.
-            let stem = format!("{file} {:03} {name}", i + 1);
-            let Ok((tip, side)) = self.store_tip(&stem, brush.width, brush.height, &brush.coverage) else {
-                continue; // an empty picture
+            let size = brush.diameter.filter(|d| *d > 0.0);
+            let (tip, size, hardness) = if brush.is_round() {
+                (BrushTip::Round, size.unwrap_or(20.0), brush.hardness.unwrap_or(1.0))
+            } else {
+                // The number keeps tips with the same name in one file apart.
+                let stem = format!("{file} {:03} {name}", i + 1);
+                let Ok((tip, side)) = self.store_tip(&stem, brush.width, brush.height, &brush.coverage) else {
+                    continue; // an empty picture
+                };
+                (BrushTip::Image(tip), size.unwrap_or(side as f32), 1.0)
             };
-            let size = brush.diameter.unwrap_or(side as f32).clamp(4.0, 500.0);
             let settings = BrushSettings {
-                tip: BrushTip::Image(tip),
+                tip,
+                hardness: hardness.clamp(0.0, 1.0),
                 spacing: brush.spacing.unwrap_or(0.25).clamp(0.02, 5.0),
                 angle: brush.angle.unwrap_or(0.0).clamp(-360.0, 360.0),
                 roundness: brush.roundness.unwrap_or(1.0).clamp(0.02, 1.0),
+                pressure_size: brush.pressure_size,
+                min_size: brush.min_size.unwrap_or(0.0).clamp(0.0, 1.0),
+                pressure_flow: brush.pressure_flow,
                 smoothing: 0.2,
-                ..BrushSettings::round(size)
+                ..BrushSettings::round(size.clamp(1.0, 500.0))
             };
             // Importing a file again replaces its brushes rather than doubling them.
             match self.brushes.iter_mut().find(|b| b.name == name && b.settings.tip == settings.tip) {
                 Some(existing) => existing.settings = settings,
-                None => self.brushes.push(Brush { name, settings }),
+                None => self.brushes.push(Brush { name, category: file.clone(), settings }),
             }
             added += 1;
         }
         if added == 0 {
-            return Err("el archivo no contiene puntas que se puedan usar".into());
+            return Err("el archivo no contiene pinceles que se puedan usar".into());
         }
         Ok(added)
     }
@@ -430,6 +454,20 @@ impl BrushLibrary {
         self.tips.retain(|t| t.id != tip.id);
         self.tips.push(tip.clone());
         Ok((tip, side))
+    }
+}
+
+/// Group for brushes the user makes.
+pub const OWN_CATEGORY: &str = "Mis pinceles";
+
+/// The group a brush belongs to when none was saved with it.
+fn default_category(name: &str) -> &'static str {
+    match name {
+        "Lápiz" | "Tinta" | "Marcador" | "Aerógrafo" | "Pluma" | "Caligrafía" => "Básicos",
+        "Carboncillo" | "Pincel seco" | "Pastel" | "Crayón" | "Tiza" => "Técnicas en seco",
+        "Óleo" | "Acuarela" | "Difuminador" | "Dedo" => "Mezcla",
+        "Cabello" | "Salpicadura" | "Hojas" | "Estrellas" => "Efectos",
+        _ => OWN_CATEGORY,
     }
 }
 
@@ -499,6 +537,7 @@ mod tests {
         // A brush using it survives saving and a fresh start.
         library.brushes = vec![Brush {
             name: "Mío".into(),
+            category: "Pruebas".into(),
             settings: BrushSettings { tip: BrushTip::Image(tip.clone()), ..BrushSettings::round(30.0) },
         }];
         library.save();

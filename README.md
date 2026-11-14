@@ -17,10 +17,18 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   aparece según la presión del lápiz.
 - Editor de pinceles con muestra del trazo: tamaño, opacidad, flujo, dureza,
   espaciado, estabilizador, forma de la punta, ángulo, redondez, dispersión,
-  variación al azar, textura de papel y mezcla de color. Los pinceles propios se guardan en una biblioteca.
+  variación al azar, textura de papel y mezcla de color. La biblioteca muestra cada
+  pincel con su trazo, agrupado por categorías y con buscador. Los pinceles propios se guardan en una biblioteca.
 - Puntas importadas: cualquier imagen sirve como punta de pincel.
-- Pinceles de Photoshop: importa archivos `.abr` (forma de la punta, nombre, tamaño,
-  espaciado, ángulo y redondez). Las dinámicas de Photoshop no se trasladan.
+- Documentos de Photoshop (`.psd`): abrir y exportar con capas, grupos, modos de fusión,
+  opacidad, visibilidad y recorte (sin máscaras, capas de ajuste ni efectos).
+- Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
+  los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
+  controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
+- Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
+  con modo de fusión propio.
+- Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
+  sobre lo que ya hay en la capa.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
   bloqueo de transparencia y modos de fusión (Normal, Multiplicar, Trama, Superponer,
   Oscurecer, Aclarar y Sumar). Cada capa muestra una miniatura de su contenido.
@@ -29,9 +37,14 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Herramientas: borrador, difuminar, relleno (con tolerancia y detección de líneas en
   todas las capas), cuentagotas, mover capa y transformar (escalar y rotar con una
   caja sobre el lienzo).
-- Selección rectangular, elíptica o de forma libre: pintar, borrar, rellenar,
-  transformar y voltear afectan solo a lo seleccionado.
+- Selección rectangular, elíptica, de forma libre o por color (varita mágica), que se
+  puede sumar, restar, intersecar e invertir: pintar, borrar, rellenar, transformar y
+  voltear afectan solo a lo seleccionado. Los cambios de selección se deshacen.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Formas: líneas, rectángulos y elipses, rellenas o de contorno.
+- Texto con la fuente incluida o las instaladas en el equipo; se coloca como capa.
+- Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
+  un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
@@ -48,8 +61,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
-- Grupos de capas.
-- Sumar y restar selecciones, y deshacer los cambios de selección.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
@@ -61,7 +72,10 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `G` / `I` / `V` | Relleno / Cuentagotas / Mover capa |
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
+| `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
+| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela) |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
+| `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |
 | `[` / `]` | Reducir / aumentar el tamaño del pincel |
 | `Alt` + clic | Tomar color del lienzo |
@@ -75,6 +89,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `5` | Restablecer la rotación |
 | `F` | Voltear horizontalmente |
 | `F6` | Mostrar u ocultar las referencias |
+| `F7` | Cambiar entre el color y el navegador |
 | `F11` | Pantalla completa |
 | `Ctrl+0` / `Ctrl+1` | Ajustar a la ventana / 100 % |
 | `Ctrl+O` | Abrir proyecto |
@@ -125,11 +140,14 @@ cargo test
 - `src/settings.rs`: preferencias guardadas entre sesiones y archivo de recuperación.
 - `src/icons.rs`: iconos de la interfaz (trazos vectoriales, mismo estilo que SharkCut).
 - `src/engine/tools.rs`: relleno, difuminar, mover y transformar capa, insertar imágenes.
+- `src/engine/shapes.rs`, `src/engine/text.rs`: formas básicas y texto.
+- `src/engine/psd.rs`, `src/engine/abr.rs`: documentos y pinceles de Photoshop.
 - `src/engine/selection.rs`: máscara de selección.
 - `src/engine/project.rs`: formato de archivo de proyecto (documentado en el propio archivo).
 - `examples/muestra.rs`, `examples/puntas.rs`, `examples/papeles.rs`, `examples/mezcla.rs`:
   generan hojas de muestra de los pinceles, las puntas, los papeles y la mezcla de
   color sin abrir ventana. `examples/abr.rs` lista y dibuja las puntas de un `.abr`.
+  `examples/psd.rs` lista las capas de un `.psd` y lo vuelve a escribir.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
 
 ## Licencia y contribuciones

@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, StrokePoint,
+    builtin_papers, builtin_tips, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, SelectMode, Shape, StrokePoint, TextFont,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -1203,10 +1203,19 @@ fn photoshop_brush_files_are_read() {
     old.extend((body.len() as u32).to_be_bytes());
     old.extend(&body);
     let brushes = read_abr(&old).expect("an old-style file");
-    assert_eq!(brushes.len(), 1);
+    assert_eq!(brushes.len(), 1, "a computed brush cut short is skipped");
     assert_eq!(brushes[0].name.as_deref(), Some("Ok"));
     assert_eq!((brushes[0].width, brushes[0].height, brushes[0].spacing), (3, 2, Some(0.4)));
     assert_eq!(brushes[0].coverage, [1, 2, 3, 4, 5, 6]);
+
+    // A complete computed brush: spacing, diameter, roundness, angle, hardness.
+    let mut old = vec![0, 1, 0, 1, 0, 1, 0, 0, 0, 14, 0, 0, 0, 0];
+    for value in [25u16, 40, 100, 0, 60] {
+        old.extend(value.to_be_bytes());
+    }
+    let brushes = read_abr(&old).expect("an old-style round brush");
+    assert!(brushes[0].is_round());
+    assert_eq!((brushes[0].diameter, brushes[0].hardness, brushes[0].spacing), (Some(40.0), Some(0.6), Some(0.25)));
 }
 
 #[test]
@@ -1224,4 +1233,508 @@ fn damaged_brush_files_are_rejected_without_panicking() {
     let mut file = vec![0, 6, 0, 1];
     file.extend(abr_block(b"samp", &huge));
     assert!(read_abr(&file).is_err());
+}
+
+/// Builders for the tree of named values Photoshop keeps brush settings in.
+mod abr_tree {
+    pub fn name(name: &str) -> Vec<u8> {
+        let mut out = if name.len() == 4 { vec![0, 0, 0, 0] } else { (name.len() as u32).to_be_bytes().to_vec() };
+        out.extend(name.bytes());
+        out
+    }
+    pub fn text(value: &str) -> Vec<u8> {
+        let units: Vec<u16> = value.encode_utf16().chain([0]).collect();
+        let mut out = b"TEXT".to_vec();
+        out.extend((units.len() as u32).to_be_bytes());
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    }
+    pub fn unit(unit: &str, value: f64) -> Vec<u8> {
+        let mut out = b"UntF".to_vec();
+        out.extend(unit.bytes());
+        out.extend(value.to_be_bytes());
+        out
+    }
+    pub fn flag(value: bool) -> Vec<u8> {
+        vec![b'b', b'o', b'o', b'l', value as u8]
+    }
+    pub fn long(value: i32) -> Vec<u8> {
+        let mut out = b"long".to_vec();
+        out.extend(value.to_be_bytes());
+        out
+    }
+    /// An object without its type tag, as the block itself starts.
+    pub fn bare(class: &str, items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 1, 0, 0];
+        out.extend(name(class));
+        out.extend((items.len() as u32).to_be_bytes());
+        for (key, value) in items {
+            out.extend(name(key));
+            out.extend(value);
+        }
+        out
+    }
+    pub fn object(class: &str, items: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"Objc".to_vec();
+        out.extend(bare(class, items));
+        out
+    }
+    pub fn list(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"VlLs".to_vec();
+        out.extend((items.len() as u32).to_be_bytes());
+        out.extend(items.concat());
+        out
+    }
+}
+
+#[test]
+fn photoshop_round_brushes_and_names_come_from_the_settings() {
+    use abr_tree::*;
+    let round = object("brushPreset", &[
+        ("Nm  ", text("Line Art")),
+        ("Brsh", object("computedBrush", &[
+            ("Dmtr", unit("#Pxl", 123.0)),
+            ("Hrdn", unit("#Prc", 100.0)),
+            ("Spcn", unit("#Prc", 5.0)),
+        ])),
+        ("useTipDynamics", flag(false)),
+    ]);
+    let sampled = object("brushPreset", &[
+        ("Nm  ", text("Boceto")),
+        ("Brsh", object("sampledBrush", &[
+            ("Dmtr", unit("#Pxl", 80.0)),
+            ("Nm  ", text("Sampled Brush 519")),
+            ("Spcn", unit("#Prc", 10.0)),
+            ("sampledData", text("uno-1111")),
+        ])),
+        ("useTipDynamics", flag(true)),
+        ("minimumDiameter", unit("#Prc", 20.0)),
+        ("szVr", object("brVr", &[("bVTy", long(2))])),
+        ("usePaintDynamics", flag(true)),
+        ("opVr", object("brVr", &[("bVTy", long(2))])),
+    ]);
+    let mut settings = vec![0, 0, 0, 16];
+    settings.extend(bare("null", &[("Brsh", list(&[round, sampled.clone(), sampled]))]));
+    let mut file = vec![0, 6, 0, 1];
+    file.extend(abr_block(b"samp", &abr_sample("uno-1111", 4, 2, 8, false, &[9, 9, 9, 9, 9, 9, 9, 9])));
+    file.extend(abr_block(b"desc", &settings));
+
+    let brushes = read_abr(&file).expect("a file with a settings tree");
+    // In the order listed, round ones included, and a picture may be shared.
+    assert_eq!(brushes.len(), 3);
+    assert!(brushes[0].is_round());
+    assert_eq!(brushes[0].name.as_deref(), Some("Line Art"));
+    assert_eq!((brushes[0].diameter, brushes[0].hardness, brushes[0].spacing), (Some(123.0), Some(1.0), Some(0.05)));
+    assert!(!brushes[0].pressure_size && !brushes[0].pressure_flow);
+    for brush in &brushes[1..] {
+        // The brush's own name, not the name of its picture.
+        assert_eq!(brush.name.as_deref(), Some("Boceto"));
+        assert_eq!((brush.width, brush.height, brush.diameter), (4, 2, Some(80.0)));
+        assert!(brush.pressure_size && brush.pressure_flow);
+        assert_eq!(brush.min_size, Some(0.2));
+    }
+}
+
+#[test]
+fn selections_add_subtract_intersect_and_invert() {
+    let mut doc = Document::new(200, 200);
+    let covered = |doc: &Document, x: i32, y: i32| doc.selection().map_or(0, |s| s.coverage(x, y));
+    doc.select_polygon(&rect_points(20.0, 20.0, 100.0, 100.0));
+    doc.select_polygon_with(&rect_points(80.0, 80.0, 160.0, 160.0), SelectMode::Add);
+    assert_eq!((covered(&doc, 30, 30), covered(&doc, 150, 150), covered(&doc, 150, 30)), (255, 255, 0));
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 160, 160));
+
+    doc.select_polygon_with(&rect_points(0.0, 0.0, 60.0, 200.0), SelectMode::Subtract);
+    assert_eq!((covered(&doc, 30, 30), covered(&doc, 70, 30), covered(&doc, 150, 150)), (0, 255, 255));
+
+    doc.select_polygon_with(&rect_points(0.0, 0.0, 200.0, 90.0), SelectMode::Intersect);
+    assert_eq!((covered(&doc, 70, 30), covered(&doc, 150, 150), covered(&doc, 150, 85)), (255, 0, 255));
+
+    doc.invert_selection();
+    assert_eq!((covered(&doc, 70, 30), covered(&doc, 150, 150), covered(&doc, 5, 5)), (0, 255, 255));
+    // Taking away from nothing, or adding nothing, leaves things as they are.
+    let stamp = doc.selection_stamp();
+    doc.select_polygon_with(&rect_points(500.0, 500.0, 600.0, 600.0), SelectMode::Add);
+    assert_eq!(doc.selection_stamp(), stamp);
+    // Inverting with nothing selected selects everything.
+    doc.deselect();
+    doc.invert_selection();
+    assert_eq!(doc.selection().unwrap().bounds, doc.bounds());
+    // The border is drawn from the selected pixels themselves.
+    doc.select_polygon(&rect_points(10.0, 10.0, 50.0, 30.0));
+    let mut edges = doc.selection().unwrap().edges.clone();
+    edges.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(edges, [
+        [(10.0, 10.0), (10.0, 30.0)],
+        [(10.0, 10.0), (50.0, 10.0)],
+        [(10.0, 30.0), (50.0, 30.0)],
+        [(50.0, 10.0), (50.0, 30.0)],
+    ]);
+}
+
+#[test]
+fn selection_changes_can_be_undone_without_touching_the_drawing() {
+    let mut doc = Document::new(200, 200);
+    line(&mut doc, &hard_brush(20.0), [0, 0, 0], false, (40.0, 40.0), (160.0, 40.0));
+    let revision = doc.revision();
+    doc.select_polygon(&rect_points(20.0, 20.0, 100.0, 100.0));
+    doc.select_polygon_with(&rect_points(80.0, 80.0, 160.0, 160.0), SelectMode::Add);
+    assert_eq!(doc.revision(), revision, "selecting is not a change to the drawing");
+    doc.undo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 100, 100));
+    doc.undo();
+    assert!(doc.selection().is_none());
+    assert_eq!(pixel(&doc, 100, 40), [0, 0, 0, 255], "the stroke is still there");
+    doc.redo();
+    doc.redo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(20, 20, 160, 160));
+    doc.undo();
+    doc.undo();
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 40), [255, 255, 255, 255], "the third undo reaches the stroke");
+}
+
+#[test]
+fn the_magic_wand_selects_by_colour() {
+    let mut doc = Document::new(200, 100);
+    // Two separate red blocks and a blue one.
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (30.0, 50.0), (40.0, 50.0));
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (160.0, 50.0), (170.0, 50.0));
+    line(&mut doc, &hard_brush(30.0), [0, 0, 255], false, (95.0, 50.0), (105.0, 50.0));
+    let covered = |doc: &Document, x: i32, y: i32| doc.selection().map_or(0, |s| s.coverage(x, y));
+
+    assert!(doc.select_similar(35, 50, 0.1, true, true, SelectMode::Replace));
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 165, 50), covered(&doc, 100, 50), covered(&doc, 5, 5)), (255, 0, 0, 0));
+    // Not limited to the area touched: both red blocks.
+    doc.select_similar(35, 50, 0.1, true, false, SelectMode::Replace);
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 165, 50), covered(&doc, 100, 50)), (255, 255, 0));
+    // Adding the blue one.
+    doc.select_similar(100, 50, 0.1, true, true, SelectMode::Add);
+    assert_eq!((covered(&doc, 35, 50), covered(&doc, 100, 50), covered(&doc, 5, 5)), (255, 255, 0));
+    // The paper around them is one joined area.
+    doc.select_similar(5, 5, 0.1, true, true, SelectMode::Replace);
+    assert_eq!((covered(&doc, 5, 5), covered(&doc, 195, 95), covered(&doc, 35, 50)), (255, 255, 0));
+    // Off the canvas nothing happens.
+    let stamp = doc.selection_stamp();
+    assert!(!doc.select_similar(-5, 50, 0.1, true, true, SelectMode::Replace));
+    assert_eq!(doc.selection_stamp(), stamp);
+}
+
+/// Three stacked layers, bottom first: black, red and blue blocks side by side.
+fn three_layers() -> Document {
+    let mut doc = Document::new(192, 64);
+    line(&mut doc, &hard_brush(40.0), [0, 0, 0], false, (30.0, 32.0), (34.0, 32.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (94.0, 32.0), (98.0, 32.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [0, 0, 255], false, (158.0, 32.0), (162.0, 32.0));
+    doc
+}
+
+#[test]
+fn layer_groups_hide_and_fade_their_layers_together() {
+    let mut doc = three_layers();
+    let names = |doc: &Document| doc.layers().iter().map(|l| (l.props.name.clone(), l.group != 0)).collect::<Vec<_>>();
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().expect("a loose layer can start a group");
+    // The layer above steps down into the group.
+    doc.set_active_layer(2);
+    assert!(doc.move_layer(false));
+    assert_eq!(names(&doc), [("Capa 1".into(), false), ("Capa 2".into(), true), ("Capa 3".into(), true)]);
+    assert_eq!(doc.active_layer(), 2, "joining a group does not reorder");
+
+    let mut group = doc.group(id).unwrap().clone();
+    group.visible = false;
+    doc.set_group(group.clone(), false);
+    assert_eq!(pixel(&doc, 96, 32), [255, 255, 255, 255], "red is hidden with its group");
+    assert_eq!(pixel(&doc, 160, 32), [255, 255, 255, 255], "and so is blue");
+    assert_eq!(pixel(&doc, 32, 32), [0, 0, 0, 255], "the loose layer is not");
+
+    group.visible = true;
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let faded = pixel(&doc, 96, 32);
+    assert!((125..=130).contains(&faded[1]) && faded[0] == 255, "half-strength red over white: {faded:?}");
+
+    // Two undo steps: the fade, then the hiding.
+    doc.undo();
+    assert_eq!(pixel(&doc, 96, 32), [255, 255, 255, 255]);
+    doc.undo();
+    assert_eq!(pixel(&doc, 96, 32), [255, 0, 0, 255]);
+
+    // A layer added inside a group belongs to it; stepping past its edge leaves.
+    doc.add_layer();
+    assert_eq!(doc.layers()[3].group, id);
+    assert!(doc.move_layer(true), "at the top of the stack it can still step out");
+    assert_eq!(doc.layers()[3].group, 0);
+    assert_eq!(doc.active_layer(), 3);
+
+    // Dissolving keeps the layers.
+    assert!(doc.ungroup(id));
+    assert!(doc.groups().is_empty());
+    assert_eq!(doc.layers().len(), 4);
+    doc.undo();
+    assert_eq!(doc.groups().len(), 1);
+    assert_eq!(doc.layers()[1].group, id);
+}
+
+#[test]
+fn layer_groups_move_as_a_block_and_empty_ones_vanish() {
+    let mut doc = three_layers();
+    let order = |doc: &Document| doc.layers().iter().map(|l| l.props.name.clone()).collect::<Vec<_>>();
+    doc.set_active_layer(0);
+    let low = doc.group_active_layer().unwrap();
+    doc.set_active_layer(1);
+    assert!(doc.move_layer(false)); // Capa 2 joins the group under it
+    assert_eq!(doc.layers()[1].group, low);
+
+    assert!(doc.move_group(low, true));
+    assert_eq!(order(&doc), ["Capa 3", "Capa 1", "Capa 2"]);
+    assert_eq!(doc.active().props.name, "Capa 2", "the active layer is followed");
+    assert!(!doc.move_group(low, true), "already at the top");
+    assert!(doc.move_group(low, false));
+    assert_eq!(order(&doc), ["Capa 1", "Capa 2", "Capa 3"]);
+
+    // A second group; the first one steps past all of it at once.
+    doc.set_active_layer(2);
+    let high = doc.group_active_layer().unwrap();
+    assert!(doc.move_group(low, true));
+    assert_eq!(order(&doc), ["Capa 3", "Capa 1", "Capa 2"]);
+    assert_eq!(doc.layers()[0].group, high);
+
+    // A layer in the middle of a group cannot start its own: it would split it.
+    doc.set_active_layer(2);
+    doc.add_layer(); // Capa 4 joins `low`, above Capa 2
+    doc.set_active_layer(2);
+    assert!(doc.group_active_layer().is_none());
+
+    // Deleting a group's last layer removes the group.
+    doc.set_active_layer(0);
+    assert!(doc.delete_layer());
+    assert!(doc.group(high).is_none());
+    assert_eq!(doc.groups().len(), 1);
+}
+
+#[test]
+fn layer_groups_are_saved_with_the_project() {
+    let mut doc = three_layers();
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    doc.set_active_layer(2);
+    doc.move_layer(false);
+    let mut group = doc.group(id).unwrap().clone();
+    group.name = "Color".into();
+    group.opacity = 0.25;
+    group.collapsed = true;
+    doc.set_group(group, false);
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.groups().len(), 1);
+    let group = &loaded.groups()[0];
+    assert_eq!((group.name.as_str(), group.visible, group.collapsed), ("Color", true, true));
+    assert!((group.opacity - 0.25).abs() < 0.001);
+    let member = |i: usize| loaded.layers()[i].group == group.id;
+    assert!(!member(0) && member(1) && member(2));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    // Cut anywhere inside the groups, the file is refused or read without them.
+    for cut in file.len() - 30..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+}
+
+#[test]
+fn a_brush_can_paint_in_a_blend_mode() {
+    // Grey over which a stroke multiplies; outside the grey it paints plainly.
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(60.0), [128, 128, 128], false, (40.0, 50.0), (60.0, 50.0));
+    let multiply = BrushSettings { blend: BlendMode::Multiply, ..hard_brush(20.0) };
+    line(&mut doc, &multiply, [255, 0, 0], false, (50.0, 50.0), (150.0, 50.0));
+    assert_eq!(pixel(&doc, 50, 50), [128, 0, 0, 255], "red times grey");
+    assert_eq!(pixel(&doc, 140, 50), [255, 0, 0, 255], "nothing under it: plain red");
+    assert_eq!(doc.layers()[0].pixel(140, 80)[3], 0, "the rest of the layer stays empty");
+    // Going over the same spot within one stroke does not multiply twice.
+    doc.undo();
+    doc.begin_stroke(&multiply, [255, 0, 0], false, StrokePoint::new(40.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(60.0, 50.0, 1.0));
+    doc.stroke_to(StrokePoint::new(40.0, 50.0, 1.0));
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 50, 50), [128, 0, 0, 255]);
+    // Screen lightens, and locked transparency is respected.
+    let mut props = doc.layers()[0].props.clone();
+    props.alpha_lock = true;
+    doc.set_layer_props(0, props, false);
+    let screen = BrushSettings { blend: BlendMode::Screen, ..hard_brush(20.0) };
+    line(&mut doc, &screen, [0, 0, 255], false, (50.0, 20.0), (50.0, 99.0));
+    let lit = pixel(&doc, 50, 70);
+    assert_eq!((lit[0], lit[1], lit[2]), (128, 128, 255), "grey screened with blue");
+    assert_eq!(doc.layers()[0].pixel(50, 95)[3], 0, "locked transparency stays empty");
+}
+
+#[test]
+fn a_layer_group_can_blend_as_one() {
+    // Grey underneath; above it a group holding red, and white over part of the red.
+    let mut doc = Document::new(200, 100);
+    line(&mut doc, &hard_brush(90.0), [128, 128, 128], false, (40.0, 50.0), (160.0, 50.0));
+    doc.add_layer();
+    line(&mut doc, &hard_brush(40.0), [255, 0, 0], false, (60.0, 50.0), (140.0, 50.0));
+    let id = doc.group_active_layer().unwrap();
+    doc.add_layer();
+    line(&mut doc, &hard_brush(20.0), [255, 255, 255], false, (120.0, 50.0), (140.0, 50.0));
+    assert_eq!(doc.layers()[2].group, id);
+    assert_eq!(pixel(&doc, 70, 50), [255, 0, 0, 255], "normal: the red covers the grey");
+
+    let mut group = doc.group(id).unwrap().clone();
+    group.blend = BlendMode::Multiply;
+    doc.set_group(group.clone(), false);
+    assert_eq!(pixel(&doc, 70, 50), [128, 0, 0, 255], "the group multiplies the grey");
+    // Inside the group white still covers red; only the result is multiplied.
+    assert_eq!(pixel(&doc, 130, 50), [128, 128, 128, 255], "white times grey");
+    assert_eq!(pixel(&doc, 70, 12), [128, 128, 128, 255], "where the group is empty nothing changes");
+    assert_eq!(pixel(&doc, 5, 5), [255, 255, 255, 255]);
+
+    // The group's opacity fades the combined result.
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let half = pixel(&doc, 70, 50);
+    assert_eq!(half[0], 128);
+    assert!((62..=66).contains(&half[1]), "halfway between grey and its product with red: {half:?}");
+
+    // Saved and read back, it looks the same.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.groups()[0].blend, BlendMode::Multiply);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    doc.undo();
+    doc.undo();
+    assert_eq!(pixel(&doc, 70, 50), [255, 0, 0, 255]);
+}
+
+#[test]
+fn photoshop_documents_round_trip() {
+    // Three layers with a group, blend modes, clipping and a hidden layer.
+    let mut doc = three_layers();
+    doc.paper = [240, 230, 210];
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    doc.set_active_layer(2);
+    doc.move_layer(false);
+    let mut group = doc.group(id).unwrap().clone();
+    group.name = "Color ñ".into();
+    group.opacity = 0.6;
+    group.blend = BlendMode::Multiply;
+    doc.set_group(group, false);
+    let mut props = doc.layers()[2].props.clone();
+    props.blend = BlendMode::Screen;
+    props.opacity = 0.8;
+    props.clip = true;
+    doc.set_layer_props(2, props, false);
+    doc.add_layer();
+    doc.move_layer(true); // out of the group, on top
+    line(&mut doc, &BrushPreset::Aerografo.settings(), [20, 160, 90], false, (20.0, 20.0), (170.0, 50.0));
+    let mut props = doc.layers()[3].props.clone();
+    props.visible = false;
+    props.alpha_lock = true;
+    doc.set_layer_props(3, props, false);
+
+    let mut file = Vec::new();
+    doc.write_psd(&mut file).unwrap();
+    let loaded = read_psd(&file).expect("our own file reads back");
+    assert_eq!((loaded.width, loaded.height), (doc.width, doc.height));
+    // The paper travels as a filled layer and is taken back as the paper.
+    assert_eq!(loaded.paper, [240, 230, 210]);
+    let names: Vec<&str> = loaded.layers().iter().map(|l| l.props.name.as_str()).collect();
+    assert_eq!(names, ["Capa 1", "Capa 2", "Capa 3", "Capa 4"]);
+    assert_eq!(loaded.groups().len(), 1);
+    let group = &loaded.groups()[0];
+    assert_eq!((group.name.as_str(), group.blend, group.visible), ("Color ñ", BlendMode::Multiply, true));
+    assert!((group.opacity - 0.6).abs() < 0.003);
+    let member: Vec<bool> = loaded.layers().iter().map(|l| l.group == group.id).collect();
+    assert_eq!(member, [false, true, true, false]);
+    let top = &loaded.layers()[2].props;
+    assert_eq!((top.blend, top.clip), (BlendMode::Screen, true));
+    assert!((top.opacity - 0.8).abs() < 0.003);
+    let hidden = &loaded.layers()[3].props;
+    assert!(!hidden.visible && hidden.alpha_lock);
+    // The picture is the same to within 8-bit rounding.
+    let (before, after) = (doc.render_rgba8(doc.bounds()), loaded.render_rgba8(loaded.bounds()));
+    let worst = before.iter().zip(&after).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(worst <= 2, "largest difference {worst}");
+
+    // Damaged files are refused, never a crash.
+    assert!(read_psd(b"8BPS").is_err());
+    assert!(read_psd(b"not a photoshop file").is_err());
+    for cut in (0..file.len()).step_by(97) {
+        let _ = read_psd(&file[..cut]);
+    }
+}
+
+#[test]
+fn shapes_are_drawn_with_clean_edges() {
+    let mut doc = Document::new(200, 200);
+    // A filled rectangle covers exactly its box.
+    assert!(doc.draw_shape(Shape::Rectangle, (20.0, 30.0), (80.0, 70.0), [255, 0, 0], 4.0, true, 1.0));
+    assert_eq!(pixel(&doc, 20, 30), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 79, 69), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 19, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 80, 50), [255, 255, 255, 255]);
+    // An outlined one is hollow, with a border of the asked thickness.
+    doc.draw_shape(Shape::Rectangle, (100.0, 30.0), (180.0, 90.0), [0, 0, 255], 6.0, false, 1.0);
+    assert_eq!(pixel(&doc, 100, 60), [0, 0, 255, 255], "on the border");
+    assert_eq!(pixel(&doc, 140, 60), [255, 255, 255, 255], "hollow inside");
+    assert_eq!(pixel(&doc, 104, 60), [255, 255, 255, 255], "three pixels in, past the border");
+    assert_eq!(pixel(&doc, 96, 60), [255, 255, 255, 255], "three pixels out, past the border");
+    // A filled ellipse reaches its box at the middle of each side, not the corners.
+    doc.draw_shape(Shape::Ellipse, (20.0, 110.0), (120.0, 170.0), [0, 0, 0], 1.0, true, 1.0);
+    assert_eq!(pixel(&doc, 70, 140), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 22, 140), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 70, 112), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 23, 113), [255, 255, 255, 255], "the corner of the box is empty");
+    // A line has the asked thickness and round ends.
+    doc.draw_shape(Shape::Line, (140.0, 120.0), (180.0, 160.0), [0, 128, 0], 8.0, false, 1.0);
+    assert_eq!(pixel(&doc, 160, 140), [0, 128, 0, 255]);
+    assert_eq!(pixel(&doc, 170, 130), [255, 255, 255, 255], "well off the line");
+    // Each shape is one undo step, and half opacity is half strength.
+    for _ in 0..4 {
+        assert!(doc.undo());
+    }
+    assert!(!doc.can_undo());
+    doc.draw_shape(Shape::Rectangle, (20.0, 30.0), (80.0, 70.0), [0, 0, 0], 1.0, true, 0.5);
+    let half = pixel(&doc, 50, 50);
+    assert!((126..=129).contains(&half[0]), "{half:?}");
+    // It keeps to the selection, and off the canvas nothing is drawn.
+    doc.select_polygon(&rect_points(0.0, 0.0, 100.0, 200.0));
+    doc.draw_shape(Shape::Line, (20.0, 150.0), (180.0, 150.0), [255, 0, 0], 10.0, false, 1.0);
+    assert_eq!(pixel(&doc, 50, 150), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 150, 150), [255, 255, 255, 255]);
+    assert!(!doc.draw_shape(Shape::Ellipse, (500.0, 500.0), (600.0, 600.0), [0, 0, 0], 2.0, true, 1.0));
+}
+
+#[test]
+fn text_is_drawn_in_the_bundled_font() {
+    let font = TextFont::builtin();
+    let (width, height, rgba) = render_text(&font, "Hola", 40.0, [200, 30, 60]).expect("text with letters");
+    assert_eq!(rgba.len(), width * height * 4);
+    assert!((60..140).contains(&width) && (25..50).contains(&height), "{width} x {height}");
+    assert!(rgba.chunks(4).any(|px| px[3] == 255), "solid ink somewhere");
+    assert!(rgba.chunks(4).all(|px| px[..3] == [200, 30, 60]), "one colour throughout");
+    // The margin around it is empty.
+    assert!(rgba.chunks(4).take(width).all(|px| px[3] == 0));
+    // Twice the size is about twice as big; two lines are about twice as tall.
+    let (big, _, _) = render_text(&font, "Hola", 80.0, [0, 0, 0]).unwrap();
+    assert!((big as f32 / width as f32 - 2.0).abs() < 0.15);
+    let (_, tall, _) = render_text(&font, "Hola\nHola", 40.0, [0, 0, 0]).unwrap();
+    assert!(tall > height * 2 - 4 && tall < height * 3);
+    // Nothing to draw.
+    assert!(render_text(&font, "", 40.0, [0, 0, 0]).is_none());
+    assert!(render_text(&font, "   \n ", 40.0, [0, 0, 0]).is_none());
+    assert!(TextFont::from_bytes("x", b"not a font".to_vec()).is_none());
+    // It goes onto the canvas as a layer of its own, in one undo step.
+    let mut doc = Document::new(300, 120);
+    doc.add_image_layer("Hola", width, height, &rgba, 20, 30);
+    assert_eq!(doc.layers().len(), 2);
+    assert_ne!(doc.render_rgba8(doc.bounds()), Document::new(300, 120).render_rgba8(IRect::new(0, 0, 300, 120)));
+    doc.undo();
+    assert_eq!(doc.layers().len(), 1);
 }

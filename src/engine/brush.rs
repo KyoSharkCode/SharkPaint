@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use super::layer::BlendMode;
+
 /// A tip shape: a square greyscale stamp, where 255 deposits full paint.
 pub struct TipImage {
     /// Stable identifier used when saving brushes ("carbon", "archivo:hoja"…).
@@ -201,6 +203,9 @@ pub struct BrushSettings {
     /// How long picked-up colour stays on the brush (0 = replaced at once,
     /// 1 = dragged a long way).
     pub drag: f32,
+    /// How the stroke combines with what is already on its layer. Brushes
+    /// that mix colour always paint normally.
+    pub blend: BlendMode,
 }
 
 impl Default for BrushSettings {
@@ -234,6 +239,7 @@ impl BrushSettings {
             grain_scale: 1.0,
             mix: 0.0,
             drag: 0.5,
+            blend: BlendMode::Normal,
         }
     }
 

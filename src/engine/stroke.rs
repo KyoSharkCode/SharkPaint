@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use super::brush::{BrushSettings, BrushTip, PaperTexture};
-use super::layer::{IRect, Layer, Tile, ONE, TILE};
+use super::layer::{blend_over, BlendMode, IRect, Layer, Tile, ONE, TILE};
 use super::selection::Selection;
 
 /// One input sample in canvas coordinates. `pressure` is 0..=1.
@@ -550,6 +550,23 @@ impl ActiveStroke {
                         let mix = |under: u16, paint: u32| -> u16 {
                             ((paint * a + under as u32 * keep + ONE / 2) >> 15) as u16
                         };
+                        if !self.erase && self.brush.blend != BlendMode::Normal {
+                            // The stroke lies over the layer's own pixels like a
+                            // layer in that blend mode would.
+                            let mut px = o.map(u32::from);
+                            let paint = [self.color[0] as u16, self.color[1] as u16, self.color[2] as u16, ONE as u16];
+                            blend_over(&mut px, paint, a, self.brush.blend);
+                            if self.alpha_lock && px[3] > 0 {
+                                // The transparency stays as it was; colour follows it.
+                                let own = o[3] as u32;
+                                for c in 0..3 {
+                                    px[c] = (px[c] * own / px[3]).min(own);
+                                }
+                                px[3] = own;
+                            }
+                            dst.0[i] = px.map(|c| c as u16);
+                            continue;
+                        }
                         dst.0[i] = if self.erase {
                             [mix(o[0], 0), mix(o[1], 0), mix(o[2], 0), mix(o[3], 0)]
                         } else if self.alpha_lock {

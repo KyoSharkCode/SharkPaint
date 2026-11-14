@@ -191,10 +191,30 @@ impl LayerProps {
     }
 }
 
+/// A named set of neighbouring layers that are shown, hidden and faded
+/// together. With the normal blend mode its layers blend with the rest of
+/// the picture one by one; with any other, they are combined among
+/// themselves first and the result is blended in as a single layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerGroup {
+    /// Unique within a document; never zero.
+    pub id: u64,
+    pub name: String,
+    pub visible: bool,
+    /// 0..=1, on top of each layer's own opacity.
+    pub opacity: f32,
+    pub blend: BlendMode,
+    /// The group's layers are folded away in the layer list.
+    pub collapsed: bool,
+}
+
 #[derive(Clone)]
 pub struct Layer {
     /// Identifies the layer across reordering and undo; unique within a document.
     pub id: u64,
+    /// The group the layer belongs to, or zero for none. A group's layers are
+    /// always next to each other in the stack.
+    pub group: u64,
     /// Changes whenever the layer's pixels change (used to refresh previews).
     pub version: u64,
     pub props: LayerProps,
@@ -211,6 +231,7 @@ impl Layer {
         let tiles_y = height.div_ceil(TILE);
         Layer {
             id: 0,
+            group: 0,
             version: 0,
             props: LayerProps::named(name),
             width,

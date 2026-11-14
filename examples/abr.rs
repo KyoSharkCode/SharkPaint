@@ -15,9 +15,13 @@ fn main() {
     let mut sheet = vec![255u8; w * h * 4];
     for (i, brush) in brushes.iter().enumerate() {
         println!(
-            "{:3}  {}x{}  nombre={:?} tamaño={:?} espaciado={:?} ángulo={:?} redondez={:?}",
-            i + 1, brush.width, brush.height, brush.name, brush.diameter, brush.spacing, brush.angle, brush.roundness
+            "{:3}  {}x{}  nombre={:?} tamaño={:?} espaciado={:?} ángulo={:?} redondez={:?} dureza={:?} presión: tamaño={} (mín. {:?}) flujo={}",
+            i + 1, brush.width, brush.height, brush.name, brush.diameter, brush.spacing, brush.angle, brush.roundness,
+            brush.hardness, brush.pressure_size, brush.min_size, brush.pressure_flow
         );
+        if brush.is_round() {
+            continue;
+        }
         let scale = (brush.width.max(brush.height) as f32 / (CELL - 8) as f32).max(1.0);
         let (ox, oy) = (i % columns * CELL + 4, i / columns * CELL + 4);
         for y in 0..CELL - 8 {

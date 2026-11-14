@@ -10,13 +10,14 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, StrokePoint, PROJECT_EXTENSION,
+    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, TextFont, PROJECT_EXTENSION,
+    read_psd, render_text,
 };
 
-use crate::brushes::{Brush, BrushLibrary};
+use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
 use crate::icons::icon;
 use crate::settings::{self, Settings};
-use crate::view::View;
+use crate::view::{View, MAX_ZOOM, MIN_ZOOM};
 
 const DEFAULT_SIZE: [usize; 2] = [3000, 2000];
 const MAX_BRUSH_SIZE: f32 = 500.0;
@@ -60,11 +61,13 @@ enum Tool {
     Mover,
     Transformar,
     Seleccion,
+    Forma,
+    Texto,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 8] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -73,6 +76,8 @@ impl Tool {
         (Tool::Mover, "mover", "Mover capa", "V"),
         (Tool::Transformar, "transformar", "Transformar", "T"),
         (Tool::Seleccion, "seleccion", "Selección", "S"),
+        (Tool::Forma, "forma", "Formas", "U"),
+        (Tool::Texto, "texto", "Texto", "A"),
     ];
 
     fn name(self) -> &'static str {
@@ -95,13 +100,16 @@ enum SelectShape {
     Rectangulo,
     Elipse,
     Libre,
+    /// A click selects the area of similar colour.
+    Varita,
 }
 
 impl SelectShape {
-    const ALL: [(SelectShape, &'static str); 3] = [
+    const ALL: [(SelectShape, &'static str); 4] = [
         (SelectShape::Rectangulo, "Rectángulo"),
         (SelectShape::Elipse, "Elipse"),
         (SelectShape::Libre, "Forma libre"),
+        (SelectShape::Varita, "Varita mágica"),
     ];
 
     /// The outline of a selection dragged from `from` to `to`, in canvas
@@ -109,7 +117,7 @@ impl SelectShape {
     /// rectangles square and ellipses round.
     fn outline(self, from: Pos2, to: Pos2, trail: &[Pos2], regular: bool) -> Vec<(f32, f32)> {
         let mut to = to;
-        if regular && self != SelectShape::Libre {
+        if regular && matches!(self, SelectShape::Rectangulo | SelectShape::Elipse) {
             let side = (to.x - from.x).abs().max((to.y - from.y).abs());
             to = Pos2::new(from.x + side * (to.x - from.x).signum(), from.y + side * (to.y - from.y).signum());
         }
@@ -124,12 +132,78 @@ impl SelectShape {
                     (rect.center().x + rect.width() * 0.5 * a.cos(), rect.center().y + rect.height() * 0.5 * a.sin())
                 })
                 .collect(),
-            SelectShape::Libre => trail.iter().map(|p| (p.x, p.y)).collect(),
+            SelectShape::Libre | SelectShape::Varita => trail.iter().map(|p| (p.x, p.y)).collect(),
         }
     }
 }
 
-/// A selection being dragged out.
+/// The two ends of a shape dragged from `from` to `to`. `regular` makes
+/// rectangles square, ellipses round and lines snap to steps of 45°.
+fn shape_ends(shape: Figure, from: Pos2, to: Pos2, regular: bool) -> (Pos2, Pos2) {
+    if !regular {
+        return (from, to);
+    }
+    let delta = to - from;
+    match shape {
+        Figure::Line => {
+            let step = std::f32::consts::FRAC_PI_4;
+            let angle = (delta.y.atan2(delta.x) / step).round() * step;
+            (from, from + Vec2::new(angle.cos(), angle.sin()) * delta.length())
+        }
+        _ => {
+            let side = delta.x.abs().max(delta.y.abs());
+            (from, from + Vec2::new(side * delta.x.signum(), side * delta.y.signum()))
+        }
+    }
+}
+
+/// Text rendered for placing on the canvas.
+struct TextPreview {
+    /// Content, size, typeface and colour it was drawn from.
+    key: (String, u32, usize, [u8; 3]),
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    texture: TextureHandle,
+}
+
+/// Font files installed on this computer, by name, sorted.
+fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
+    let mut folders: Vec<PathBuf> = Vec::new();
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    if cfg!(windows) {
+        folders.extend(var("WINDIR").map(|dir| dir.join("Fonts")));
+        folders.extend(var("LOCALAPPDATA").map(|dir| dir.join("Microsoft").join("Windows").join("Fonts")));
+    } else {
+        folders.extend(["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts", "/System/Library/Fonts"].map(PathBuf::from));
+        folders.extend(var("HOME").map(|dir| dir.join(".fonts")));
+        folders.extend(var("HOME").map(|dir| dir.join(".local/share/fonts")));
+        folders.extend(var("HOME").map(|dir| dir.join("Library/Fonts")));
+    }
+    let mut found: Vec<(String, Option<PathBuf>)> = Vec::new();
+    // Folders nest a few levels deep on some systems.
+    let mut pending: Vec<(PathBuf, u32)> = folders.into_iter().map(|dir| (dir, 0)).collect();
+    while let Some((dir, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 {
+                    pending.push((path, depth + 1));
+                }
+                continue;
+            }
+            let is_font = path.extension().is_some_and(|e| ["ttf", "otf", "ttc"].iter().any(|kind| e.eq_ignore_ascii_case(kind)));
+            if let (true, Some(name)) = (is_font, path.file_stem()) {
+                found.push((name.to_string_lossy().into_owned(), Some(path)));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
+}
+
+/// A selection or a shape being dragged out.
 struct SelectDrag {
     from: Pos2,
     to: Pos2,
@@ -237,6 +311,7 @@ enum Command {
     Save,
     SaveAs,
     ExportPng,
+    ExportPsd,
     Undo,
     Redo,
     ClearLayer,
@@ -245,6 +320,7 @@ enum Command {
     LayerDelete,
     LayerMove(bool),
     LayerMerge,
+    LayerGroup,
     Fit,
     ActualSize,
     Zoom(f32),
@@ -253,12 +329,14 @@ enum Command {
     Flip,
     ToggleBrushWindow,
     ToggleReferences,
+    ToggleNavigator,
     ToggleSymmetry,
     Preferences,
     Fullscreen,
     FinishTransform(bool),
     SelectAll,
     Deselect,
+    InvertSelection,
     DeleteSelected,
     FlipContents(bool),
     Quit,
@@ -309,6 +387,33 @@ pub struct SharkPaintApp {
     xform_empty: Option<(u64, u64, u64)>,
     select_shape: SelectShape,
     select_drag: Option<SelectDrag>,
+    /// The shape tool: which shape, filled or outlined, how thick and how strong.
+    shape_kind: Figure,
+    shape_filled: bool,
+    shape_width: f32,
+    shape_opacity: f32,
+    /// The text tool: what to write, how tall, and in which typeface.
+    text_content: String,
+    text_size: f32,
+    /// Typefaces on offer: the bundled one first, then those installed.
+    text_fonts: Option<Vec<(String, Option<PathBuf>)>>,
+    text_font_index: usize,
+    /// The typeface in use, with its place in the list.
+    text_font: Option<(usize, TextFont)>,
+    /// Where on the canvas the text's top-left corner goes, once chosen.
+    text_anchor: Option<Pos2>,
+    /// The pointer is moving the text about.
+    text_dragging: bool,
+    /// The text as drawn, with what it was drawn from.
+    text_preview: Option<TextPreview>,
+    /// How a new selection combines with the current one.
+    select_mode: SelectMode,
+    /// How far a colour may be from the one clicked for the magic wand to take it.
+    select_tolerance: f32,
+    /// The magic wand stops at the edges of the area clicked.
+    select_contiguous: bool,
+    /// The magic wand looks at the whole picture rather than the active layer.
+    select_all_layers: bool,
     /// What Copy or Cut last took: where it was on the canvas and its pixels.
     clip: Option<(IRect, Vec<u8>)>,
     /// The brushes on offer and the tip shapes they use.
@@ -321,6 +426,15 @@ pub struct SharkPaintApp {
     saved_brushes: String,
     /// Sample stroke for the brush on screen, with the settings it was drawn from.
     preview: Option<(BrushSettings, TextureHandle)>,
+    /// Sample strokes for the library list, by position in the library, each
+    /// with the settings it was drawn from.
+    brush_thumbs: HashMap<usize, (BrushSettings, TextureHandle)>,
+    /// The less common brush settings are on show.
+    brush_advanced: bool,
+    /// Text the library list is narrowed by.
+    brush_search: String,
+    /// Group the library list shows; empty for all of them.
+    brush_category: String,
     color: [u8; 3],
     /// Pressure of the pen currently touching the tablet, if any.
     pen_pressure: Option<f32>,
@@ -364,6 +478,11 @@ pub struct SharkPaintApp {
     brush_window_open: bool,
     /// The reference panel is showing.
     refs_open: bool,
+    /// The group chosen in the layer list, when a group rather than a layer is.
+    active_group: Option<u64>,
+    /// The side panel shows the navigator (a small view of the whole canvas)
+    /// in place of the colour picker.
+    nav_open: bool,
     /// Which reference is on screen.
     ref_index: usize,
     /// Pan (points) and extra zoom of the reference on screen.
@@ -427,12 +546,32 @@ impl SharkPaintApp {
             xform_empty: None,
             select_shape: SelectShape::Rectangulo,
             select_drag: None,
+            shape_kind: Figure::Rectangle,
+            shape_filled: false,
+            shape_width: 6.0,
+            shape_opacity: 1.0,
+            text_content: String::new(),
+            text_size: 96.0,
+            text_fonts: None,
+            text_font_index: 0,
+            text_font: None,
+            text_anchor: None,
+            text_dragging: false,
+            text_preview: None,
+            select_mode: SelectMode::Replace,
+            select_tolerance: 0.15,
+            select_contiguous: true,
+            select_all_layers: true,
             clip: None,
             library: BrushLibrary { brushes: Vec::new(), tips: Vec::new(), papers: Vec::new() },
             brush_index: Some(1),
             brush_source: None,
             saved_brushes: String::new(),
             preview: None,
+            brush_thumbs: HashMap::new(),
+            brush_advanced: false,
+            brush_search: String::new(),
+            brush_category: String::new(),
             color: [24, 24, 32],
             pen_pressure: None,
             last_pressure: 1.0,
@@ -457,6 +596,8 @@ impl SharkPaintApp {
             window_hooked: false,
             brush_window_open: true,
             refs_open: false,
+            active_group: None,
+            nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
             ref_texture: None,
@@ -495,7 +636,7 @@ impl SharkPaintApp {
         }
         // A project opens as such; any other file is taken as an image to draw over.
         if let Some(path) = open_path {
-            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION) || e.eq_ignore_ascii_case("psd")) {
                 app.load_project(path);
             } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
                 app.import_abr(&path);
@@ -688,6 +829,18 @@ impl SharkPaintApp {
     }
 
     fn load_project(&mut self, path: PathBuf) {
+        // A Photoshop document opens as a new, unsaved drawing: saving it
+        // makes a project file and leaves the original alone.
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("psd")) {
+            match std::fs::read(&path).and_then(|data| read_psd(&data)) {
+                Ok(doc) => {
+                    self.status = format!("Abierto desde Photoshop: {}. Al guardar se creará un proyecto de SharkPaint.", path.display());
+                    self.replace_document(doc, None);
+                }
+                Err(e) => self.status = format!("No se pudo abrir {}: {e}", path.display()),
+            }
+            return;
+        }
         match Document::load(&path) {
             Ok(doc) => {
                 self.status = format!("Abierto: {}", path.display());
@@ -755,8 +908,10 @@ impl SharkPaintApp {
             }
             Discarding::Open => {
                 let picked = rfd::FileDialog::new()
-                    .set_title("Abrir proyecto")
+                    .set_title("Abrir")
+                    .add_filter("Proyectos y documentos de Photoshop", &[PROJECT_EXTENSION, "psd"])
                     .add_filter("Proyecto de SharkPaint", &[PROJECT_EXTENSION])
+                    .add_filter("Documento de Photoshop", &["psd"])
                     .pick_file();
                 if let Some(path) = picked {
                     self.load_project(path);
@@ -876,6 +1031,9 @@ impl SharkPaintApp {
             if hit(cmd, Key::D) {
                 commands.push(Command::Deselect);
             }
+            if hit(cmd | egui::Modifiers::SHIFT, Key::I) {
+                commands.push(Command::InvertSelection);
+            }
             if hit(none, Key::Delete) {
                 commands.push(Command::DeleteSelected);
             }
@@ -920,6 +1078,9 @@ impl SharkPaintApp {
             if hit(none, Key::F6) {
                 commands.push(Command::ToggleReferences);
             }
+            if hit(none, Key::F7) {
+                commands.push(Command::ToggleNavigator);
+            }
             for (slot, (tool, ..)) in Tool::ALL.iter().enumerate() {
                 if hit(none, self.tool_keys[slot]) {
                     self.tool = *tool;
@@ -960,6 +1121,9 @@ impl SharkPaintApp {
                 }
                 if ui.add(egui::Button::new("Exportar PNG…").shortcut_text("Ctrl+E")).clicked() {
                     commands.push(Command::ExportPng);
+                }
+                if ui.button("Exportar PSD…").on_hover_text("Documento de Photoshop, con capas y grupos").clicked() {
+                    commands.push(Command::ExportPsd);
                 }
                 ui.separator();
                 if ui.button("Salir").clicked() {
@@ -1032,6 +1196,9 @@ impl SharkPaintApp {
                 if ui.add_enabled(selected, egui::Button::new("Deseleccionar").shortcut_text("Ctrl+D")).clicked() {
                     commands.push(Command::Deselect);
                 }
+                if ui.add(egui::Button::new("Invertir selección").shortcut_text("Ctrl+Mayús+I")).clicked() {
+                    commands.push(Command::InvertSelection);
+                }
                 ui.separator();
                 if ui.add_enabled(selected, egui::Button::new("Borrar lo seleccionado").shortcut_text("Supr")).clicked() {
                     commands.push(Command::DeleteSelected);
@@ -1083,6 +1250,9 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Referencias", "F6") {
                     commands.push(Command::ToggleReferences);
+                }
+                if item(ui, "Navegador", "F7") {
+                    commands.push(Command::ToggleNavigator);
                 }
                 if item(ui, "Pantalla completa", "F11") {
                     commands.push(Command::Fullscreen);
@@ -1203,6 +1373,95 @@ impl SharkPaintApp {
 
     /// The reference panel: images to look at while drawing. They live beside
     /// the picture, with their own zoom, and are never exported.
+    /// A small view of the whole canvas, in the side panel. The outline marks
+    /// what the main view shows; a click or a drag moves the main view there.
+    fn navigator_panel(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>) {
+        let (viewport, doc_size) = (self.viewport, self.doc_size());
+        let side = ui.available_width().clamp(120.0, 260.0);
+        let scale = (side / doc_size.x).min(side * 0.8 / doc_size.y);
+        let (rect, response) = ui.allocate_exact_size(doc_size * scale, Sense::click_and_drag());
+        let flip = self.view.flip;
+        // Canvas pixel <-> point in the picture, mirrored like the main view.
+        let to_nav = |c: Pos2| {
+            let x = if flip { doc_size.x - c.x } else { c.x };
+            rect.min + Vec2::new(x, c.y) * scale
+        };
+        let to_canvas = |p: Pos2| {
+            let v = (p - rect.min) / scale;
+            Pos2::new(if flip { doc_size.x - v.x } else { v.x }, v.y)
+        };
+        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(128));
+        // The smallest copy of the canvas is plenty at this size.
+        let level = self.reduced.len();
+        if let Some(texture) = self.reduced.last().or(self.texture.as_ref()) {
+            let reach = if level == 0 {
+                Vec2::splat(1.0)
+            } else {
+                Vec2::new(
+                    (doc_size.x / (texture.size()[0] << level) as f32).min(1.0),
+                    (doc_size.y / (texture.size()[1] << level) as f32).min(1.0),
+                )
+            };
+            let (left, right) = if flip { (reach.x, 0.0) } else { (0.0, reach.x) };
+            let uv = Rect::from_min_max(Pos2::new(left, 0.0), Pos2::new(right, reach.y));
+            ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+        }
+        // What the main view shows, as an outline; it turns with the view.
+        let outline: Vec<Pos2> =
+            [viewport.left_top(), viewport.right_top(), viewport.right_bottom(), viewport.left_bottom()]
+                .into_iter()
+                .map(|corner| to_nav(self.view.to_canvas(corner, viewport, doc_size)))
+                .collect();
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.add(egui::Shape::closed_line(outline.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
+        painter.add(egui::Shape::closed_line(outline, Stroke::new(1.5, Color32::from_rgb(111, 227, 240))));
+        ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(60)), egui::StrokeKind::Outside);
+
+        // Press or drag: bring that spot to the middle of the main view.
+        if let Some(pos) = response.interact_pointer_pos().filter(|_| response.is_pointer_button_down_on()) {
+            let target = to_canvas(rect.clamp(pos));
+            self.view.pan += viewport.center() - self.view.to_screen(target, viewport, doc_size);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.view.zoom_about(viewport.center(), (scroll * 0.004).exp(), viewport, doc_size);
+            }
+        }
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = side - 150.0;
+            let mut zoom = self.view.zoom;
+            let slider = egui::Slider::new(&mut zoom, MIN_ZOOM..=MAX_ZOOM)
+                .logarithmic(true)
+                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                .custom_parser(|text| text.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0));
+            if ui.add(slider).on_hover_text("Zoom").changed() {
+                self.view.zoom_about(viewport.center(), zoom / self.view.zoom, viewport, doc_size);
+            }
+            if ui.small_button("Ajustar").on_hover_text("Ver el lienzo completo").clicked() {
+                commands.push(Command::Fit);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = side - 150.0;
+            // Shown from -180° to 180°, so a small turn either way reads as small.
+            let mut degrees = self.view.rotation.to_degrees();
+            if degrees > 180.0 {
+                degrees -= 360.0;
+            }
+            let before = degrees;
+            let slider = egui::Slider::new(&mut degrees, -180.0..=180.0).fixed_decimals(0).suffix("°");
+            if ui.add(slider).on_hover_text("Rotación").changed() {
+                self.view.rotate_about(viewport.center(), (degrees - before).to_radians(), viewport, doc_size);
+            }
+            if ui.small_button("Recto").on_hover_text("Quitar la rotación").clicked() {
+                commands.push(Command::ResetRotation);
+            }
+        });
+    }
+
     fn references_window(&mut self, ctx: &egui::Context) {
         let mut open = self.refs_open;
         let mut add_files = false;
@@ -1324,8 +1583,6 @@ impl SharkPaintApp {
     }
 
     fn color_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.strong("Color");
         let mut color = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
         ui.scope(|ui| {
             // The picker takes its width from the slider width; make it fill the panel.
@@ -1465,24 +1722,149 @@ impl SharkPaintApp {
 
     /// The library of brushes: pick one, save the current settings as a new
     /// one, update, rename or delete.
+    /// The brushes on offer: a search box, a group picker and a list where
+    /// each brush shows a sample stroke.
     fn brush_library(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Pinceles");
-        egui::ScrollArea::vertical().id_salt("biblioteca").max_height(132.0).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (i, brush) in self.library.brushes.iter().enumerate() {
-                    if ui.selectable_label(self.brush_index == Some(i), &brush.name).clicked() {
-                        self.brush = brush.settings.clone();
-                        self.brush_index = Some(i);
-                    }
+        let width = ui.available_width();
+        ui.add(egui::TextEdit::singleline(&mut self.brush_search).hint_text("Buscar pincel").desired_width(width));
+        let mut categories: Vec<String> = Vec::new();
+        for brush in &self.library.brushes {
+            if !categories.contains(&brush.category) {
+                categories.push(brush.category.clone());
+            }
+        }
+        if !self.brush_category.is_empty() && !categories.contains(&self.brush_category) {
+            self.brush_category.clear();
+        }
+        ui.horizontal(|ui| {
+            let shown = if self.brush_category.is_empty() { "Todos los pinceles" } else { self.brush_category.as_str() };
+            egui::ComboBox::from_id_salt("categoria_pinceles").selected_text(shown).width(width - 44.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.brush_category, String::new(), "Todos los pinceles");
+                for category in &categories {
+                    ui.selectable_value(&mut self.brush_category, category.clone(), category);
                 }
             });
+            ui.menu_button("⋯", |ui| {
+                if ui.button("Importar de Photoshop (.abr)…").clicked() {
+                    ui.close();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Importar pinceles de Photoshop")
+                        .add_filter("Pinceles de Photoshop", &["abr"])
+                        .pick_file()
+                    {
+                        self.import_abr(&path);
+                    }
+                }
+                if ui.button("Restaurar los pinceles iniciales").clicked() {
+                    ui.close();
+                    self.library.brushes = self.library.default_brushes();
+                    self.brush_index = self.library.brushes.iter().position(|b| b.settings == self.brush);
+                    self.brush_source = self.brush_index;
+                }
+            })
+            .response
+            .on_hover_text("Importar pinceles de Photoshop (también arrastrando el archivo a la ventana)\no volver a los pinceles iniciales");
         });
+
+        let search = self.brush_search.trim().to_lowercase();
+        let listed: Vec<usize> = (0..self.library.brushes.len())
+            .filter(|&i| {
+                let brush = &self.library.brushes[i];
+                (self.brush_category.is_empty() || brush.category == self.brush_category)
+                    && (search.is_empty() || brush.name.to_lowercase().contains(&search))
+            })
+            .collect();
+        // Samples are drawn a few per frame so a long list never stalls the window.
+        let mut budget = 3;
+        const ROW: f32 = 50.0;
+        const SAMPLE: [usize; 2] = [232, 28];
+        let source = self.brush_source;
+        // Tall enough for a handful of brushes; shorter when there are fewer.
+        let height = ROW * (listed.len() as f32).clamp(1.0, 5.5);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        egui::ScrollArea::vertical().id_salt("biblioteca").max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show_rows(
+            ui,
+            ROW,
+            listed.len(),
+            |ui, rows| {
+                for &i in &listed[rows] {
+                    let settings = &self.library.brushes[i].settings;
+                    if budget > 0 && self.brush_thumbs.get(&i).is_none_or(|(drawn, _)| drawn != settings) {
+                        budget -= 1;
+                        let rgba = brush_preview(settings, SAMPLE[0] * 2, SAMPLE[1] * 2, [230, 232, 238], [20, 22, 28]);
+                        let image = ColorImage::from_rgba_unmultiplied([SAMPLE[0] * 2, SAMPLE[1] * 2], &rgba);
+                        let texture = ui.ctx().load_texture(format!("pincel_{i}"), image, TextureOptions::LINEAR);
+                        self.brush_thumbs.insert(i, (settings.clone(), texture));
+                    }
+                    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW - 4.0), Sense::click());
+                    let chosen = source == Some(i);
+                    let fill = if chosen {
+                        ui.visuals().selection.bg_fill
+                    } else if response.hovered() {
+                        ui.visuals().widgets.hovered.weak_bg_fill
+                    } else {
+                        ui.visuals().faint_bg_color
+                    };
+                    ui.painter().rect_filled(rect, 4.0, fill);
+                    let sample = Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::new(rect.width() - 8.0, SAMPLE[1] as f32));
+                    match self.brush_thumbs.get(&i).filter(|(drawn, _)| drawn == settings) {
+                        Some((_, texture)) => {
+                            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                            ui.painter().image(texture.id(), sample, uv, Color32::WHITE);
+                        }
+                        None => ui.ctx().request_repaint(),
+                    }
+                    let brush = &self.library.brushes[i];
+                    let text = if chosen { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+                    let line = rect.bottom() - 8.0;
+                    let font = egui::FontId::proportional(11.5);
+                    let size = ui.painter().text(
+                        Pos2::new(rect.left() + 6.0, line),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:.0}", brush.settings.size),
+                        font.clone(),
+                        if chosen { text } else { ui.visuals().weak_text_color() },
+                    );
+                    ui.painter().text(
+                        Pos2::new(size.right().max(rect.left() + 30.0) + 6.0, line),
+                        egui::Align2::LEFT_CENTER,
+                        &brush.name,
+                        font,
+                        text,
+                    );
+                    if response.on_hover_text(format!("{} · {}", brush.name, brush.category)).clicked() {
+                        self.brush = brush.settings.clone();
+                        self.brush_index = Some(i);
+                        self.brush_source = Some(i);
+                    }
+                }
+            },
+        );
+        if listed.is_empty() {
+            ui.weak("Ningún pincel coincide.");
+        }
+    }
+
+    /// Name and group of the brush in use, and saving it to the library.
+    fn brush_storage(&mut self, ui: &mut egui::Ui) {
+        if let Some(i) = self.brush_source.filter(|&i| i < self.library.brushes.len()) {
+            egui::Grid::new("pincel_guardado").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Nombre");
+                ui.add(egui::TextEdit::singleline(&mut self.library.brushes[i].name).desired_width(150.0));
+                ui.end_row();
+                ui.label("Grupo");
+                ui.add(egui::TextEdit::singleline(&mut self.library.brushes[i].category).desired_width(150.0))
+                    .on_hover_text("Los pinceles con el mismo grupo se listan juntos");
+                ui.end_row();
+            });
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if ui.small_button("Guardar nuevo").on_hover_text("Añade los ajustes actuales como un pincel nuevo").clicked() {
                 let name = format!("Pincel {}", self.library.brushes.len() + 1);
-                self.library.brushes.push(Brush { name, settings: self.brush.clone() });
+                self.library.brushes.push(Brush { name, category: OWN_CATEGORY.to_owned(), settings: self.brush.clone() });
                 self.brush_index = Some(self.library.brushes.len() - 1);
+                self.brush_source = self.brush_index;
             }
             let stored = self.brush_index.filter(|&i| i < self.library.brushes.len());
             // The settings on screen have drifted from the brush they came from.
@@ -1506,30 +1888,6 @@ impl SharkPaintApp {
                 }
             }
         });
-        if let Some(i) = self.brush_source.filter(|&i| i < self.library.brushes.len()) {
-            ui.horizontal(|ui| {
-                ui.label("Nombre");
-                ui.add(egui::TextEdit::singleline(&mut self.library.brushes[i].name).desired_width(150.0));
-            });
-        }
-        if ui
-            .small_button("Importar de Photoshop (.abr)…")
-            .on_hover_text("Añade las puntas de un archivo de pinceles de Photoshop.\nSe importan la forma, el tamaño y el espaciado; el resto se ajusta aquí.\nTambién puedes arrastrar el archivo a la ventana.")
-            .clicked()
-        {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Importar pinceles de Photoshop")
-                .add_filter("Pinceles de Photoshop", &["abr"])
-                .pick_file()
-            {
-                self.import_abr(&path);
-            }
-        }
-        if ui.small_button("Restaurar los pinceles iniciales").clicked() {
-            self.library.brushes = self.library.default_brushes();
-            self.brush_index = self.library.brushes.iter().position(|b| b.settings == self.brush);
-            self.brush_source = self.brush_index;
-        }
     }
 
     /// A sample stroke of the brush on screen.
@@ -1646,6 +2004,106 @@ impl SharkPaintApp {
         ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
     }
 
+    /// Loads the chosen typeface if it is not the one in hand. A file that
+    /// cannot be used falls back to the bundled typeface.
+    fn text_font(&mut self) -> &TextFont {
+        let index = self.text_font_index;
+        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != index) {
+            let entry = self.text_fonts.as_ref().and_then(|fonts| fonts.get(index)).cloned();
+            let font = entry
+                .and_then(|(name, path)| TextFont::from_bytes(name, std::fs::read(path?).ok()?))
+                .unwrap_or_else(TextFont::builtin);
+            self.text_font = Some((index, font));
+        }
+        &self.text_font.as_ref().expect("just loaded").1
+    }
+
+    /// Redraws the text waiting to be placed when what it shows has changed.
+    fn sync_text_preview(&mut self, ctx: &egui::Context) {
+        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_index, self.color);
+        if self.text_preview.as_ref().is_some_and(|preview| preview.key == key) {
+            return;
+        }
+        let (size, color, content) = (self.text_size, self.color, self.text_content.clone());
+        self.text_preview = render_text(self.text_font(), &content, size, color).map(|(width, height, rgba)| {
+            let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+            let texture = ctx.load_texture("texto", image, TextureOptions::LINEAR);
+            TextPreview { key: key.clone(), width, height, rgba, texture }
+        });
+        if self.text_preview.is_none() && !self.text_content.trim().is_empty() && self.text_anchor.is_some() {
+            self.status = "El texto es demasiado grande para dibujarlo; reduce el tamaño.".into();
+        }
+    }
+
+    /// Puts the text on the canvas as a layer of its own.
+    fn place_text(&mut self, ctx: &egui::Context) {
+        self.sync_text_preview(ctx);
+        let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) else { return };
+        let name: String = self.text_content.lines().next().unwrap_or("Texto").chars().take(24).collect();
+        self.doc.add_image_layer(name.trim(), preview.width, preview.height, &preview.rgba, anchor.x as i32, anchor.y as i32);
+        self.note_color();
+        self.text_anchor = None;
+        self.status = "Texto colocado en una capa nueva. Muévelo o transfórmalo como cualquier capa.".into();
+    }
+
+    /// What to write, in which typeface and how tall.
+    fn text_panel(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(248.0);
+        let fonts = self.text_fonts.get_or_insert_with(|| {
+            let mut fonts = vec![("Ubuntu Light (incluida)".to_owned(), None)];
+            fonts.extend(installed_fonts());
+            fonts
+        });
+        self.text_font_index = self.text_font_index.min(fonts.len() - 1);
+        ui.add(
+            egui::TextEdit::multiline(&mut self.text_content)
+                .hint_text("Escribe aquí el texto")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        egui::Grid::new("texto").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Fuente");
+            let fonts = self.text_fonts.as_ref().expect("filled above");
+            egui::ComboBox::from_id_salt("fuente_texto")
+                .selected_text(fonts[self.text_font_index].0.as_str())
+                .width(170.0)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    for (i, (name, _)) in fonts.iter().enumerate() {
+                        ui.selectable_value(&mut self.text_font_index, i, name);
+                    }
+                });
+            ui.end_row();
+            ui.label("Tamaño");
+            ui.add(egui::Slider::new(&mut self.text_size, 8.0..=1000.0).logarithmic(true).fixed_decimals(0).suffix(" px"));
+            ui.end_row();
+        });
+        let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+                self.place_text(ui.ctx());
+            }
+            if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+                self.text_anchor = None;
+            }
+        });
+        ui.label(if self.text_anchor.is_some() {
+            "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
+        } else {
+            "Haz clic en el lienzo donde quieras el texto."
+        });
+        ui.label("Al colocarlo queda en una capa nueva, como imagen: después no se puede reescribir.");
+        // Shortcuts work while typing too.
+        let (place, cancel) = ui.input(|i| {
+            (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
+        });
+        if place && ready {
+            self.place_text(ui.ctx());
+        } else if cancel {
+            self.text_anchor = None;
+        }
+    }
+
     /// How much the brush mixes with the paint already on the canvas.
     fn mix_settings(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
@@ -1670,8 +2128,7 @@ impl SharkPaintApp {
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         match self.tool {
-            Tool::Pincel => self.brush_library(ui),
-            Tool::Borrador | Tool::Difuminar => {}
+            Tool::Pincel | Tool::Borrador | Tool::Difuminar => {}
             Tool::Relleno => {
                 ui.horizontal(|ui| {
                     ui.label("Tolerancia");
@@ -1695,6 +2152,37 @@ impl SharkPaintApp {
                 self.transform_panel(ui);
                 return;
             }
+            Tool::Forma => {
+                ui.set_width(248.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (shape, name) in [(Figure::Line, "Línea"), (Figure::Rectangle, "Rectángulo"), (Figure::Ellipse, "Elipse")] {
+                        ui.selectable_value(&mut self.shape_kind, shape, name);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add_enabled_ui(self.shape_kind != Figure::Line, |ui| {
+                    ui.checkbox(&mut self.shape_filled, "Rellena").on_hover_text("Desmarcado, dibuja solo el contorno");
+                });
+                let outlined = self.shape_kind == Figure::Line || !self.shape_filled;
+                egui::Grid::new("forma").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Grosor");
+                    ui.add_enabled(
+                        outlined,
+                        egui::Slider::new(&mut self.shape_width, 1.0..=200.0).logarithmic(true).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                    ui.label("Opacidad");
+                    ui.add(egui::Slider::new(&mut self.shape_opacity, 0.01..=1.0).custom_formatter(percent));
+                    ui.end_row();
+                });
+                ui.label("Arrastra sobre el lienzo para dibujar con el color elegido.");
+                ui.label("Mayús: cuadrado, círculo o línea a 45°.");
+                return;
+            }
+            Tool::Texto => {
+                self.text_panel(ui);
+                return;
+            }
             Tool::Seleccion => {
                 ui.horizontal_wrapped(|ui| {
                     for (shape, name) in SelectShape::ALL {
@@ -1702,64 +2190,149 @@ impl SharkPaintApp {
                     }
                 });
                 ui.add_space(4.0);
-                ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
-                ui.label("Un clic sin arrastrar quita la selección.");
+                ui.horizontal_wrapped(|ui| {
+                    for (mode, name, tip) in [
+                        (SelectMode::Replace, "Nueva", "Sustituye la selección"),
+                        (SelectMode::Add, "Añadir", "Suma a la selección"),
+                        (SelectMode::Subtract, "Quitar", "Resta de la selección"),
+                        (SelectMode::Intersect, "Intersecar", "Deja solo lo que coincide con la selección"),
+                    ] {
+                        ui.selectable_value(&mut self.select_mode, mode, name).on_hover_text(tip);
+                    }
+                });
+                ui.add_space(4.0);
+                if self.select_shape == SelectShape::Varita {
+                    ui.horizontal(|ui| {
+                        ui.label("Tolerancia");
+                        ui.add(egui::Slider::new(&mut self.select_tolerance, 0.0..=1.0).custom_formatter(percent));
+                    });
+                    ui.checkbox(&mut self.select_contiguous, "Solo la zona tocada")
+                        .on_hover_text("Desmarcado, toma ese color en todo el lienzo");
+                    ui.checkbox(&mut self.select_all_layers, "Tener en cuenta todas las capas");
+                    ui.label("Haz clic sobre un color para seleccionar su zona.");
+                } else {
+                    ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
+                    if self.select_mode == SelectMode::Replace {
+                        ui.label("Un clic sin arrastrar quita la selección.");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Invertir").on_hover_text("Ctrl+Mayús+I").clicked() {
+                        self.doc.invert_selection();
+                    }
+                    if ui.small_button("Deseleccionar").on_hover_text("Ctrl+D").clicked() {
+                        self.doc.deselect();
+                    }
+                });
                 ui.label("Pintar, borrar, rellenar, transformar y voltear afectan solo a lo seleccionado.");
                 return;
             }
         }
 
-        if self.tool != Tool::Difuminar {
-            self.brush_sample(ui);
-            ui.checkbox(&mut self.symmetry, "Simetría")
-                .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
-        }
         let smudging = self.tool == Tool::Difuminar;
-        egui::CollapsingHeader::new("Trazo").default_open(true).show(ui, |ui| {
-            let b = self.active_brush();
-            egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Tamaño");
-                ui.add(
-                    egui::Slider::new(&mut b.size, 1.0..=MAX_BRUSH_SIZE)
-                        .logarithmic(true)
-                        .fixed_decimals(0)
-                        .suffix(" px"),
-                );
-                ui.end_row();
-                let rows: Vec<(&str, &mut f32, f32, f32)> = if smudging {
-                    vec![("Intensidad", &mut b.flow, 0.01, 1.0), ("Dureza", &mut b.hardness, 0.0, 1.0)]
-                } else {
-                    vec![
-                        ("Opacidad", &mut b.opacity, 0.01, 1.0),
-                        ("Flujo", &mut b.flow, 0.01, 1.0),
-                        ("Dureza", &mut b.hardness, 0.0, 1.0),
-                        ("Espaciado", &mut b.spacing, 0.01, 2.0),
-                        ("Estabilizador", &mut b.smoothing, 0.0, 0.95),
-                    ]
-                };
-                for (label, value, min, max) in rows {
-                    ui.label(label);
-                    ui.add(egui::Slider::new(value, min..=max).custom_formatter(percent));
-                    ui.end_row();
-                }
-            });
-        });
+        ui.set_width(248.0);
         if !smudging {
-            egui::CollapsingHeader::new("Punta").default_open(false).show(ui, |ui| self.tip_settings(ui));
-            egui::CollapsingHeader::new("Textura de papel").default_open(false).show(ui, |ui| self.paper_settings(ui));
-            egui::CollapsingHeader::new("Mezcla de color").default_open(false).show(ui, |ui| self.mix_settings(ui));
+            self.brush_sample(ui);
         }
-        egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
-            let b = self.active_brush();
-            ui.checkbox(&mut b.pressure_size, "Controla el tamaño");
-            ui.add_enabled_ui(b.pressure_size, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Tamaño mínimo");
-                    ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
-                });
+        // What is in hand, and the switch for the settings used less often.
+        ui.horizontal(|ui| {
+            let source = self.brush_source.filter(|&i| i < self.library.brushes.len());
+            let title = match (self.tool, source) {
+                (Tool::Pincel, Some(i)) => {
+                    let changed = self.brush_index.is_none();
+                    format!("{}{}", self.library.brushes[i].name, if changed { " (modificado)" } else { "" })
+                }
+                (Tool::Pincel, None) => "Pincel sin guardar".to_owned(),
+                _ => self.tool.name().to_owned(),
+            };
+            ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.toggle_value(&mut self.brush_advanced, egui::RichText::new("⚙").size(16.0)).on_hover_text("Más ajustes: punta, papel, mezcla, presión y guardado");
             });
-            ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
         });
+
+        // How the stroke combines with what is already on the layer.
+        if self.tool == Tool::Pincel {
+            let width = ui.available_width();
+            let mixing = self.brush.mix > 0.0;
+            ui.add_enabled_ui(!mixing, |ui| {
+                egui::ComboBox::from_id_salt("fusion_pincel")
+                    .selected_text(if mixing { "Normal" } else { self.brush.blend.name() })
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for mode in BlendMode::ALL {
+                            ui.selectable_value(&mut self.brush.blend, mode, mode.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Modo de fusión del pincel: cómo se combina el trazo\ncon lo que ya hay en la capa")
+                    .on_disabled_hover_text("Los pinceles que mezclan color pintan siempre en modo normal");
+            });
+        }
+
+        // The four settings reached for all the time, each on its own line.
+        {
+            ui.spacing_mut().slider_width = 176.0;
+            let b = self.active_brush();
+            let caption = |ui: &mut egui::Ui, text: &str| {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(text).size(12.0));
+            };
+            caption(ui, "Tamaño");
+            ui.add(egui::Slider::new(&mut b.size, 1.0..=MAX_BRUSH_SIZE).logarithmic(true).fixed_decimals(0).suffix(" px"));
+            let rows: Vec<(&str, &mut f32, f32)> = if smudging {
+                vec![("Intensidad", &mut b.flow, 0.01), ("Dureza", &mut b.hardness, 0.0)]
+            } else {
+                vec![("Opacidad", &mut b.opacity, 0.01), ("Flujo", &mut b.flow, 0.01), ("Dureza", &mut b.hardness, 0.0)]
+            };
+            for (label, value, min) in rows {
+                caption(ui, label);
+                ui.add(egui::Slider::new(value, min..=1.0).custom_formatter(percent));
+            }
+        }
+
+        if self.brush_advanced {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.spacing_mut().slider_width = 100.0;
+            if !smudging {
+                let b = self.active_brush();
+                egui::Grid::new("ajustes").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Espaciado");
+                    ui.add(egui::Slider::new(&mut b.spacing, 0.01..=2.0).custom_formatter(percent));
+                    ui.end_row();
+                    ui.label("Estabilizador");
+                    ui.add(egui::Slider::new(&mut b.smoothing, 0.0..=0.95).custom_formatter(percent));
+                    ui.end_row();
+                });
+                ui.checkbox(&mut self.symmetry, "Simetría")
+                    .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
+            }
+            egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
+                let b = self.active_brush();
+                ui.checkbox(&mut b.pressure_size, "Controla el tamaño");
+                ui.add_enabled_ui(b.pressure_size, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Tamaño mínimo");
+                        ui.add(egui::Slider::new(&mut b.min_size, 0.0..=1.0).custom_formatter(percent));
+                    });
+                });
+                ui.checkbox(&mut b.pressure_flow, if smudging { "Controla la intensidad" } else { "Controla el flujo" });
+            });
+            if !smudging {
+                egui::CollapsingHeader::new("Punta").default_open(false).show(ui, |ui| self.tip_settings(ui));
+                egui::CollapsingHeader::new("Textura de papel").default_open(false).show(ui, |ui| self.paper_settings(ui));
+                egui::CollapsingHeader::new("Mezcla de color").default_open(false).show(ui, |ui| self.mix_settings(ui));
+            }
+            if self.tool == Tool::Pincel {
+                egui::CollapsingHeader::new("Guardar en la biblioteca").default_open(false).show(ui, |ui| self.brush_storage(ui));
+            }
+        }
+        if self.tool == Tool::Pincel {
+            ui.add_space(4.0);
+            ui.separator();
+            self.brush_library(ui);
+        }
         if self.tool == Tool::Pincel {
             // Remember which brush these settings started from, and whether
             // they still match it.
@@ -1794,6 +2367,9 @@ impl SharkPaintApp {
         let active = self.doc.active_layer();
         let text = ui.visuals().strong_text_color();
         let faint = ui.visuals().weak_text_color();
+        // The chosen group, if it still exists.
+        self.active_group = self.active_group.filter(|&id| self.doc.group(id).is_some());
+        let chosen_group = self.active_group;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let tool = |ui: &mut egui::Ui, name: &str, enabled: bool, tip: &str| {
@@ -1807,21 +2383,84 @@ impl SharkPaintApp {
             if tool(ui, "duplicar", true, "Duplicar capa (Ctrl+J)") {
                 commands.push(Command::LayerDuplicate);
             }
-            if tool(ui, "subir", active + 1 < count, "Subir capa") {
-                commands.push(Command::LayerMove(true));
+            if tool(ui, "carpeta", chosen_group.is_none(), "Agrupar: pone la capa en un grupo nuevo") {
+                commands.push(Command::LayerGroup);
             }
-            if tool(ui, "bajar", active > 0, "Bajar capa") {
-                commands.push(Command::LayerMove(false));
-            }
-            if tool(ui, "fusionar", active > 0, "Fusionar con la capa inferior") {
-                commands.push(Command::LayerMerge);
-            }
-            if tool(ui, "quitar", count > 1, "Eliminar capa") {
-                commands.push(Command::LayerDelete);
+            match chosen_group {
+                // A group is chosen: the arrows move all of it.
+                Some(id) => {
+                    if tool(ui, "subir", true, "Subir el grupo") {
+                        self.doc.move_group(id, true);
+                    }
+                    if tool(ui, "bajar", true, "Bajar el grupo") {
+                        self.doc.move_group(id, false);
+                    }
+                    if tool(ui, "quitar", true, "Desagrupar: las capas se quedan") {
+                        self.doc.ungroup(id);
+                        self.active_group = None;
+                    }
+                }
+                None => {
+                    let grouped = self.doc.active().group != 0;
+                    let tip = if grouped { "Subir capa (en el borde del grupo, sale de él)" } else { "Subir capa" };
+                    if tool(ui, "subir", active + 1 < count || grouped, tip) {
+                        commands.push(Command::LayerMove(true));
+                    }
+                    let tip = if grouped { "Bajar capa (en el borde del grupo, sale de él)" } else { "Bajar capa" };
+                    if tool(ui, "bajar", active > 0 || grouped, tip) {
+                        commands.push(Command::LayerMove(false));
+                    }
+                    if tool(ui, "fusionar", active > 0, "Fusionar con la capa inferior") {
+                        commands.push(Command::LayerMerge);
+                    }
+                    if tool(ui, "quitar", count > 1, "Eliminar capa") {
+                        commands.push(Command::LayerDelete);
+                    }
+                }
             }
         });
 
-        // Properties of the active layer.
+        // Properties of the chosen group, or of the active layer.
+        let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
+        if let Some(before) = chosen_group.and_then(|id| self.doc.group(id).cloned()) {
+            let mut group = before.clone();
+            let mut continuous = false;
+            egui::Grid::new("grupo_activo").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Grupo");
+                let name = ui.add(egui::TextEdit::singleline(&mut group.name).desired_width(150.0));
+                continuous |= name.has_focus();
+                ui.end_row();
+                ui.label("Modo");
+                egui::ComboBox::from_id_salt("modo_fusion_grupo").selected_text(group.blend.name()).show_ui(ui, |ui| {
+                    for mode in BlendMode::ALL {
+                        ui.selectable_value(&mut group.blend, mode, mode.name());
+                    }
+                });
+                ui.end_row();
+                ui.label("Opacidad");
+                let slider = ui.add(egui::Slider::new(&mut group.opacity, 0.0..=1.0).custom_formatter(percent));
+                continuous |= slider.dragged();
+                ui.end_row();
+            });
+            ui.label(if group.blend == BlendMode::Normal {
+                "En modo normal, cada capa del grupo se mezcla por su cuenta con lo de abajo."
+            } else {
+                "Las capas del grupo se combinan entre sí y el resultado se mezcla con lo de abajo."
+            });
+            if group != before {
+                self.doc.set_group(group, self.prop_edit_active);
+                self.prop_edit_active = continuous;
+            } else if !continuous {
+                self.prop_edit_active = false;
+            }
+        } else {
+            self.active_layer_props(ui, active);
+        }
+        self.layer_list(ui, active, text, faint);
+    }
+
+    /// Name, blend mode, opacity and switches of the active layer.
+    fn active_layer_props(&mut self, ui: &mut egui::Ui, active: usize) {
         let before = self.doc.active().props.clone();
         let mut props = before.clone();
         let mut continuous = false;
@@ -1857,18 +2496,93 @@ impl SharkPaintApp {
         } else if !continuous {
             self.prop_edit_active = false;
         }
+    }
 
+    /// The stack, top layer first: visibility, preview, name. A group shows as
+    /// a heading above its layers, which are set in from the edge.
+    fn layer_list(&mut self, ui: &mut egui::Ui, active: usize, text: Color32, faint: Color32) {
+        let chosen_group = self.active_group;
         ui.add_space(4.0);
-        // The stack, top layer first: visibility, preview, name.
         let mut select = None;
         let mut toggle = None;
+        let mut select_group = None;
+        let mut toggle_group = None;
+        let mut fold_group = None;
         egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, layer) in self.doc.layers().iter().enumerate().rev() {
+            let layers = self.doc.layers();
+            for (i, layer) in layers.iter().enumerate().rev() {
+                let group = self.doc.group(layer.group);
+                // The heading goes above the group's topmost layer.
+                if let Some(group) = group.filter(|g| layers.get(i + 1).is_none_or(|above| above.group != g.id)) {
+                    let ink = if group.visible { text } else { faint };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let (eye, tip) = if group.visible { ("ojo", "Ocultar grupo") } else { ("ojoCerrado", "Mostrar grupo") };
+                        let button = egui::Button::image(icon(eye, 16.0, ink)).frame(false).min_size(Vec2::new(26.0, 26.0));
+                        if ui.add(button).on_hover_text(tip).clicked() {
+                            toggle_group = Some(group.id);
+                        }
+                        let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                        let painter = ui.painter().with_clip_rect(row);
+                        let selected = chosen_group == Some(group.id);
+                        if selected {
+                            painter.rect_filled(row, 4.0, ui.visuals().selection.bg_fill);
+                        } else if response.hovered() {
+                            painter.rect_filled(row, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                        }
+                        let ink = if selected { ui.visuals().selection.stroke.color } else { ink };
+                        // The arrow folds the group; the rest of the row chooses it.
+                        let arrow = Rect::from_min_size(row.min, Vec2::new(20.0, row.height()));
+                        painter.text(
+                            arrow.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if group.collapsed { "▶" } else { "▼" },
+                            egui::FontId::proportional(10.0),
+                            ink,
+                        );
+                        let folder = Rect::from_center_size(Pos2::new(row.left() + 30.0, row.center().y), Vec2::splat(16.0));
+                        icon("carpeta", 16.0, ink).paint_at(ui, folder);
+                        let members = layers.iter().filter(|l| l.group == group.id).count();
+                        let mut label = group.name.clone();
+                        if group.collapsed {
+                            label.push_str(&format!(" ({members})"));
+                        }
+                        if group.blend != BlendMode::Normal {
+                            label.push_str(&format!(" · {}", group.blend.name()));
+                        }
+                        if group.opacity < 1.0 {
+                            label.push_str(&format!(" · {:.0} %", group.opacity * 100.0));
+                        }
+                        painter.text(
+                            Pos2::new(row.left() + 44.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(13.0),
+                            ink,
+                        );
+                        if response.clicked() {
+                            let on_arrow = response.interact_pointer_pos().is_some_and(|pos| arrow.contains(pos));
+                            if on_arrow {
+                                fold_group = Some((group.id, !group.collapsed));
+                            } else {
+                                select_group = Some(group.id);
+                            }
+                        }
+                    });
+                }
+                if group.is_some_and(|g| g.collapsed) {
+                    continue;
+                }
                 let props = &layer.props;
-                let ink = if props.visible { text } else { faint };
+                let in_group = group.is_some();
+                let shown = props.visible && group.is_none_or(|g| g.visible);
+                let ink = if shown { text } else { faint };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    if in_group {
+                        ui.add_space(12.0);
+                    }
                     let (eye, tip) = if props.visible {
                         ("ojo", "Ocultar capa")
                     } else {
@@ -1884,7 +2598,7 @@ impl SharkPaintApp {
                     let size = Vec2::new(ui.available_width(), ROW_HEIGHT);
                     let (row, response) = ui.allocate_exact_size(size, Sense::click());
                     let painter = ui.painter().with_clip_rect(row);
-                    let selected = i == active;
+                    let selected = i == active && chosen_group.is_none();
                     if selected {
                         painter.rect_filled(row, 4.0, ui.visuals().selection.bg_fill);
                     } else if response.hovered() {
@@ -1957,6 +2671,17 @@ impl SharkPaintApp {
         }
         if let Some(i) = select {
             self.doc.set_active_layer(i);
+            self.active_group = None;
+        }
+        if let Some(id) = select_group {
+            self.active_group = Some(id);
+        }
+        if let Some((id, collapsed)) = fold_group {
+            self.doc.set_group_collapsed(id, collapsed);
+        }
+        if let Some(mut group) = toggle_group.and_then(|id| self.doc.group(id).cloned()) {
+            group.visible = !group.visible;
+            self.doc.set_group(group, false);
         }
     }
 
@@ -2175,6 +2900,9 @@ impl SharkPaintApp {
                     self.brush_index = Some(before);
                     self.brush_source = Some(before);
                     self.tool = Tool::Pincel;
+                    // Show the group that has just arrived.
+                    self.brush_category = brush.category.clone();
+                    self.brush_search.clear();
                 }
                 self.library.save();
             }
@@ -2208,8 +2936,8 @@ impl SharkPaintApp {
                 continue;
             }
             let on_references = self.pointer_on_references;
-            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION)) {
-                self.status = "Para abrir un proyecto usa Archivo → Abrir.".into();
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(PROJECT_EXTENSION) || e.eq_ignore_ascii_case("psd")) {
+                self.status = "Para abrir un proyecto o un documento de Photoshop usa Archivo → Abrir.".into();
             } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("abr")) {
                 self.import_abr(&path);
             } else if on_references {
@@ -2359,7 +3087,25 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
-                    if self.tool == Tool::Seleccion && !alt {
+                    if self.tool == Tool::Texto && !alt {
+                        // Press to put the text there; keep holding to move it.
+                        self.text_anchor = Some(c.round());
+                        self.text_dragging = true;
+                        continue;
+                    }
+                    if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
+                        let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
+                        self.doc.select_similar(
+                            x,
+                            y,
+                            self.select_tolerance,
+                            self.select_all_layers,
+                            self.select_contiguous,
+                            self.select_mode,
+                        );
+                        continue;
+                    }
+                    if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
                         self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
                         continue;
                     }
@@ -2421,6 +3167,7 @@ impl SharkPaintApp {
                     }
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
+                Event::PointerMoved(pos) if self.text_dragging => self.text_anchor = Some(to_canvas(*pos).round()),
                 Event::PointerMoved(pos) if self.select_drag.is_some() => {
                     if let Some(drag) = &mut self.select_drag {
                         drag.to = to_canvas(*pos);
@@ -2454,6 +3201,10 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
+                    if self.text_dragging {
+                        self.text_dragging = false;
+                        continue;
+                    }
                     if self.tool == Tool::Transformar {
                         // The transform stays open between drags; only the drag ends.
                         if let Some(xform) = &mut self.xform {
@@ -2462,10 +3213,26 @@ impl SharkPaintApp {
                         continue;
                     }
                     if let Some(drag) = self.select_drag.take() {
+                        if self.tool == Tool::Forma {
+                            if drag.moved {
+                                let (from, to) = shape_ends(self.shape_kind, drag.from, drag.to, free);
+                                self.doc.draw_shape(
+                                    self.shape_kind,
+                                    (from.x, from.y),
+                                    (to.x, to.y),
+                                    self.color,
+                                    self.shape_width,
+                                    self.shape_filled,
+                                    self.shape_opacity,
+                                );
+                                self.note_color();
+                            }
+                            continue;
+                        }
                         if drag.moved {
                             let outline = self.select_shape.outline(drag.from, drag.to, &drag.trail, free);
-                            self.doc.select_polygon(&outline);
-                        } else {
+                            self.doc.select_polygon_with(&outline, self.select_mode);
+                        } else if self.select_mode == SelectMode::Replace {
                             self.doc.deselect();
                         }
                         continue;
@@ -2565,10 +3332,78 @@ impl SharkPaintApp {
             painter.add(Shape::line(points.clone(), Stroke::new(1.0, Color32::WHITE)));
             painter.extend(Shape::dashed_line(&points, Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
         };
-        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
+        if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved && self.tool == Tool::Forma) {
+            // The shape being dragged out, as it will be drawn.
+            let (from, to) = shape_ends(self.shape_kind, drag.from, drag.to, free);
+            let screen = |p: Pos2| self.view.to_screen(p, viewport, doc_size);
+            let ink = Color32::from_rgb(self.color[0], self.color[1], self.color[2]).gamma_multiply(self.shape_opacity);
+            let stroke = Stroke::new((self.shape_width * self.view.zoom).max(1.0), ink);
+            let rect = Rect::from_two_pos(from, to);
+            let points: Vec<Pos2> = match self.shape_kind {
+                Figure::Line => vec![screen(from), screen(to)],
+                Figure::Rectangle => [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()].map(screen).to_vec(),
+                Figure::Ellipse => (0..72)
+                    .map(|i| {
+                        let a = i as f32 / 72.0 * std::f32::consts::TAU;
+                        screen(rect.center() + Vec2::new(rect.width() * 0.5 * a.cos(), rect.height() * 0.5 * a.sin()))
+                    })
+                    .collect(),
+            };
+            match self.shape_kind {
+                Figure::Line => {
+                    painter.line_segment([points[0], points[1]], stroke);
+                }
+                _ if self.shape_filled => {
+                    painter.add(Shape::convex_polygon(points, ink, Stroke::NONE));
+                }
+                _ => {
+                    painter.add(Shape::closed_line(points, stroke));
+                }
+            }
+        } else if let Some(drag) = self.select_drag.as_ref().filter(|d| d.moved) {
             dashed(&self.select_shape.outline(drag.from, drag.to, &drag.trail, free));
-        } else if let Some(selection) = self.doc.selection() {
-            dashed(&selection.outline);
+        }
+        if let Some(selection) = self.doc.selection() {
+            // The border as runs along pixel edges; only those in view are drawn.
+            let visible = painter.clip_rect().expand(2.0);
+            let mut drawn = 0;
+            for [a, b] in &selection.edges {
+                let a = self.view.to_screen(Pos2::new(a.0, a.1), viewport, doc_size);
+                let b = self.view.to_screen(Pos2::new(b.0, b.1), viewport, doc_size);
+                if !visible.intersects(Rect::from_two_pos(a, b)) {
+                    continue;
+                }
+                drawn += 1;
+                painter.line_segment([a, b], Stroke::new(1.0, Color32::WHITE));
+                // Dashes cost more; an intricate border goes without once it is long.
+                if drawn < 6000 {
+                    painter.extend(Shape::dashed_line(&[a, b], Stroke::new(1.0, Color32::BLACK), 5.0, 5.0));
+                }
+            }
+        }
+
+        // Text waiting to be placed, shown where it will go.
+        if self.tool == Tool::Texto {
+            self.sync_text_preview(&ctx);
+            if let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) {
+                let size = Vec2::new(preview.width as f32, preview.height as f32);
+                let corners = [Vec2::ZERO, Vec2::new(size.x, 0.0), size, Vec2::new(0.0, size.y)]
+                    .map(|offset| self.view.to_screen(anchor + offset, viewport, doc_size));
+                let mut mesh = Mesh::with_texture(preview.texture.id());
+                for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
+                    mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                }
+                mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+                painter.add(Shape::mesh(mesh));
+                let mut outline = corners.to_vec();
+                outline.push(corners[0]);
+                painter.extend(Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_rgb(111, 227, 240)), 5.0, 5.0));
+            } else if let Some(anchor) = self.text_anchor {
+                // Nothing written yet: a mark where the text will start.
+                let at = self.view.to_screen(anchor, viewport, doc_size);
+                let height = (self.text_size * self.view.zoom).max(8.0);
+                painter.line_segment([at, at + Vec2::new(0.0, height)], Stroke::new(1.5, Color32::from_rgb(111, 227, 240)));
+            }
         }
 
         // The transform box: outline and corner handles.
@@ -2587,7 +3422,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion) {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -2674,6 +3509,36 @@ impl SharkPaintApp {
         };
     }
 
+    /// Writes the drawing as a Photoshop document, layers and groups included.
+    fn export_psd(&mut self) {
+        self.doc.end_stroke();
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map_or("dibujo".to_owned(), |n| n.to_string_lossy().into_owned());
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title("Exportar como documento de Photoshop")
+            .add_filter("Documento de Photoshop", &["psd"])
+            .set_file_name(format!("{name}.psd"))
+            .save_file()
+        else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("psd");
+        }
+        let written = std::fs::File::create(&path).and_then(|file| {
+            let mut file = std::io::BufWriter::new(file);
+            self.doc.write_psd(&mut file)?;
+            std::io::Write::flush(&mut file)
+        });
+        self.status = match written {
+            Ok(()) => format!("Exportado: {}", path.display()),
+            Err(e) => format!("No se pudo exportar: {e}"),
+        };
+    }
+
     fn run(&mut self, command: Command, ctx: &egui::Context) {
         let viewport = self.viewport;
         let doc_size = self.doc_size();
@@ -2690,6 +3555,7 @@ impl SharkPaintApp {
                 self.save_project(true);
             }
             Command::ExportPng => self.export_png(),
+            Command::ExportPsd => self.export_psd(),
             Command::Undo => {
                 self.doc.undo();
             }
@@ -2708,6 +3574,10 @@ impl SharkPaintApp {
             Command::LayerMerge => {
                 self.doc.merge_down();
             }
+            Command::LayerGroup => match self.doc.group_active_layer() {
+                Some(id) => self.active_group = Some(id),
+                None => self.status = "Lleva la capa al borde de su grupo para sacarla a un grupo nuevo.".into(),
+            },
             Command::Fit => self.fit_pending = true,
             Command::ActualSize => {
                 self.view.zoom = 1.0;
@@ -2723,11 +3593,13 @@ impl SharkPaintApp {
             Command::Flip => self.view.flip = !self.view.flip,
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
             Command::ToggleReferences => self.refs_open = !self.refs_open,
+            Command::ToggleNavigator => self.nav_open = !self.nav_open,
             Command::ToggleSymmetry => self.symmetry = !self.symmetry,
             Command::Preferences => self.prefs_open = true,
             Command::FinishTransform(apply) => self.finish_transform(apply),
             Command::SelectAll => self.doc.select_all(),
             Command::Deselect => self.doc.deselect(),
+            Command::InvertSelection => self.doc.invert_selection(),
             Command::DeleteSelected => self.doc.clear_selection_contents(),
             Command::FlipContents(horizontal) => self.doc.flip(horizontal),
             Command::Fullscreen => {
@@ -2769,7 +3641,18 @@ impl eframe::App for SharkPaintApp {
             .resizable(false)
             .default_size(260.0)
             .show(ui, |ui| {
-                self.color_panel(ui);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.nav_open, false, egui::RichText::new("Color").strong());
+                    ui.selectable_value(&mut self.nav_open, true, egui::RichText::new("Navegador").strong())
+                        .on_hover_text("Vista del lienzo completo (F7)");
+                });
+                ui.add_space(2.0);
+                if self.nav_open {
+                    self.navigator_panel(ui, &mut commands);
+                } else {
+                    self.color_panel(ui);
+                }
                 ui.separator();
                 self.layers_panel(ui, &mut commands);
             });

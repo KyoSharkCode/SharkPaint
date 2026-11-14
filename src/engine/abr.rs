@@ -1,9 +1,9 @@
 //! Reader for Photoshop brush files (`.abr`).
 //!
-//! Only the sampled tips are read: the greyscale picture each brush stamps,
-//! plus its name, size, spacing, angle and roundness where the file states
-//! them. Photoshop's brush dynamics have no equivalent here and are ignored,
-//! as are computed (plain round) brushes, which carry no picture.
+//! A brush is either sampled (it stamps a greyscale picture) or computed (a
+//! plain round tip with a hardness). Both are read, with their name, size,
+//! spacing, angle and roundness, and whether pen pressure drives the size or
+//! the flow. The rest of Photoshop's dynamics have no equivalent here.
 //!
 //! Two layouts exist. Versions 1 and 2 are a flat list of brushes. Versions 6
 //! to 10 keep the pictures in a `samp` block and the settings in a `desc`
@@ -13,10 +13,19 @@
 #[derive(Clone, Debug, PartialEq)]
 pub struct AbrBrush {
     pub name: Option<String>,
+    /// Size of the picture; zero for a computed (round) brush.
     pub width: usize,
     pub height: usize,
     /// Coverage, row by row: 0 leaves the canvas alone, 255 paints fully.
+    /// Empty for a computed (round) brush.
     pub coverage: Vec<u8>,
+    /// Edge of a computed brush: 1 = crisp, 0 = fully soft.
+    pub hardness: Option<f32>,
+    /// Pen pressure changes the size, down to `min_size` (a share of it).
+    pub pressure_size: bool,
+    pub min_size: Option<f32>,
+    /// Pen pressure changes how much paint is laid down.
+    pub pressure_flow: bool,
     /// Distance between dabs as a share of the size (0.25 = a quarter).
     pub spacing: Option<f32>,
     /// Size in pixels the brush was saved at.
@@ -25,6 +34,30 @@ pub struct AbrBrush {
     pub angle: Option<f32>,
     /// 1 = as drawn, lower = squashed.
     pub roundness: Option<f32>,
+}
+
+impl AbrBrush {
+    /// A computed brush: a round tip with no picture.
+    pub fn is_round(&self) -> bool {
+        self.coverage.is_empty()
+    }
+
+    fn blank() -> Self {
+        AbrBrush {
+            name: None,
+            width: 0,
+            height: 0,
+            coverage: Vec::new(),
+            hardness: None,
+            pressure_size: false,
+            min_size: None,
+            pressure_flow: false,
+            spacing: None,
+            diameter: None,
+            angle: None,
+            roundness: None,
+        }
+    }
 }
 
 /// Largest tip side accepted; anything bigger is a damaged file.
@@ -59,7 +92,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Reads every sampled brush in a `.abr` file.
+/// Reads every brush in a `.abr` file, in the order the file lists them.
 pub fn read_abr(data: &[u8]) -> Result<Vec<AbrBrush>, String> {
     let mut r = Reader { data, at: 0 };
     let version = r.u16().map_err(|_| "no es un archivo de pinceles de Photoshop")?;
@@ -71,7 +104,7 @@ pub fn read_abr(data: &[u8]) -> Result<Vec<AbrBrush>, String> {
         _ => return Err("no es un archivo de pinceles de Photoshop".into()),
     };
     if brushes.is_empty() {
-        return Err("el archivo no contiene puntas dibujadas (solo pinceles redondos calculados)".into());
+        return Err("el archivo no contiene pinceles".into());
     }
     Ok(brushes)
 }
@@ -83,14 +116,35 @@ fn read_flat(r: &mut Reader, version: u16, count: u16) -> Result<Vec<AbrBrush>, 
         let Ok(kind) = r.u16() else { break };
         let Ok(size) = r.u32() else { break };
         let next = r.at.saturating_add(size as usize);
-        if kind == 2 {
-            if let Ok(brush) = read_flat_brush(r, version) {
-                brushes.push(brush);
-            }
-        }
+        // Read within the entry only, so a short one cannot run into the next.
+        let mut entry = Reader { data: &r.data[..next.min(r.data.len())], at: r.at };
+        let brush = match kind {
+            1 => read_flat_round(&mut entry),
+            2 => read_flat_brush(&mut entry, version),
+            _ => Err(String::new()),
+        };
+        brushes.extend(brush.ok());
         r.seek(next);
     }
     Ok(brushes)
+}
+
+/// A computed brush in the old layout: only numbers.
+fn read_flat_round(r: &mut Reader) -> Result<AbrBrush, String> {
+    r.u32()?; // unused
+    let spacing = r.u16()?;
+    let diameter = r.u16()?;
+    let roundness = r.u16()?;
+    let angle = r.u16()? as i16;
+    let hardness = r.u16()?;
+    Ok(AbrBrush {
+        spacing: Some(spacing as f32 / 100.0).filter(|s| *s > 0.0),
+        diameter: Some(diameter as f32).filter(|d| *d > 0.0),
+        roundness: Some(roundness as f32 / 100.0).filter(|v| *v > 0.0),
+        angle: Some(angle as f32),
+        hardness: Some(hardness as f32 / 100.0),
+        ..AbrBrush::blank()
+    })
 }
 
 fn read_flat_brush(r: &mut Reader, version: u16) -> Result<AbrBrush, String> {
@@ -115,9 +169,7 @@ fn read_flat_brush(r: &mut Reader, version: u16) -> Result<AbrBrush, String> {
         height,
         coverage,
         spacing: Some(spacing as f32 / 100.0).filter(|s| *s > 0.0),
-        diameter: None,
-        angle: None,
-        roundness: None,
+        ..AbrBrush::blank()
     })
 }
 
@@ -140,47 +192,211 @@ fn read_blocks(r: &mut Reader, subversion: u16) -> Result<Vec<AbrBrush>, String>
         }
         r.seek(end);
     }
-    let (start, end) = samples.ok_or("el archivo no contiene puntas dibujadas")?;
-    let presets = settings.map(presets).unwrap_or_default();
-
-    let mut brushes = Vec::new();
-    r.seek(start);
-    while r.at + 4 <= end {
-        let size = r.u32()? as usize;
-        let begin = r.at;
-        // Each entry is padded to a multiple of four bytes.
-        let next = begin.saturating_add(size.saturating_add(3) & !3);
-        // The entry opens with its identifier, then bytes of no use here.
-        let skip = if subversion == 1 { 47 } else { 301 };
-        let key = &r.data[begin.min(r.data.len())..(begin + skip).min(r.data.len())];
-        r.seek(begin + skip);
-        let brush = picture_header(r).and_then(|(width, height, depth, compressed)| {
-            let coverage = picture(r, width, height, depth, compressed)?;
-            Ok(AbrBrush { name: None, width, height, coverage, spacing: None, diameter: None, angle: None, roundness: None })
-        });
-        if let Ok(mut brush) = brush {
-            let index = brushes.len();
-            // Settings are matched by identifier; failing that, by position
-            // when the file has exactly one set of settings per picture.
-            let preset = presets
-                .iter()
-                .find(|p| !p.key.is_empty() && contains(key, p.key.as_bytes()))
-                .or_else(|| presets.get(index).filter(|p| p.key.is_empty()));
-            if let Some(preset) = preset {
-                brush.name = preset.name.clone();
-                brush.spacing = preset.spacing;
-                brush.diameter = preset.diameter;
-                brush.angle = preset.angle;
-                brush.roundness = preset.roundness;
+    // Pictures first, each under its identifier.
+    let mut pictures: Vec<(&[u8], AbrBrush)> = Vec::new();
+    if let Some((start, end)) = samples {
+        r.seek(start);
+        while r.at + 4 <= end {
+            let size = r.u32()? as usize;
+            let begin = r.at;
+            // Each entry is padded to a multiple of four bytes.
+            let next = begin.saturating_add(size.saturating_add(3) & !3);
+            // The entry opens with its identifier, then bytes of no use here.
+            let skip = if subversion == 1 { 47 } else { 301 };
+            let key = &r.data[begin.min(r.data.len())..(begin + skip).min(r.data.len())];
+            r.seek(begin + skip);
+            let brush = picture_header(r).and_then(|(width, height, depth, compressed)| {
+                let coverage = picture(r, width, height, depth, compressed)?;
+                Ok(AbrBrush { width, height, coverage, ..AbrBrush::blank() })
+            });
+            pictures.extend(brush.ok().map(|brush| (key, brush)));
+            if next <= begin {
+                break;
             }
-            brushes.push(brush);
+            r.seek(next);
         }
-        if next <= begin {
-            break;
+    }
+
+    // The settings list the brushes the user sees, in order; several may share
+    // a picture, and round ones have none.
+    if let Some(listed) = settings.and_then(listed_brushes) {
+        let mut used = vec![false; pictures.len()];
+        let mut brushes = Vec::new();
+        for (key, mut brush) in listed {
+            match key {
+                None => brushes.push(brush),
+                Some(key) => {
+                    let Some(i) = pictures.iter().position(|(id, _)| contains(id, key.as_bytes())) else { continue };
+                    used[i] = true;
+                    let picture = &pictures[i].1;
+                    (brush.width, brush.height, brush.coverage) = (picture.width, picture.height, picture.coverage.clone());
+                    brushes.push(brush);
+                }
+            }
         }
-        r.seek(next);
+        // Pictures no brush refers to are still worth having.
+        brushes.extend(pictures.into_iter().zip(used).filter(|(_, used)| !used).map(|((_, brush), _)| brush));
+        return Ok(brushes);
+    }
+
+    // Settings that cannot be read in full: look for the values by name.
+    let presets = settings.map(presets).unwrap_or_default();
+    let mut brushes = Vec::new();
+    for (index, (key, mut brush)) in pictures.into_iter().enumerate() {
+        let preset = presets
+            .iter()
+            .find(|p| !p.key.is_empty() && contains(key, p.key.as_bytes()))
+            .or_else(|| presets.get(index).filter(|p| p.key.is_empty()));
+        if let Some(preset) = preset {
+            brush.name = preset.name.clone();
+            brush.spacing = preset.spacing;
+            brush.diameter = preset.diameter;
+            brush.angle = preset.angle;
+            brush.roundness = preset.roundness;
+        }
+        brushes.push(brush);
     }
     Ok(brushes)
+}
+
+/// A value in the settings block, which is a tree of named values.
+enum Value {
+    Object(Vec<(String, Value)>),
+    List(Vec<Value>),
+    Number(f64),
+    Text(String),
+    Flag(bool),
+    Other,
+}
+
+impl Value {
+    fn get(&self, name: &str) -> Option<&Value> {
+        match self {
+            Value::Object(items) => items.iter().find(|(key, _)| key == name).map(|(_, value)| value),
+            _ => None,
+        }
+    }
+    fn number(&self, name: &str) -> Option<f32> {
+        match self.get(name)? {
+            Value::Number(v) if v.is_finite() => Some(*v as f32),
+            _ => None,
+        }
+    }
+    fn text(&self, name: &str) -> Option<String> {
+        match self.get(name)? {
+            Value::Text(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        }
+    }
+    fn flag(&self, name: &str) -> bool {
+        matches!(self.get(name), Some(Value::Flag(true)))
+    }
+    /// Whether a dynamics entry is driven by pen pressure.
+    fn by_pressure(&self, name: &str) -> bool {
+        self.get(name).and_then(|entry| entry.number("bVTy")) == Some(2.0)
+    }
+}
+
+/// A name in the tree: four letters, or a longer one with its length in front.
+fn tree_name(r: &mut Reader) -> Result<String, String> {
+    let length = r.u32()? as usize;
+    let bytes = r.take(if length == 0 { 4 } else { length })?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn tree_text(r: &mut Reader) -> Result<String, String> {
+    let chars = r.u32()? as usize;
+    Ok(utf16(r.take(chars.checked_mul(2).ok_or("texto dañado")?)?))
+}
+
+fn tree_object(r: &mut Reader, depth: u32) -> Result<Value, String> {
+    tree_text(r)?; // display name
+    tree_name(r)?; // class
+    let count = r.u32()?;
+    let mut items = Vec::new();
+    for _ in 0..count {
+        let name = tree_name(r)?;
+        items.push((name, tree_value(r, depth)?));
+    }
+    Ok(Value::Object(items))
+}
+
+fn tree_value(r: &mut Reader, depth: u32) -> Result<Value, String> {
+    if depth > 40 {
+        return Err("ajustes demasiado anidados".into());
+    }
+    Ok(match r.take(4)? {
+        b"Objc" | b"GlbO" => tree_object(r, depth + 1)?,
+        b"VlLs" => {
+            let count = r.u32()?;
+            let mut items = Vec::new();
+            for _ in 0..count {
+                items.push(tree_value(r, depth + 1)?);
+            }
+            Value::List(items)
+        }
+        b"doub" => Value::Number(f64::from_be_bytes(r.take(8)?.try_into().unwrap())),
+        b"UntF" => {
+            r.take(4)?; // unit
+            Value::Number(f64::from_be_bytes(r.take(8)?.try_into().unwrap()))
+        }
+        b"TEXT" => Value::Text(tree_text(r)?),
+        b"long" => Value::Number(r.i32()? as f64),
+        b"bool" => Value::Flag(r.u8()? != 0),
+        b"enum" => {
+            tree_name(r)?;
+            tree_name(r)?;
+            Value::Other
+        }
+        b"comp" => {
+            r.take(8)?;
+            Value::Other
+        }
+        b"tdta" | b"alis" => {
+            let length = r.u32()? as usize;
+            r.take(length)?;
+            Value::Other
+        }
+        b"type" | b"GlbC" => {
+            tree_text(r)?;
+            tree_name(r)?;
+            Value::Other
+        }
+        _ => return Err("ajuste de tipo desconocido".into()),
+    })
+}
+
+/// The brushes the settings block lists, each with the identifier of its
+/// picture if it has one. `None` if the block cannot be read in full.
+fn listed_brushes(block: &[u8]) -> Option<Vec<(Option<String>, AbrBrush)>> {
+    let mut r = Reader { data: block, at: 0 };
+    r.u32().ok()?; // version of the tree
+    let root = tree_object(&mut r, 0).ok()?;
+    let Value::List(presets) = root.get("Brsh")? else { return None };
+    let percent = |value: Option<f32>| value.map(|v| v / 100.0);
+    let mut brushes = Vec::new();
+    for preset in presets {
+        let Some(tip) = preset.get("Brsh") else { continue };
+        let key = tip.text("sampledData");
+        let pressure_size = preset.flag("useTipDynamics") && preset.by_pressure("szVr");
+        let paint = preset.flag("usePaintDynamics");
+        brushes.push((
+            key,
+            AbrBrush {
+                name: preset.text("Nm  ").or_else(|| tip.text("Nm  ")),
+                diameter: tip.number("Dmtr").filter(|v| *v > 0.0),
+                spacing: percent(tip.number("Spcn")).filter(|v| *v > 0.0),
+                angle: tip.number("Angl"),
+                roundness: percent(tip.number("Rndn")).filter(|v| *v > 0.0),
+                hardness: percent(tip.number("Hrdn")),
+                pressure_size,
+                min_size: percent(preset.number("minimumDiameter")).filter(|_| pressure_size),
+                pressure_flow: paint && (preset.by_pressure("prVr") || preset.by_pressure("opVr")),
+                ..AbrBrush::blank()
+            },
+        ));
+    }
+    Some(brushes).filter(|b| !b.is_empty())
 }
 
 /// Bounds, depth and compression flag in front of a picture.

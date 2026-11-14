@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::brush::BrushSettings;
-use super::layer::{blend_over, IRect, Layer, LayerProps, Tile, ONE, TILE};
-use super::selection::Selection;
+use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
+use super::selection::{SelectMode, Selection};
 use super::stroke::{ActiveStroke, StrokePoint};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
@@ -18,9 +18,21 @@ enum HistoryEntry {
     Tiles { layer: usize, tiles: Vec<(usize, Option<Arc<Tile>>)> },
     /// The whole layer stack (add, delete, reorder, merge). Tiles are shared,
     /// so the snapshot only costs the per-layer tile tables.
-    Layers { layers: Vec<Layer>, active: usize },
+    Layers { layers: Vec<Layer>, groups: Vec<LayerGroup>, active: usize },
+    /// The groups' names, visibility and opacity.
+    Groups(Vec<LayerGroup>),
     /// One layer's name, visibility, opacity, blend mode or alpha lock.
     Props { layer: usize, props: LayerProps },
+    /// The selection as it was.
+    Selection(Option<Arc<Selection>>),
+}
+
+/// A group whose layers are combined apart and blended in as one.
+#[derive(Clone, Copy)]
+struct Isolated {
+    id: u64,
+    opacity: u32,
+    blend: BlendMode,
 }
 
 /// A reference image kept alongside the drawing: shown in its own panel,
@@ -42,6 +54,8 @@ pub struct ProjectSnapshot {
     pub height: usize,
     pub paper: [u8; 3],
     pub layers: Vec<Layer>,
+    /// Layer groups; each layer names its group by `id`.
+    pub groups: Vec<LayerGroup>,
     pub active_layer: usize,
     pub references: Vec<Reference>,
 }
@@ -51,6 +65,8 @@ pub struct Document {
     pub height: usize,
     /// Bottom layer first.
     pub(super) layers: Vec<Layer>,
+    /// Layer groups, in no particular order; layers refer to them by id.
+    pub(super) groups: Vec<LayerGroup>,
     pub(super) active_layer: usize,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
@@ -96,6 +112,7 @@ impl Document {
             height,
             next_layer_number: layers.len() + 1,
             layers,
+            groups: Vec::new(),
             active_layer: active,
             paper: [255, 255, 255],
             symmetry: false,
@@ -157,6 +174,8 @@ impl Document {
         let mut layer = Layer::new(self.width, self.height, name);
         layer.id = self.stamp();
         layer.version = layer.id;
+        // A layer added inside a group joins it.
+        layer.group = self.active().group;
         self.active_layer += 1;
         self.layers.insert(self.active_layer, layer);
     }
@@ -180,22 +199,171 @@ impl Document {
         self.checkpoint_layers();
         self.layers.remove(self.active_layer);
         self.active_layer = self.active_layer.saturating_sub(1);
+        self.prune_groups();
         self.mark_dirty(self.bounds());
         true
     }
 
-    /// Moves the active layer one step up (`true`) or down the stack.
+    /// Moves the active layer one step up (`true`) or down the stack. At the
+    /// edge of its group the step takes it out of the group; next to another
+    /// group the step takes it in.
     pub fn move_layer(&mut self, up: bool) -> bool {
         let from = self.active_layer;
         let to = if up { from + 1 } else { from.wrapping_sub(1) };
+        let own = self.layers[from].group;
         if to >= self.layers.len() {
+            // Nothing beyond, but the layer can still step out of its group.
+            if own == 0 {
+                return false;
+            }
+            self.checkpoint_layers();
+            self.layers[from].group = 0;
+            self.prune_groups();
+            self.mark_dirty(self.bounds());
+            return true;
+        }
+        self.checkpoint_layers();
+        let next = self.layers[to].group;
+        if own == next {
+            self.layers.swap(from, to);
+            self.active_layer = to;
+        } else if own != 0 {
+            self.layers[from].group = 0;
+            self.prune_groups();
+        } else {
+            self.layers[from].group = next;
+        }
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    // --- Layer groups ---------------------------------------------------------
+
+    pub fn groups(&self) -> &[LayerGroup] {
+        &self.groups
+    }
+
+    pub fn group(&self, id: u64) -> Option<&LayerGroup> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// Whether a layer is on show, and its opacity (0..=32768), once its
+    /// group's visibility and opacity are counted in.
+    pub fn layer_display(&self, layer: &Layer) -> (bool, u32) {
+        let opacity = layer.props.opacity15();
+        match self.group(layer.group) {
+            // A group blended as one applies its opacity to the combined result.
+            Some(group) if group.blend != BlendMode::Normal => {
+                (layer.props.visible && group.visible && opacity > 0 && group.opacity > 0.0, opacity)
+            }
+            Some(group) => {
+                let faded = (opacity as f32 * group.opacity.clamp(0.0, 1.0)).round() as u32;
+                (layer.props.visible && group.visible && faded > 0, faded)
+            }
+            None => (layer.props.visible && opacity > 0, opacity),
+        }
+    }
+
+    /// Puts the active layer in a new group of its own and returns the
+    /// group's id. A layer already in a group is taken out of it first, which
+    /// is only possible at that group's edge; elsewhere this does nothing.
+    pub fn group_active_layer(&mut self) -> Option<u64> {
+        let index = self.active_layer;
+        let old = self.layers[index].group;
+        if old != 0 {
+            let inside = |i: usize| self.layers.get(i).is_some_and(|l| l.group == old);
+            if index > 0 && inside(index - 1) && inside(index + 1) {
+                return None; // it would split the group in two
+            }
+        }
+        self.checkpoint_layers();
+        let id = self.stamp();
+        let number = self.groups.len() + 1;
+        self.groups.push(LayerGroup { id, name: format!("Grupo {number}"), visible: true, opacity: 1.0, blend: BlendMode::Normal, collapsed: false });
+        self.layers[index].group = id;
+        self.prune_groups();
+        self.mark_dirty(self.bounds());
+        Some(id)
+    }
+
+    /// Dissolves a group; its layers stay where they are.
+    pub fn ungroup(&mut self, id: u64) -> bool {
+        if self.group(id).is_none() {
             return false;
         }
         self.checkpoint_layers();
-        self.layers.swap(from, to);
-        self.active_layer = to;
+        for layer in self.layers.iter_mut().filter(|l| l.group == id) {
+            layer.group = 0;
+        }
+        self.prune_groups();
         self.mark_dirty(self.bounds());
         true
+    }
+
+    /// Moves a whole group one step up (`true`) or down the stack, past the
+    /// layer or the group next to it.
+    pub fn move_group(&mut self, id: u64, up: bool) -> bool {
+        let Some(first) = self.layers.iter().position(|l| l.group == id) else { return false };
+        let last = self.layers.iter().rposition(|l| l.group == id).unwrap_or(first);
+        // The neighbouring block: one loose layer, or all of another group.
+        let (from, to) = if up {
+            if last + 1 >= self.layers.len() {
+                return false;
+            }
+            let other = self.layers[last + 1].group;
+            let end = if other == 0 { last + 1 } else { self.layers.iter().rposition(|l| l.group == other).unwrap_or(last + 1) };
+            (first, end)
+        } else {
+            if first == 0 {
+                return false;
+            }
+            let other = self.layers[first - 1].group;
+            let start = if other == 0 { first - 1 } else { self.layers.iter().position(|l| l.group == other).unwrap_or(first - 1) };
+            (start, last)
+        };
+        self.checkpoint_layers();
+        let active = self.layers[self.active_layer].id;
+        let members = last - first + 1;
+        if up {
+            self.layers[from..=to].rotate_left(members);
+        } else {
+            self.layers[from..=to].rotate_right(members);
+        }
+        self.active_layer = self.layers.iter().position(|l| l.id == active).unwrap_or(0);
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Replaces a group's name, visibility and opacity as one undoable step.
+    /// `coalesce` folds the change into the previous step when that step was
+    /// also a group edit, so dragging a slider is undone in one go.
+    pub fn set_group(&mut self, group: LayerGroup, coalesce: bool) {
+        let Some(index) = self.groups.iter().position(|g| g.id == group.id) else { return };
+        if self.groups[index] == group {
+            return;
+        }
+        self.end_stroke();
+        let before = self.groups.clone();
+        self.groups[index] = group;
+        if coalesce && matches!(self.undo.last(), Some(HistoryEntry::Groups(_))) {
+            self.revision += 1;
+        } else {
+            self.push_undo(HistoryEntry::Groups(before));
+        }
+        self.mark_dirty(self.bounds());
+    }
+
+    /// Folds or unfolds a group in the layer list. Not an undo step.
+    pub fn set_group_collapsed(&mut self, id: u64, collapsed: bool) {
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+            group.collapsed = collapsed;
+        }
+    }
+
+    /// Drops groups that no layer belongs to any more.
+    fn prune_groups(&mut self) {
+        let layers = &self.layers;
+        self.groups.retain(|g| layers.iter().any(|l| l.group == g.id));
     }
 
     /// Flattens the active layer into the one beneath it, baking in the active
@@ -207,6 +375,7 @@ impl Document {
         self.checkpoint_layers();
         let top = self.layers.remove(self.active_layer);
         self.active_layer -= 1;
+        self.prune_groups();
         let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
         below.version = version;
@@ -292,6 +461,7 @@ impl Document {
             height: self.height,
             paper: self.paper,
             layers: self.layers.clone(),
+            groups: self.groups.clone(),
             active_layer: self.active_layer,
             references: self.references.clone(),
         }
@@ -300,6 +470,30 @@ impl Document {
     /// Builds a document from loaded contents, with a clean history.
     pub fn from_snapshot(snapshot: ProjectSnapshot) -> Self {
         let mut doc = Document::from_layers(snapshot.width, snapshot.height, snapshot.layers, snapshot.active_layer);
+        // Groups get fresh ids that cannot clash with anything made later.
+        for mut group in snapshot.groups {
+            let id = doc.stamp();
+            for layer in doc.layers.iter_mut().filter(|l| l.group == group.id) {
+                layer.group = id;
+            }
+            group.id = id;
+            doc.groups.push(group);
+        }
+        // A layer naming a group that is not there, or a group split by other
+        // layers, would break the list: such layers go loose.
+        let known: Vec<u64> = doc.groups.iter().map(|g| g.id).collect();
+        let mut closed: Vec<u64> = Vec::new();
+        let mut previous = 0;
+        for layer in &mut doc.layers {
+            if layer.group != 0 && (!known.contains(&layer.group) || (layer.group != previous && closed.contains(&layer.group))) {
+                layer.group = 0;
+            }
+            if previous != 0 && layer.group != previous {
+                closed.push(previous);
+            }
+            previous = layer.group;
+        }
+        doc.prune_groups();
         doc.paper = snapshot.paper;
         doc.references = snapshot.references;
         doc
@@ -319,9 +513,47 @@ impl Document {
     /// Selects the inside of a closed polygon given in canvas coordinates.
     /// A polygon that covers nothing clears the selection.
     pub fn select_polygon(&mut self, points: &[(f32, f32)]) {
+        self.select_polygon_with(points, SelectMode::Replace);
+    }
+
+    /// Selects the inside of a closed polygon, combined with the selection
+    /// already there as `mode` says.
+    pub fn select_polygon_with(&mut self, points: &[(f32, f32)], mode: SelectMode) {
         self.end_stroke();
-        self.selection = Selection::from_polygon(self.width, self.height, points).map(Arc::new);
+        let shape = Selection::from_polygon(self.width, self.height, points);
+        let next = match (shape, mode) {
+            (shape, SelectMode::Replace) => shape,
+            // Adding or taking away nothing changes nothing.
+            (None, SelectMode::Add | SelectMode::Subtract) => return,
+            (None, SelectMode::Intersect) => None,
+            (Some(shape), _) => Selection::combined(self.selection.as_deref(), self.width, self.height, &shape.mask, mode),
+        };
+        self.set_selection(next.map(Arc::new));
+    }
+
+    /// Selects what was not selected, and the other way round.
+    pub fn invert_selection(&mut self) {
+        self.end_stroke();
+        match self.selection.clone() {
+            Some(selection) => self.set_selection(selection.inverted().map(Arc::new)),
+            None => self.select_all(),
+        }
+    }
+
+    /// Replaces the selection, remembering the old one for undo.
+    pub(super) fn set_selection(&mut self, next: Option<Arc<Selection>>) {
+        if self.selection.is_none() && next.is_none() {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.selection, next);
         self.selection_stamp += 1;
+        // The selection is not part of the drawing: changing it leaves the
+        // document as saved as it was.
+        self.undo.push(HistoryEntry::Selection(previous));
+        self.redo.clear();
+        if self.undo.len() > MAX_UNDO_STEPS {
+            self.undo.remove(0);
+        }
     }
 
     pub fn select_all(&mut self) {
@@ -331,9 +563,7 @@ impl Document {
 
     pub fn deselect(&mut self) {
         self.end_stroke();
-        if self.selection.take().is_some() {
-            self.selection_stamp += 1;
-        }
+        self.set_selection(None);
     }
 
     // --- Strokes --------------------------------------------------------------
@@ -456,6 +686,20 @@ impl Document {
         let to8 = |v: u32| ((v.min(ONE) * 255 + ONE / 2) >> 15) as u8;
         let paper8 = [to8(paper[0]), to8(paper[1]), to8(paper[2])];
 
+        // Whether each layer shows and how strongly, groups counted in.
+        let display: Vec<(bool, u32)> = self.layers.iter().map(|layer| self.layer_display(layer)).collect();
+        // The group each layer is gathered into, if its group blends as one.
+        let isolated: Vec<Option<Isolated>> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                self.group(layer.group).filter(|g| g.blend != BlendMode::Normal).map(|g| Isolated {
+                    id: g.id,
+                    opacity: (g.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
+                    blend: g.blend,
+                })
+            })
+            .collect();
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
         let (ty0, ty1) = (rect.y0 as usize / TILE, (rect.y1 as usize - 1) / TILE);
         for ty in ty0..=ty1 {
@@ -467,21 +711,22 @@ impl Document {
                 let y1 = rect.y1.min(oy + TILE as i32);
                 // Each drawable layer's tile, with the tile and opacity of the
                 // layer it is clipped to, if any.
-                let mut tiles: Vec<(&Tile, &LayerProps, Option<(&Tile, u32)>)> = Vec::new();
+                let mut tiles: Vec<(&Tile, &LayerProps, u32, Option<(&Tile, u32)>, Option<Isolated>)> = Vec::new();
                 let mut clip_base: Option<(&Tile, u32)> = None;
                 for (index, layer) in self.layers.iter().enumerate() {
                     let props = &layer.props;
-                    let shown = props.visible && props.opacity > 0.0;
+                    let (shown, opacity) = display[index];
+                    let isolated = isolated[index];
                     let tile = layer.tiles[layer.tile_index(tx, ty)].as_deref();
                     if props.clip && index > 0 {
                         if let (true, Some(tile), Some(base)) = (shown, tile, clip_base) {
-                            tiles.push((tile, props, Some(base)));
+                            tiles.push((tile, props, opacity, Some(base), isolated));
                         }
                     } else {
                         // A hidden or empty base hides everything clipped to it.
-                        clip_base = tile.filter(|_| shown).map(|t| (t, props.opacity15()));
+                        clip_base = tile.filter(|_| shown).map(|t| (t, opacity));
                         if let (true, Some(tile)) = (shown, tile) {
-                            tiles.push((tile, props, None));
+                            tiles.push((tile, props, opacity, None, isolated));
                         }
                     }
                 }
@@ -496,13 +741,31 @@ impl Document {
                         }
                         let i = row + (x - ox) as usize;
                         let mut c = [paper[0], paper[1], paper[2], ONE];
-                        for (tile, props, base) in &tiles {
-                            let mut opacity = props.opacity15();
+                        // A group blended as one gathers its layers apart, then
+                        // goes over the picture when the next thing comes up.
+                        let mut apart: Option<(Isolated, [u32; 4])> = None;
+                        let flush = |c: &mut [u32; 4], apart: &mut Option<(Isolated, [u32; 4])>| {
+                            if let Some((group, gathered)) = apart.take() {
+                                blend_over(c, gathered.map(|v| v as u16), group.opacity, group.blend);
+                            }
+                        };
+                        for (tile, props, opacity, base, isolated) in &tiles {
+                            let mut opacity = *opacity;
                             if let Some((base, base_opacity)) = base {
                                 opacity = (opacity * ((base.0[i][3] as u32 * base_opacity) >> 15)) >> 15;
                             }
-                            blend_over(&mut c, tile.0[i], opacity, props.blend);
+                            if apart.as_ref().map(|(group, _)| group.id) != isolated.map(|group| group.id) {
+                                flush(&mut c, &mut apart);
+                            }
+                            match isolated {
+                                Some(group) => {
+                                    let (_, gathered) = apart.get_or_insert((*group, [0; 4]));
+                                    blend_over(gathered, tile.0[i], opacity, props.blend);
+                                }
+                                None => blend_over(&mut c, tile.0[i], opacity, props.blend),
+                            }
                         }
+                        flush(&mut c, &mut apart);
                         out[o] = to8(c[0]);
                         out[o + 1] = to8(c[1]);
                         out[o + 2] = to8(c[2]);
@@ -518,7 +781,11 @@ impl Document {
     /// Records the layer stack as it is now, before a structural change.
     fn checkpoint_layers(&mut self) {
         self.end_stroke();
-        self.push_undo(HistoryEntry::Layers { layers: self.layers.clone(), active: self.active_layer });
+        self.push_undo(HistoryEntry::Layers {
+            layers: self.layers.clone(),
+            groups: self.groups.clone(),
+            active: self.active_layer,
+        });
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
@@ -531,8 +798,14 @@ impl Document {
     }
 
     fn swap_entry(&mut self, entry: &mut HistoryEntry) {
+        if let HistoryEntry::Selection(selection) = entry {
+            std::mem::swap(&mut self.selection, selection);
+            self.selection_stamp += 1;
+            return;
+        }
         self.revision += 1;
         match entry {
+            HistoryEntry::Selection(_) => {}
             HistoryEntry::Tiles { layer, tiles } => {
                 self.next_stamp += 1;
                 let layer = &mut self.layers[*layer];
@@ -547,7 +820,12 @@ impl Document {
                 }
                 self.mark_dirty(rect);
             }
-            HistoryEntry::Layers { layers, active } => {
+            HistoryEntry::Groups(groups) => {
+                std::mem::swap(&mut self.groups, groups);
+                self.mark_dirty(self.bounds());
+            }
+            HistoryEntry::Layers { layers, groups, active } => {
+                std::mem::swap(&mut self.groups, groups);
                 std::mem::swap(&mut self.layers, layers);
                 std::mem::swap(&mut self.active_layer, active);
                 self.mark_dirty(self.bounds());
