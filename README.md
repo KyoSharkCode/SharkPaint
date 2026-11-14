@@ -61,6 +61,14 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
+Para la 0.1.4:
+
+- Texto editable: una capa de texto sigue siendo texto (se puede reescribir, cambiar
+  de fuente y de tamaño) hasta que se convierte en imagen.
+- Redimensionar y recortar el lienzo.
+
+Más adelante:
+
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
