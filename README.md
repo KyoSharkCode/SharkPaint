@@ -71,7 +71,6 @@ Para la 0.1.4:
 - Nombres reales de las fuentes en la herramienta de texto.
 - Simetría como herramienta: eje que se coloca donde haga falta (no siempre va en el
   centro), vertical, horizontal o los dos a la vez.
-- Botones a la vista para voltear, que hoy solo están en los menús.
 - Voltear el lienzo entero (todas las capas), en horizontal y en vertical, y voltear
   la vista también en vertical.
 

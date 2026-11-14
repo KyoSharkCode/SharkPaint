@@ -2420,6 +2420,19 @@ impl SharkPaintApp {
             }
         });
 
+        // Flipping, close at hand: the selection if there is one, else the layer.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let what = if self.doc.selection().is_some() { "la selección" } else { "la capa" };
+            for (name, horizontal, way) in [("voltearH", true, "horizontalmente"), ("voltearV", false, "verticalmente")] {
+                let button = egui::Button::image(icon(name, 18.0, text)).min_size(Vec2::splat(28.0));
+                if ui.add(button).on_hover_text(format!("Voltear {what} {way}")).clicked() {
+                    commands.push(Command::FlipContents(horizontal));
+                }
+            }
+            ui.weak("Voltear");
+        });
+
         // Properties of the chosen group, or of the active layer.
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         if let Some(before) = chosen_group.and_then(|id| self.doc.group(id).cloned()) {
