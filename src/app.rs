@@ -321,6 +321,10 @@ enum Command {
     LayerMove(bool),
     LayerMerge,
     LayerGroup,
+    CanvasSize(bool),
+    CropToSelection,
+    FlipCanvas(bool),
+    FlipViewVertical,
     Fit,
     ActualSize,
     Zoom(f32),
@@ -354,6 +358,20 @@ enum Discarding {
 struct NewCanvasDialog {
     width: usize,
     height: usize,
+}
+
+/// The window for changing the canvas size.
+struct CanvasDialog {
+    /// Rescale the picture to the new size, rather than keep it as it is and
+    /// add or cut room around it.
+    scale: bool,
+    width: usize,
+    height: usize,
+    /// Keep the canvas's proportions while rescaling.
+    keep_ratio: bool,
+    /// Where the picture stays put when room is added or cut: 0, 1 or 2
+    /// across (left, middle, right) and down (top, middle, bottom).
+    anchor: (u8, u8),
 }
 
 pub struct SharkPaintApp {
@@ -462,6 +480,7 @@ pub struct SharkPaintApp {
     pen_seen: bool,
     fit_pending: bool,
     new_dialog: Option<NewCanvasDialog>,
+    canvas_dialog: Option<CanvasDialog>,
     status: String,
     /// Project file the document was opened from or last saved to.
     path: Option<PathBuf>,
@@ -587,6 +606,7 @@ impl SharkPaintApp {
             pen_seen: false,
             fit_pending: true,
             new_dialog: None,
+            canvas_dialog: None,
             status: String::new(),
             path: None,
             saved_revision: 0,
@@ -1154,6 +1174,25 @@ impl SharkPaintApp {
                     commands.push(Command::PasteImage);
                 }
             });
+            ui.menu_button("Lienzo", |ui| {
+                if ui.button("Tamaño del lienzo…").on_hover_text("Añade o quita espacio alrededor del dibujo").clicked() {
+                    commands.push(Command::CanvasSize(false));
+                }
+                if ui.button("Redimensionar imagen…").on_hover_text("Agranda o reduce el dibujo entero").clicked() {
+                    commands.push(Command::CanvasSize(true));
+                }
+                let crop = egui::Button::new("Recortar a la selección");
+                if ui.add_enabled(self.doc.selection().is_some(), crop).clicked() {
+                    commands.push(Command::CropToSelection);
+                }
+                ui.separator();
+                if ui.button("Voltear lienzo horizontalmente").on_hover_text("Todas las capas a la vez").clicked() {
+                    commands.push(Command::FlipCanvas(true));
+                }
+                if ui.button("Voltear lienzo verticalmente").on_hover_text("Todas las capas a la vez").clicked() {
+                    commands.push(Command::FlipCanvas(false));
+                }
+            });
             ui.menu_button("Capa", |ui| {
                 let many = self.doc.layers().len() > 1;
                 let active = self.doc.active_layer();
@@ -1240,6 +1279,9 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Voltear horizontalmente", "F") {
                     commands.push(Command::Flip);
+                }
+                if ui.button("Voltear verticalmente").on_hover_text("Solo la vista; el dibujo no cambia").clicked() {
+                    commands.push(Command::FlipViewVertical);
                 }
                 ui.separator();
                 if item(ui, "Ajustes del pincel", "F5") {
@@ -3455,6 +3497,98 @@ impl SharkPaintApp {
         }
     }
 
+    /// What every change of canvas size leaves to do: show all of it again.
+    fn after_canvas_change(&mut self, status: &str) {
+        self.fit_pending = true;
+        self.xform = None;
+        self.xform_empty = None;
+        self.text_anchor = None;
+        self.status = format!("{status} Ahora mide {} × {} px.", self.doc.width, self.doc.height);
+    }
+
+    /// The window for the canvas size: with or without rescaling the picture.
+    fn canvas_size_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.canvas_dialog else { return };
+        let max_side = ctx.input(|i| i.max_texture_side).max(256);
+        let (old_w, old_h) = (self.doc.width, self.doc.height);
+        let mut apply = false;
+        let mut cancel = false;
+        let title = if dialog.scale { "Redimensionar imagen" } else { "Tamaño del lienzo" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Tamaño actual: {old_w} × {old_h} px"));
+                let before = (dialog.width, dialog.height);
+                egui::Grid::new("lienzo").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Ancho");
+                    ui.add(egui::DragValue::new(&mut dialog.width).range(1..=max_side).suffix(" px"));
+                    ui.end_row();
+                    ui.label("Alto");
+                    ui.add(egui::DragValue::new(&mut dialog.height).range(1..=max_side).suffix(" px"));
+                    ui.end_row();
+                });
+                if dialog.scale {
+                    ui.checkbox(&mut dialog.keep_ratio, "Mantener proporción");
+                    if dialog.keep_ratio {
+                        // The side that was not touched follows the one that was.
+                        let ratio = old_w as f32 / old_h as f32;
+                        if dialog.width != before.0 {
+                            dialog.height = ((dialog.width as f32 / ratio).round() as usize).clamp(1, max_side);
+                        } else if dialog.height != before.1 {
+                            dialog.width = ((dialog.height as f32 * ratio).round() as usize).clamp(1, max_side);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        for (name, factor) in [("50 %", 0.5), ("200 %", 2.0)] {
+                            if ui.small_button(name).clicked() {
+                                dialog.width = ((old_w as f32 * factor).round() as usize).clamp(1, max_side);
+                                dialog.height = ((old_h as f32 * factor).round() as usize).clamp(1, max_side);
+                            }
+                        }
+                    });
+                    ui.label("El dibujo entero se agranda o se reduce.");
+                } else {
+                    ui.label("El dibujo se queda en:");
+                    egui::Grid::new("ancla").spacing([2.0, 2.0]).show(ui, |ui| {
+                        for row in 0..3u8 {
+                            for column in 0..3u8 {
+                                let chosen = dialog.anchor == (column, row);
+                                let mark = if chosen { "●" } else { "·" };
+                                if ui.add(egui::Button::new(mark).selected(chosen).min_size(Vec2::splat(24.0))).clicked() {
+                                    dialog.anchor = (column, row);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.label("El dibujo conserva su tamaño; se añade o se quita espacio.");
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    apply = ui.button("Aplicar").clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+        if apply {
+            let (scale, width, height, anchor) = (dialog.scale, dialog.width, dialog.height, dialog.anchor);
+            let changed = if scale {
+                self.doc.scale_image(width, height)
+            } else {
+                // Shift so the chosen edge or the middle stays where it was.
+                let shift = |new: usize, old: usize, place: u8| (new as i32 - old as i32) * place as i32 / 2;
+                self.doc.resize_canvas(width, height, shift(width, old_w, anchor.0), shift(height, old_h, anchor.1))
+            };
+            if changed {
+                self.after_canvas_change(if scale { "Imagen redimensionada." } else { "Tamaño del lienzo cambiado." });
+            }
+        }
+        if apply || cancel {
+            self.canvas_dialog = None;
+        }
+    }
+
     fn new_canvas_window(&mut self, ctx: &egui::Context) {
         let Some(dialog) = &mut self.new_dialog else { return };
         let max_side = ctx.input(|i| i.max_texture_side).max(256);
@@ -3604,6 +3738,31 @@ impl SharkPaintApp {
                 self.view.rotate_about(viewport.center(), -self.view.rotation, viewport, doc_size)
             }
             Command::Flip => self.view.flip = !self.view.flip,
+            Command::FlipViewVertical => {
+                // Top to bottom is left to right plus half a turn.
+                self.view.flip = !self.view.flip;
+                self.view.rotate_about(viewport.center(), std::f32::consts::PI, viewport, doc_size);
+            }
+            Command::CanvasSize(scale) => {
+                self.canvas_dialog = Some(CanvasDialog {
+                    scale,
+                    width: self.doc.width,
+                    height: self.doc.height,
+                    keep_ratio: true,
+                    anchor: (1, 1),
+                });
+            }
+            Command::CropToSelection => {
+                if self.doc.crop_to_selection() {
+                    self.after_canvas_change("Lienzo recortado a la selección.");
+                } else {
+                    self.status = "Selecciona primero la zona que quieres conservar.".into();
+                }
+            }
+            Command::FlipCanvas(horizontal) => {
+                self.doc.flip_canvas(horizontal);
+                self.status = "Lienzo volteado.".into();
+            }
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
             Command::ToggleReferences => self.refs_open = !self.refs_open,
             Command::ToggleNavigator => self.nav_open = !self.nav_open,
@@ -3695,6 +3854,7 @@ impl eframe::App for SharkPaintApp {
             self.store_settings();
         }
         self.new_canvas_window(&ctx);
+        self.canvas_size_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
         for command in commands {

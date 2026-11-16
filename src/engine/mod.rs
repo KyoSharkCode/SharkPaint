@@ -2,6 +2,7 @@
 
 mod abr;
 mod brush;
+mod canvas;
 mod document;
 mod export;
 mod layer;

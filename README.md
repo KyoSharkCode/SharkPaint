@@ -41,6 +41,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   puede sumar, restar, intersecar e invertir: pintar, borrar, rellenar, transformar y
   voltear afectan solo a lo seleccionado. Los cambios de selección se deshacen.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Lienzo: cambiar su tamaño, redimensionar la imagen, recortar a la selección y
+  voltear todas las capas a la vez.
 - Formas: líneas, rectángulos y elipses, rellenas o de contorno.
 - Texto con la fuente incluida o las instaladas en el equipo; se coloca como capa.
 - Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
@@ -65,14 +67,11 @@ Para la 0.1.4:
 
 - Texto editable: una capa de texto sigue siendo texto (se puede reescribir, cambiar
   de fuente y de tamaño) hasta que se convierte en imagen.
-- Redimensionar y recortar el lienzo.
 - Arrastrar capas en la lista para reordenarlas y meterlas en grupos.
 - Máscaras de capa: ocultar partes de una capa sin borrarlas.
 - Nombres reales de las fuentes en la herramienta de texto.
 - Simetría como herramienta: eje que se coloca donde haga falta (no siempre va en el
   centro), vertical, horizontal o los dos a la vez.
-- Voltear el lienzo entero (todas las capas), en horizontal y en vertical, y voltear
-  la vista también en vertical.
 
 Más adelante:
 

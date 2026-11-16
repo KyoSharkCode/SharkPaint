@@ -25,6 +25,15 @@ enum HistoryEntry {
     Props { layer: usize, props: LayerProps },
     /// The selection as it was.
     Selection(Option<Arc<Selection>>),
+    /// The whole picture, before the canvas changed size or was turned over.
+    Canvas {
+        width: usize,
+        height: usize,
+        layers: Vec<Layer>,
+        groups: Vec<LayerGroup>,
+        active: usize,
+        selection: Option<Arc<Selection>>,
+    },
 }
 
 /// A group whose layers are combined apart and blended in as one.
@@ -778,6 +787,27 @@ impl Document {
 
     // --- Internals ------------------------------------------------------------
 
+    /// Replaces the canvas and every layer at once, as one undoable step. The
+    /// selection, which is tied to the old canvas, is dropped.
+    pub(super) fn replace_canvas(&mut self, width: usize, height: usize, layers: Vec<Layer>) {
+        let previous = HistoryEntry::Canvas {
+            width: std::mem::replace(&mut self.width, width),
+            height: std::mem::replace(&mut self.height, height),
+            layers: std::mem::replace(&mut self.layers, layers),
+            groups: self.groups.clone(),
+            active: self.active_layer,
+            selection: self.selection.take(),
+        };
+        self.selection_stamp += 1;
+        self.push_undo(previous);
+        self.dirty = self.bounds();
+    }
+
+    /// A fresh stamp for a layer rebuilt elsewhere in the engine.
+    pub(super) fn next_version(&mut self) -> u64 {
+        self.stamp()
+    }
+
     /// Records the layer stack as it is now, before a structural change.
     fn checkpoint_layers(&mut self) {
         self.end_stroke();
@@ -823,6 +853,16 @@ impl Document {
             HistoryEntry::Groups(groups) => {
                 std::mem::swap(&mut self.groups, groups);
                 self.mark_dirty(self.bounds());
+            }
+            HistoryEntry::Canvas { width, height, layers, groups, active, selection } => {
+                std::mem::swap(&mut self.width, width);
+                std::mem::swap(&mut self.height, height);
+                std::mem::swap(&mut self.layers, layers);
+                std::mem::swap(&mut self.groups, groups);
+                std::mem::swap(&mut self.active_layer, active);
+                std::mem::swap(&mut self.selection, selection);
+                self.selection_stamp += 1;
+                self.dirty = self.bounds();
             }
             HistoryEntry::Layers { layers, groups, active } => {
                 std::mem::swap(&mut self.groups, groups);

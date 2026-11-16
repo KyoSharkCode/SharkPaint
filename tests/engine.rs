@@ -1738,3 +1738,73 @@ fn text_is_drawn_in_the_bundled_font() {
     doc.undo();
     assert_eq!(doc.layers().len(), 1);
 }
+
+#[test]
+fn the_canvas_can_be_resized_cropped_scaled_and_flipped() {
+    // A red block at the left of a 200 x 100 canvas, on two layers with a group.
+    let mut doc = Document::new(200, 100);
+    doc.draw_shape(Shape::Rectangle, (10.0, 20.0), (60.0, 70.0), [255, 0, 0], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (150.0, 80.0), (190.0, 95.0), [0, 0, 255], 1.0, true, 1.0);
+    let id = doc.group_active_layer().unwrap();
+    let original = doc.render_rgba8(doc.bounds());
+
+    // More room on every side: the picture moves with the offset.
+    assert!(doc.resize_canvas(300, 160, 50, 30));
+    assert_eq!((doc.width, doc.height), (300, 160));
+    assert_eq!(pixel(&doc, 60, 50), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 59, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 239, 124), [0, 0, 255, 255]);
+    assert_eq!(doc.layers()[1].group, id, "groups survive");
+    assert!(!doc.resize_canvas(300, 160, 0, 0), "nothing to do");
+    doc.undo();
+    assert_eq!((doc.width, doc.height), (200, 100));
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // Cropping to a selection keeps what is inside its box.
+    doc.select_polygon(&rect_points(10.0, 20.0, 110.0, 70.0));
+    assert!(doc.crop_to_selection());
+    assert_eq!((doc.width, doc.height), (100, 50));
+    assert!(doc.selection().is_none());
+    assert_eq!(pixel(&doc, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 49, 49), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 50, 25), [255, 255, 255, 255]);
+    doc.undo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(10, 20, 110, 70), "undo brings the selection back");
+    doc.deselect();
+    assert!(!doc.crop_to_selection());
+
+    // Half size: everything is half as big and in the same place.
+    assert!(doc.scale_image(100, 50));
+    assert_eq!((doc.width, doc.height), (100, 50));
+    assert_eq!(pixel(&doc, 15, 20), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 3, 20), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 85, 43), [0, 0, 255, 255]);
+    // Back up to full size: solid areas stay solid, edges may soften.
+    assert!(doc.scale_image(200, 100));
+    assert_eq!(pixel(&doc, 35, 45), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 170, 88), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 100, 10), [255, 255, 255, 255]);
+    doc.undo();
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // Turned over left to right, then top to bottom; twice is as before.
+    doc.flip_canvas(true);
+    assert_eq!(pixel(&doc, 189, 20), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 10, 80), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 10, 20), [255, 255, 255, 255]);
+    doc.flip_canvas(false);
+    assert_eq!(pixel(&doc, 189, 79), [255, 0, 0, 255]);
+    doc.flip_canvas(false);
+    doc.flip_canvas(true);
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // A project saved after a resize reads back at the new size.
+    doc.resize_canvas(120, 90, -5, -5);
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!((loaded.width, loaded.height), (120, 90));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+}
