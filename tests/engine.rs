@@ -1854,3 +1854,70 @@ fn symmetry_lines_can_stand_anywhere_and_cross() {
     assert!(dark(60, 150 - rise) && !dark(60, 150 + rise), "top-bottom copy");
     assert!(dark(140, 150 - rise) && !dark(160, 150 - rise), "copy across both");
 }
+
+#[test]
+fn layers_and_groups_can_be_dropped_anywhere_in_the_stack() {
+    // Bottom to top: Capa 1, Capa 2, Capa 3, then two more.
+    let mut doc = three_layers();
+    doc.add_layer();
+    doc.add_layer();
+    let order = |doc: &Document| -> Vec<String> {
+        doc.layers().iter().map(|l| format!("{}{}", &l.props.name[5..], if l.group != 0 { "g" } else { "" })).collect()
+    };
+    assert_eq!(order(&doc), ["1", "2", "3", "4", "5"]);
+    let before = doc.render_rgba8(doc.bounds());
+
+    // Capa 5 dropped at the bottom; Capa 1 (now second) dropped at the top.
+    assert!(doc.place_layer(4, 0, 0));
+    assert_eq!(order(&doc), ["5", "1", "2", "3", "4"]);
+    assert_eq!(doc.active().props.name, "Capa 5", "the active layer is followed");
+    assert!(doc.place_layer(1, 5, 0));
+    assert_eq!(order(&doc), ["5", "2", "3", "4", "1"]);
+    // Dropping a layer where it already is changes nothing.
+    assert!(!doc.place_layer(2, 2, 0));
+    assert!(!doc.place_layer(2, 3, 0));
+    doc.undo();
+    doc.undo();
+    assert_eq!(order(&doc), ["1", "2", "3", "4", "5"]);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // A group around Capa 2; Capa 5 dropped into it, above Capa 2.
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    assert!(doc.place_layer(4, 2, id));
+    assert_eq!(order(&doc), ["1", "2g", "5g", "3", "4"]);
+    // Capa 4 dropped between the two, taking the group too.
+    assert!(doc.place_layer(4, 2, id));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5g", "3"]);
+    // Loose in the middle of the group would split it: refused.
+    assert!(!doc.place_layer(4, 2, 0));
+    // Into the group from far away is refused too: not next to its layers.
+    assert!(!doc.place_layer(2, 0, id));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5g", "3"]);
+    // Out of the group in place, by dropping it at the group's edge with no group.
+    assert!(doc.place_layer(3, 4, 0));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5", "3"]);
+    // A group that does not exist is refused.
+    assert!(!doc.place_layer(0, 5, 999_999));
+
+    // The whole group dropped at the top, then at the bottom.
+    assert!(doc.place_group(id, 5));
+    assert_eq!(order(&doc), ["1", "5", "3", "2g", "4g"]);
+    assert!(doc.place_group(id, 0));
+    assert_eq!(order(&doc), ["2g", "4g", "1", "5", "3"]);
+    assert!(!doc.place_group(id, 1), "inside itself is no move");
+    assert!(!doc.place_group(id, 2), "just above itself is no move");
+    // A second group; the first may not land inside it.
+    doc.set_active_layer(3);
+    let other = doc.group_active_layer().unwrap();
+    assert!(doc.place_layer(4, 4, other));
+    assert_eq!(order(&doc), ["2g", "4g", "1", "5g", "3g"]);
+    assert!(!doc.place_group(id, 4));
+    assert!(doc.place_group(id, 5));
+    assert_eq!(order(&doc), ["1", "5g", "3g", "2g", "4g"]);
+    // Dropping a group's last layer elsewhere removes the group.
+    assert!(doc.place_layer(1, 0, 0));
+    assert!(doc.place_layer(2, 0, 0));
+    assert!(doc.group(other).is_none());
+    assert_eq!(doc.groups().len(), 1);
+}

@@ -159,6 +159,87 @@ fn shape_ends(shape: Figure, from: Pos2, to: Pos2, regular: bool) -> (Pos2, Pos2
     }
 }
 
+/// What is being dragged in the layer list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dragged {
+    /// A layer, by its id.
+    Layer(u64),
+    /// A whole group, by its id.
+    Group(u64),
+}
+
+/// A row of the layer list: a layer, by its place in the stack, or the
+/// heading of a group.
+#[derive(Clone, Copy)]
+enum ListRow {
+    Layer(usize),
+    Heading(u64),
+}
+
+/// Where something dragged in the layer list would land.
+struct ListDrop {
+    /// Gap in the stack: just under the layer now at this index.
+    gap: usize,
+    /// Group it would join; zero for none.
+    group: u64,
+    /// Where to draw the line that shows it.
+    line_y: f32,
+}
+
+/// Works out where a drag over the layer list would drop. `rows` are the
+/// rows on screen, top first; `list_left` is the list's left edge.
+fn list_drop(dragged: Dragged, pointer: Pos2, rows: &[(Rect, ListRow)], doc: &Document, list_left: f32) -> Option<ListDrop> {
+    let layers = doc.layers();
+    // The row under the pointer, or the nearest end of the list.
+    let (first, last) = (rows.first()?, rows.last()?);
+    let &(rect, row) = rows
+        .iter()
+        .find(|(rect, _)| (rect.top() - 1.0..=rect.bottom() + 1.0).contains(&pointer.y))
+        .unwrap_or(if pointer.y < first.0.top() { first } else { last });
+    let upper = pointer.y < rect.center().y;
+    let bottom_of = |id: u64| layers.iter().position(|l| l.group == id);
+    let top_of = |id: u64| layers.iter().rposition(|l| l.group == id);
+    match (dragged, row) {
+        // A layer dropped on a heading goes to the top of that group.
+        (Dragged::Layer(_), ListRow::Heading(id)) => Some(ListDrop { gap: top_of(id)? + 1, group: id, line_y: rect.bottom() }),
+        (Dragged::Layer(_), ListRow::Layer(i)) => {
+            let own = layers[i].group;
+            let lowest = own != 0 && (i == 0 || layers[i - 1].group != own);
+            // Under a group's last layer it may stay in or come out: towards
+            // the left edge of the list it comes out.
+            let leaves = !upper && lowest && pointer.x < list_left + 44.0;
+            Some(ListDrop {
+                gap: if upper { i + 1 } else { i },
+                group: if leaves { 0 } else { own },
+                line_y: if upper { rect.top() } else { rect.bottom() },
+            })
+        }
+        (Dragged::Group(id), row) => {
+            let over = match row {
+                ListRow::Heading(other) => other,
+                ListRow::Layer(i) => layers[i].group,
+            };
+            if over == id {
+                return None;
+            }
+            if over == 0 {
+                let ListRow::Layer(i) = row else { return None };
+                return Some(ListDrop { gap: if upper { i + 1 } else { i }, group: 0, line_y: if upper { rect.top() } else { rect.bottom() } });
+            }
+            // Over another group: above all of it, or below all of it.
+            if matches!(row, ListRow::Heading(_)) && upper {
+                return Some(ListDrop { gap: top_of(over)? + 1, group: 0, line_y: rect.top() });
+            }
+            let lowest = bottom_of(over)?;
+            let line_y = rows
+                .iter()
+                .find(|(_, r)| matches!(r, ListRow::Layer(i) if *i == lowest))
+                .map_or(rect.bottom(), |(rect, _)| rect.bottom());
+            Some(ListDrop { gap: lowest, group: 0, line_y })
+        }
+    }
+}
+
 /// Text rendered for placing on the canvas.
 struct TextPreview {
     /// Content, size, typeface and colour it was drawn from.
@@ -501,6 +582,8 @@ pub struct SharkPaintApp {
     refs_open: bool,
     /// The group chosen in the layer list, when a group rather than a layer is.
     active_group: Option<u64>,
+    /// The layer or group being dragged in the layer list.
+    layer_drag: Option<Dragged>,
     /// The side panel shows the navigator (a small view of the whole canvas)
     /// in place of the colour picker.
     nav_open: bool,
@@ -627,6 +710,7 @@ impl SharkPaintApp {
             brush_window_open: true,
             refs_open: false,
             active_group: None,
+            layer_drag: None,
             nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
@@ -2624,9 +2708,14 @@ impl SharkPaintApp {
         let mut select_group = None;
         let mut toggle_group = None;
         let mut fold_group = None;
+        // Dragging a row to another place in the list.
+        let dragging = self.layer_drag;
+        let mut started = None;
+        let mut drop: Option<ListDrop> = None;
         egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let layers = self.doc.layers();
+            let mut rows: Vec<(Rect, ListRow)> = Vec::new();
             for (i, layer) in layers.iter().enumerate().rev() {
                 let group = self.doc.group(layer.group);
                 // The heading goes above the group's topmost layer.
@@ -2639,7 +2728,12 @@ impl SharkPaintApp {
                         if ui.add(button).on_hover_text(tip).clicked() {
                             toggle_group = Some(group.id);
                         }
-                        let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                        let (row, response) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click_and_drag());
+                        rows.push((row, ListRow::Heading(group.id)));
+                        if response.drag_started() {
+                            started = Some(Dragged::Group(group.id));
+                        }
                         let painter = ui.painter().with_clip_rect(row);
                         let selected = chosen_group == Some(group.id);
                         if selected {
@@ -2712,7 +2806,11 @@ impl SharkPaintApp {
                     }
 
                     let size = Vec2::new(ui.available_width(), ROW_HEIGHT);
-                    let (row, response) = ui.allocate_exact_size(size, Sense::click());
+                    let (row, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                    rows.push((row, ListRow::Layer(i)));
+                    if response.drag_started() {
+                        started = Some(Dragged::Layer(layer.id));
+                    }
                     let painter = ui.painter().with_clip_rect(row);
                     let selected = i == active && chosen_group.is_none();
                     if selected {
@@ -2777,9 +2875,52 @@ impl SharkPaintApp {
                     if response.clicked() {
                         select = Some(i);
                     }
+                    // What is being dragged is marked, with its whole group.
+                    let carried = match dragging {
+                        Some(Dragged::Layer(id)) => id == layer.id,
+                        Some(Dragged::Group(id)) => id == layer.group,
+                        None => false,
+                    };
+                    if carried {
+                        painter.rect_filled(row, 4.0, Color32::from_black_alpha(110));
+                    }
                 });
             }
+            // A line shows where the dragged row would land.
+            if let Some(dragged) = dragging {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                let list = ui.clip_rect();
+                let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.x_range().contains(pos.x));
+                drop = pointer.and_then(|pos| list_drop(dragged, pos, &rows, &self.doc, list.left()));
+                if let Some(target) = &drop {
+                    let from = list.left() + if target.group != 0 { 40.0 } else { 28.0 };
+                    ui.painter().line_segment(
+                        [Pos2::new(from, target.line_y), Pos2::new(list.right() - 2.0, target.line_y)],
+                        Stroke::new(2.0, Color32::from_rgb(111, 227, 240)),
+                    );
+                }
+            }
         });
+        if started.is_some() {
+            self.layer_drag = started;
+        }
+        if let Some(dragged) = self.layer_drag {
+            let (released, down) = ui.input(|i| (i.pointer.any_released(), i.pointer.any_down()));
+            if released || !down {
+                self.layer_drag = None;
+                match (dragged, drop) {
+                    (Dragged::Layer(id), Some(target)) => {
+                        if let Some(from) = self.doc.layers().iter().position(|l| l.id == id) {
+                            self.doc.place_layer(from, target.gap, target.group);
+                        }
+                    }
+                    (Dragged::Group(id), Some(target)) => {
+                        self.doc.place_group(id, target.gap);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(i) = toggle {
             let mut props = self.doc.layers()[i].props.clone();
             props.visible = !props.visible;

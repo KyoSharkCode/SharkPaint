@@ -342,6 +342,66 @@ impl Document {
         true
     }
 
+    /// Moves a layer to a gap in the stack and into a group (zero for none), as
+    /// when it is dragged in the layer list. Gap `g` is the place just under
+    /// the layer now at index `g`; gap `len` is the top. Nothing happens, and
+    /// `false` comes back, if the layer would not move or the move would
+    /// leave a group in two pieces.
+    pub fn place_layer(&mut self, from: usize, gap: usize, group: u64) -> bool {
+        if from >= self.layers.len() || gap > self.layers.len() || (group != 0 && self.group(group).is_none()) {
+            return false;
+        }
+        let to = if gap > from { gap - 1 } else { gap };
+        if to == from && self.layers[from].group == group {
+            return false;
+        }
+        let mut layers = self.layers.clone();
+        let mut layer = layers.remove(from);
+        layer.group = group;
+        layers.insert(to, layer);
+        self.restack(layers)
+    }
+
+    /// Moves a whole group to a gap in the stack (see [`Document::place_layer`]).
+    /// The gap may not be inside another group.
+    pub fn place_group(&mut self, id: u64, gap: usize) -> bool {
+        let Some(first) = self.layers.iter().position(|l| l.group == id) else { return false };
+        let last = self.layers.iter().rposition(|l| l.group == id).unwrap_or(first);
+        if gap > self.layers.len() || (first..=last + 1).contains(&gap) {
+            return false; // it is already there
+        }
+        let mut layers = self.layers.clone();
+        let block: Vec<Layer> = layers.drain(first..=last).collect();
+        let at = if gap > last { gap - block.len() } else { gap };
+        layers.splice(at..at, block);
+        self.restack(layers)
+    }
+
+    /// Takes a new order for the layers as one undoable step, unless it would
+    /// leave some group's layers apart from each other.
+    fn restack(&mut self, layers: Vec<Layer>) -> bool {
+        let mut closed: Vec<u64> = Vec::new();
+        let mut previous = 0;
+        for layer in &layers {
+            if layer.group != previous {
+                if closed.contains(&layer.group) {
+                    return false;
+                }
+                if previous != 0 {
+                    closed.push(previous);
+                }
+                previous = layer.group;
+            }
+        }
+        self.checkpoint_layers();
+        let active = self.layers[self.active_layer].id;
+        self.layers = layers;
+        self.active_layer = self.layers.iter().position(|l| l.id == active).unwrap_or(0);
+        self.prune_groups();
+        self.mark_dirty(self.bounds());
+        true
+    }
+
     /// Replaces a group's name, visibility and opacity as one undoable step.
     /// `coalesce` folds the change into the previous step when that step was
     /// also a group edit, so dragging a slider is undone in one go.

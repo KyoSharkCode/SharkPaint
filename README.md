@@ -25,6 +25,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
+- Capas y grupos se reordenan arrastrándolos en la lista.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
   con modo de fusión propio.
 - Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
@@ -68,7 +69,6 @@ Para la 0.1.4:
 
 - Texto editable: una capa de texto sigue siendo texto (se puede reescribir, cambiar
   de fuente y de tamaño) hasta que se convierte en imagen.
-- Arrastrar capas en la lista para reordenarlas y meterlas en grupos.
 - Máscaras de capa: ocultar partes de una capa sin borrarlas.
 - Nombres reales de las fuentes en la herramienta de texto.
 
