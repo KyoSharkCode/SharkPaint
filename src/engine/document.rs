@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::brush::BrushSettings;
 use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
-use super::stroke::{ActiveStroke, StrokePoint};
+use super::stroke::{ActiveStroke, StrokePoint, Symmetry};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
 const MAX_UNDO_STEPS: usize = 200;
@@ -79,9 +79,8 @@ pub struct Document {
     pub(super) active_layer: usize,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
-    /// Brush and eraser strokes are mirrored across the canvas's vertical
-    /// centre line.
-    pub symmetry: bool,
+    /// Lines across which brush and eraser strokes are mirrored.
+    pub symmetry: Symmetry,
     stroke: Option<ActiveStroke>,
     pub(super) smudge: Option<SmudgeStroke>,
     pub(super) moving: Option<MoveSession>,
@@ -124,7 +123,7 @@ impl Document {
             groups: Vec::new(),
             active_layer: active,
             paper: [255, 255, 255],
-            symmetry: false,
+            symmetry: Symmetry::OFF,
             stroke: None,
             smudge: None,
             moving: None,
@@ -588,9 +587,8 @@ impl Document {
         }
         let li = self.active_layer;
         let selection = self.selection.clone();
-        let mirror_x = self.symmetry.then_some(self.width as f32 * 0.5);
         let (stroke, rect) =
-            ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, mirror_x, p);
+            ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, self.symmetry, p);
         self.stroke = Some(stroke);
         self.mark_dirty(rect);
     }

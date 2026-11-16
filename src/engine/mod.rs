@@ -27,6 +27,6 @@ pub use psd::read_psd;
 pub use layer::{BlendMode, IRect, Layer, LayerGroup, LayerProps, Px, Tile, ONE, TILE};
 pub use selection::{SelectMode, Selection};
 pub use shapes::Shape;
-pub use stroke::StrokePoint;
+pub use stroke::{StrokePoint, Symmetry};
 pub use text::{render_text, TextFont};
 pub use tools::{brush_preview, LayerTransform};

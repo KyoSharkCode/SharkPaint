@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, TextFont, PROJECT_EXTENSION,
+    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, PROJECT_EXTENSION,
     read_psd, render_text,
 };
 
@@ -63,11 +63,12 @@ enum Tool {
     Seleccion,
     Forma,
     Texto,
+    Simetria,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 11] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -78,6 +79,7 @@ impl Tool {
         (Tool::Seleccion, "seleccion", "Selección", "S"),
         (Tool::Forma, "forma", "Formas", "U"),
         (Tool::Texto, "texto", "Texto", "A"),
+        (Tool::Simetria, "simetria", "Simetría", "Y"),
     ];
 
     fn name(self) -> &'static str {
@@ -522,6 +524,14 @@ pub struct SharkPaintApp {
     prefs_open: bool,
     /// Strokes are mirrored across the canvas's vertical centre line.
     symmetry: bool,
+    /// Which lines mirror the strokes: upright (left to right) and level (top
+    /// to bottom).
+    symmetry_vertical: bool,
+    symmetry_horizontal: bool,
+    /// Where the lines cross on the canvas; the middle of it until moved.
+    symmetry_center: Option<Pos2>,
+    /// The pointer is moving the symmetry lines.
+    symmetry_dragging: bool,
     /// When and at which document revision the recovery file was last written.
     autosave_time: f64,
     autosave_revision: u64,
@@ -629,6 +639,10 @@ impl SharkPaintApp {
             saved_settings: Settings::default(),
             prefs_open: false,
             symmetry: false,
+            symmetry_vertical: true,
+            symmetry_horizontal: false,
+            symmetry_center: None,
+            symmetry_dragging: false,
             autosave_time: 0.0,
             autosave_revision: 0,
             autosave_thread: None,
@@ -846,6 +860,7 @@ impl SharkPaintApp {
         self.ref_index = 0;
         self.ref_view = (Vec2::ZERO, 1.0);
         self.refs_open = !self.doc.references().is_empty();
+        self.symmetry_center = None;
     }
 
     fn load_project(&mut self, path: PathBuf) {
@@ -2225,6 +2240,52 @@ impl SharkPaintApp {
                 self.text_panel(ui);
                 return;
             }
+            Tool::Simetria => {
+                ui.set_width(248.0);
+                ui.checkbox(&mut self.symmetry, "Simetría activa")
+                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo");
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    let both = (self.symmetry_vertical, self.symmetry_horizontal);
+                    for (axes, name, tip) in [
+                        ((true, false), "Vertical", "Espejo de izquierda a derecha"),
+                        ((false, true), "Horizontal", "Espejo de arriba abajo"),
+                        ((true, true), "Las dos", "Cuatro copias de cada trazo"),
+                    ] {
+                        if ui.selectable_label(both == axes, name).on_hover_text(tip).clicked() {
+                            (self.symmetry_vertical, self.symmetry_horizontal) = axes;
+                            self.symmetry = true;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                let mut center = self.symmetry_point();
+                let before = center;
+                let (width, height) = (self.doc.width as f32, self.doc.height as f32);
+                egui::Grid::new("simetria").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Eje vertical en");
+                    ui.add_enabled(
+                        self.symmetry_vertical,
+                        egui::DragValue::new(&mut center.x).range(0.0..=width).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                    ui.label("Eje horizontal en");
+                    ui.add_enabled(
+                        self.symmetry_horizontal,
+                        egui::DragValue::new(&mut center.y).range(0.0..=height).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                });
+                if center != before {
+                    self.symmetry_center = Some(center);
+                }
+                if ui.button("Centrar en el lienzo").clicked() {
+                    self.symmetry_center = None;
+                }
+                ui.label("Haz clic o arrastra sobre el lienzo para colocar los ejes donde quieras.");
+                ui.label("Después vuelve al pincel: la simetría sigue activa hasta que la apagues.");
+                return;
+            }
             Tool::Seleccion => {
                 ui.horizontal_wrapped(|ui| {
                     for (shape, name) in SelectShape::ALL {
@@ -2348,7 +2409,7 @@ impl SharkPaintApp {
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.symmetry, "Simetría")
-                    .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
+                    .on_hover_text("Repite cada trazo en espejo. Los ejes se colocan con la herramienta Simetría.");
             }
             egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
                 let b = self.active_brush();
@@ -3073,7 +3134,7 @@ impl SharkPaintApp {
             }
         }
 
-        self.doc.symmetry = self.symmetry;
+        self.doc.symmetry = self.symmetry_lines();
         self.sync_transform();
         let free = ctx.input(|i| i.modifiers.shift);
         let mut transform_changed = false;
@@ -3160,6 +3221,13 @@ impl SharkPaintApp {
                         );
                         continue;
                     }
+                    if self.tool == Tool::Simetria && !alt {
+                        // Press to put the lines there; keep holding to move them.
+                        self.symmetry = true;
+                        self.symmetry_center = Some(c.round());
+                        self.symmetry_dragging = true;
+                        continue;
+                    }
                     if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
                         self.select_drag = Some(SelectDrag { from: c, to: c, trail: vec![c], pressed_at: *pos, moved: false });
                         continue;
@@ -3223,6 +3291,7 @@ impl SharkPaintApp {
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
                 Event::PointerMoved(pos) if self.text_dragging => self.text_anchor = Some(to_canvas(*pos).round()),
+                Event::PointerMoved(pos) if self.symmetry_dragging => self.symmetry_center = Some(to_canvas(*pos).round()),
                 Event::PointerMoved(pos) if self.select_drag.is_some() => {
                     if let Some(drag) = &mut self.select_drag {
                         drag.to = to_canvas(*pos);
@@ -3256,8 +3325,9 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
-                    if self.text_dragging {
+                    if self.text_dragging || self.symmetry_dragging {
                         self.text_dragging = false;
+                        self.symmetry_dragging = false;
                         continue;
                     }
                     if self.tool == Tool::Transformar {
@@ -3369,12 +3439,27 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
-        // The symmetry axis, as a guide.
-        if self.symmetry {
-            let top = self.view.to_screen(Pos2::new(doc_size.x * 0.5, 0.0), viewport, doc_size);
-            let bottom = self.view.to_screen(Pos2::new(doc_size.x * 0.5, doc_size.y), viewport, doc_size);
-            let guide = Stroke::new(1.0, Color32::from_rgb(111, 227, 240));
-            painter.extend(Shape::dashed_line(&[top, bottom], guide, 8.0, 6.0));
+        // The symmetry lines, as guides, with a handle where they meet while
+        // the symmetry tool is in hand.
+        let lines = self.symmetry_lines();
+        let guide = Stroke::new(1.0, Color32::from_rgb(111, 227, 240));
+        let screen = |x: f32, y: f32| self.view.to_screen(Pos2::new(x, y), viewport, doc_size);
+        // Dark under light, so the line shows on any colour.
+        let draw_guide = |from: Pos2, to: Pos2| {
+            painter.line_segment([from, to], Stroke::new(1.0, Color32::from_black_alpha(110)));
+            painter.extend(Shape::dashed_line(&[from, to], guide, 8.0, 6.0));
+        };
+        if let Some(x) = lines.vertical {
+            draw_guide(screen(x, 0.0), screen(x, doc_size.y));
+        }
+        if let Some(y) = lines.horizontal {
+            draw_guide(screen(0.0, y), screen(doc_size.x, y));
+        }
+        if self.symmetry && self.tool == Tool::Simetria {
+            let center = self.symmetry_point();
+            let at = screen(center.x, center.y);
+            painter.circle_filled(at, 5.0, Color32::from_rgb(111, 227, 240));
+            painter.circle_stroke(at, 5.0, Stroke::new(1.0, Color32::from_gray(15)));
         }
 
         // The selection, and the one being dragged out, as a dashed outline.
@@ -3477,7 +3562,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto | Tool::Simetria) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -3497,8 +3582,28 @@ impl SharkPaintApp {
         }
     }
 
+    /// Where the symmetry lines cross, kept on the canvas.
+    fn symmetry_point(&self) -> Pos2 {
+        let size = self.doc_size();
+        let center = self.symmetry_center.unwrap_or((size * 0.5).to_pos2());
+        Pos2::new(center.x.clamp(0.0, size.x), center.y.clamp(0.0, size.y))
+    }
+
+    /// The lines strokes are mirrored across right now.
+    fn symmetry_lines(&self) -> Symmetry {
+        if !self.symmetry {
+            return Symmetry::OFF;
+        }
+        let center = self.symmetry_point();
+        Symmetry {
+            vertical: self.symmetry_vertical.then_some(center.x),
+            horizontal: self.symmetry_horizontal.then_some(center.y),
+        }
+    }
+
     /// What every change of canvas size leaves to do: show all of it again.
     fn after_canvas_change(&mut self, status: &str) {
+        self.symmetry_center = None;
         self.fit_pending = true;
         self.xform = None;
         self.xform_empty = None;

@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
     builtin_papers, builtin_tips, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape, StrokePoint, TextFont,
+    LayerTransform, Reference, SelectMode, Shape, StrokePoint, Symmetry, TextFont,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -832,7 +832,7 @@ fn references_are_saved_with_the_project_but_not_drawn() {
 #[test]
 fn symmetry_mirrors_strokes_across_the_centre() {
     let mut doc = Document::new(200, 100);
-    doc.symmetry = true;
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: None };
     line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (20.0, 30.0), (60.0, 70.0));
     for (x, y) in [(20, 30), (40, 50), (60, 70)] {
         assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255]);
@@ -1807,4 +1807,50 @@ fn the_canvas_can_be_resized_cropped_scaled_and_flipped() {
     let loaded = Document::read_from(&mut file.as_slice()).unwrap();
     assert_eq!((loaded.width, loaded.height), (120, 90));
     assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+}
+
+#[test]
+fn symmetry_lines_can_stand_anywhere_and_cross() {
+    // An upright line off-centre.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: Some(60.0), horizontal: None };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (20.0, 30.0), (40.0, 50.0));
+    assert_eq!(pixel(&doc, 20, 30), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 99, 30), [0, 0, 0, 255], "mirrored across x = 60");
+    assert_eq!(pixel(&doc, 179, 30), [255, 255, 255, 255], "not across the centre of the canvas");
+    assert_eq!(pixel(&doc, 20, 89), [255, 255, 255, 255], "and not top to bottom");
+
+    // A level line.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: None, horizontal: Some(40.0) };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (20.0, 10.0), (60.0, 20.0));
+    assert_eq!(pixel(&doc, 20, 69), [0, 0, 0, 255], "mirrored across y = 40");
+    assert_eq!(pixel(&doc, 60, 59), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 179, 10), [255, 255, 255, 255]);
+
+    // Both: four copies, one undo step.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: Some(60.0) };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (30.0, 20.0), (50.0, 30.0));
+    for (x, y) in [(30, 20), (169, 20), (30, 99), (169, 99)] {
+        assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255], "copy at ({x}, {y})");
+    }
+    doc.undo();
+    assert!(!doc.can_undo());
+
+    // A shaped tip is mirrored too, not just moved: a slanted flat tip leans
+    // the other way on the far side of each line.
+    let mut doc = Document::new(200, 200);
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: Some(100.0) };
+    let flat = BrushSettings { roundness: 0.15, angle: 45.0, ..hard_brush(40.0) };
+    doc.begin_stroke(&flat, [0, 0, 0], false, StrokePoint::new(50.0, 50.0, 1.0));
+    doc.end_stroke();
+    let dark = |x: i32, y: i32| pixel(&doc, x, y)[0] < 128;
+    // The original leans one way through (50, 50): `rise` is how far up or
+    // down it has gone ten pixels to the right.
+    let rise = if dark(60, 60) { 10 } else { -10 };
+    assert!(dark(60, 50 + rise) && !dark(60, 50 - rise), "the tip is slanted");
+    assert!(dark(140, 50 + rise) && !dark(160, 50 + rise), "left-right copy leans the other way");
+    assert!(dark(60, 150 - rise) && !dark(60, 150 + rise), "top-bottom copy");
+    assert!(dark(140, 150 - rise) && !dark(160, 150 - rise), "copy across both");
 }

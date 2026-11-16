@@ -19,6 +19,7 @@ pub const TRAZOS: &[(&str, &str)] = &[
     ("cuentagotas", "M13.5 6.5l4 4M11.5 8.5l4 4-7.5 7.5H5.5V17.5zM15.5 6.5l1.4-1.4a2.1 2.1 0 0 1 3 3L18.5 9.5M4 21l1.5-1"),
     ("mover", "M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3"),
     ("transformar", "M6.5 6.5h11v11h-11zM4 4h5v5H4zM15 4h5v5h-5zM4 15h5v5H4zM15 15h5v5h-5z"),
+    ("simetria", "M12 3v2.5M12 8v2.5M12 13.5V16M12 18.5V21M9 7.5l-5 4.5 5 4.5zM15 7.5l5 4.5-5 4.5z"),
     ("forma", "M3 13h9v8H3zM21 8.5a5.5 5.5 0 1 1-11 0a5.5 5.5 0 1 1 11 0"),
     ("texto", "M5 7V5h14v2M12 5v14M9 19h6"),
     ("seleccion", "M4 4h3M10.5 4h3M17 4h3M4 20h3M10.5 20h3M17 20h3M4 7.5v2.5M4 14v2.5M20 7.5v2.5M20 14v2.5"),

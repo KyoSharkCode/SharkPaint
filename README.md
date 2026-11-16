@@ -51,7 +51,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
-- Simetría: los trazos se repiten en espejo respecto al centro del lienzo.
+- Simetría (`Y`): los trazos se repiten en espejo respecto a un eje vertical, uno
+  horizontal o los dos, colocados donde haga falta.
 - Paleta de colores guardados e historial de colores recientes.
 - Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
 - Atajos de herramientas configurables (Editar → Preferencias).
@@ -70,8 +71,6 @@ Para la 0.1.4:
 - Arrastrar capas en la lista para reordenarlas y meterlas en grupos.
 - Máscaras de capa: ocultar partes de una capa sin borrarlas.
 - Nombres reales de las fuentes en la herramienta de texto.
-- Simetría como herramienta: eje que se coloca donde haga falta (no siempre va en el
-  centro), vertical, horizontal o los dos a la vez.
 
 Más adelante:
 
@@ -90,6 +89,7 @@ Más adelante:
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
 | `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela) |
+| `Y` | Simetría: clic o arrastre para colocar los ejes |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |
