@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape, StrokePoint, Symmetry, TextFont,
+    builtin_papers, builtin_tips, font_names, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, SelectMode, Shape, StrokePoint, Symmetry, TextFont, TextSpec,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -1729,7 +1729,10 @@ fn text_is_drawn_in_the_bundled_font() {
     // Nothing to draw.
     assert!(render_text(&font, "", 40.0, [0, 0, 0]).is_none());
     assert!(render_text(&font, "   \n ", 40.0, [0, 0, 0]).is_none());
-    assert!(TextFont::from_bytes("x", b"not a font".to_vec()).is_none());
+    assert!(TextFont::from_bytes("x", b"not a font".to_vec(), 0).is_none());
+    // The bundled font says what it is called.
+    assert_eq!(font_names(TextFont::builtin_data()), ["Ubuntu Light"]);
+    assert!(font_names(b"not a font").is_empty());
     // It goes onto the canvas as a layer of its own, in one undo step.
     let mut doc = Document::new(300, 120);
     doc.add_image_layer("Hola", width, height, &rgba, 20, 30);
@@ -1920,4 +1923,104 @@ fn layers_and_groups_can_be_dropped_anywhere_in_the_stack() {
     assert!(doc.place_layer(2, 0, 0));
     assert!(doc.group(other).is_none());
     assert_eq!(doc.groups().len(), 1);
+}
+
+/// A text layer the way the application makes one: drawn in the bundled font.
+fn written(content: &str, size: f32, x: i32, y: i32) -> (TextSpec, usize, usize, Vec<u8>) {
+    let spec = TextSpec { content: content.into(), font: "Ubuntu Light".into(), size, color: [0, 0, 0], x, y };
+    let (w, h, rgba) = render_text(&TextFont::builtin(), content, size, spec.color).unwrap_or((0, 0, Vec::new()));
+    (spec, w, h, rgba)
+}
+
+#[test]
+fn text_layers_stay_text_until_turned_into_pictures() {
+    let mut doc = Document::new(400, 200);
+    let ink = |doc: &Document| doc.render_rgba8(doc.bounds()).chunks(4).filter(|px| px[0] < 128).count();
+    let (spec, w, h, rgba) = written("Hola", 40.0, 20, 30);
+    doc.add_text_layer(spec.clone(), w, h, &rgba);
+    assert_eq!(doc.layers().len(), 2);
+    assert!(doc.active_is_text());
+    assert_eq!(doc.active().props.name, "Hola");
+    assert_eq!(doc.active().text.as_ref(), Some(&spec));
+    let small = ink(&doc);
+    assert!(small > 100);
+
+    // It cannot be painted on, filled, erased, cleared or turned over.
+    let before = doc.render_rgba8(doc.bounds());
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (10.0, 10.0), (390.0, 190.0));
+    line(&mut doc, &hard_brush(30.0), [0, 0, 0], true, (10.0, 50.0), (390.0, 50.0));
+    assert!(!doc.flood_fill(300, 150, [0, 0, 255], 0.1, true));
+    assert!(!doc.draw_shape(Shape::Rectangle, (10.0, 10.0), (90.0, 90.0), [0, 255, 0], 2.0, true, 1.0));
+    doc.clear_active_layer();
+    doc.flip(true);
+    assert!(doc.begin_transform().is_none());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.layers().len(), 2);
+
+    // Rewriting it, bigger and elsewhere: several changes, one undo step.
+    for (content, size) in [("Hola K", 40.0), ("Hola Ky", 60.0), ("Hola Kyo", 80.0)] {
+        let (spec, w, h, rgba) = written(content, size, 60, 90);
+        assert!(doc.update_text_layer(1, spec, w, h, &rgba));
+    }
+    assert_eq!(doc.active().props.name, "Hola Kyo", "a name taken from the text follows it");
+    assert!(ink(&doc) > small * 3);
+    assert_eq!(pixel(&doc, 25, 35)[3], 255);
+    assert_eq!(doc.layers()[1].pixel(40, 50)[3], 0, "nothing is left where it used to be");
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.active().text.as_ref(), Some(&spec));
+    doc.redo();
+    assert_eq!(doc.active().text.as_ref().unwrap().content, "Hola Kyo");
+    // Closing the run of changes makes the next one a step of its own.
+    doc.end_text_edit();
+    let (bigger, w, h, rgba) = written("Hola Kyo", 90.0, 60, 90);
+    doc.update_text_layer(1, bigger, w, h, &rgba);
+    doc.undo();
+    assert_eq!(doc.active().text.as_ref().unwrap().size, 80.0);
+
+    // Moved as a layer, it remembers where it went; undo brings both back.
+    doc.begin_layer_move();
+    doc.move_layer_to(15, -20);
+    doc.end_stroke();
+    let moved = doc.active().text.clone().unwrap();
+    assert_eq!((moved.x, moved.y), (75, 70));
+    doc.undo();
+    assert_eq!((doc.active().text.as_ref().unwrap().x, doc.active().text.as_ref().unwrap().y), (60, 90));
+    doc.redo();
+
+    // Saved and read back, it is still text.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.layers()[1].text.as_ref(), Some(&moved));
+    assert!(loaded.layers()[0].text.is_none());
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    for cut in file.len() - 40..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+    // More room around the canvas moves it along; turning the canvas over
+    // makes it a picture.
+    doc.resize_canvas(500, 300, 50, 40);
+    assert_eq!(doc.active().text.as_ref().unwrap().x, 125);
+    doc.flip_canvas(true);
+    assert!(!doc.active_is_text());
+    doc.undo();
+    assert!(doc.active_is_text());
+
+    // Turned into a picture it can be painted on, and that can be undone.
+    assert!(doc.rasterize_text(1));
+    assert!(!doc.active_is_text());
+    assert!(!doc.rasterize_text(1));
+    let before = ink(&doc);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 10.0), (200.0, 10.0));
+    assert!(ink(&doc) > before);
+    doc.undo();
+    doc.undo();
+    assert!(doc.active_is_text());
+
+    // Merging onto text makes a picture of it.
+    doc.add_layer();
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 10.0), (200.0, 10.0));
+    assert!(doc.merge_down());
+    assert!(!doc.active_is_text());
 }

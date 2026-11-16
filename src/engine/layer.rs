@@ -208,6 +208,29 @@ pub struct LayerGroup {
     pub collapsed: bool,
 }
 
+/// What a text layer says and how: enough to draw it again. The layer's
+/// pixels are that drawing, made by whoever has the fonts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSpec {
+    pub content: String,
+    /// Name of the typeface, as the font list shows it.
+    pub font: String,
+    /// Height of the text in pixels.
+    pub size: f32,
+    pub color: [u8; 3],
+    /// Top-left corner of the drawn text on the canvas.
+    pub x: i32,
+    pub y: i32,
+}
+
+impl TextSpec {
+    /// A name for the layer, taken from the start of the text.
+    pub fn layer_name(&self) -> String {
+        let name: String = self.content.lines().next().unwrap_or("").trim().chars().take(24).collect();
+        if name.is_empty() { "Texto".to_owned() } else { name }
+    }
+}
+
 #[derive(Clone)]
 pub struct Layer {
     /// Identifies the layer across reordering and undo; unique within a document.
@@ -217,6 +240,9 @@ pub struct Layer {
     pub group: u64,
     /// Changes whenever the layer's pixels change (used to refresh previews).
     pub version: u64,
+    /// Set while the layer is text that can still be rewritten. Such a layer
+    /// is not painted on: its pixels always are what `text` says.
+    pub text: Option<TextSpec>,
     pub props: LayerProps,
     pub width: usize,
     pub height: usize,
@@ -232,6 +258,7 @@ impl Layer {
         Layer {
             id: 0,
             group: 0,
+            text: None,
             version: 0,
             props: LayerProps::named(name),
             width,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::brush::BrushSettings;
-use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
+use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, TextSpec, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
 use super::stroke::{ActiveStroke, StrokePoint, Symmetry};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
@@ -77,6 +77,9 @@ pub struct Document {
     /// Layer groups, in no particular order; layers refer to them by id.
     pub(super) groups: Vec<LayerGroup>,
     pub(super) active_layer: usize,
+    /// The text layer being rewritten, by id: its changes so far are one undo
+    /// step, until anything else is done.
+    pub(super) text_session: Option<u64>,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
     /// Lines across which brush and eraser strokes are mirrored.
@@ -122,6 +125,7 @@ impl Document {
             layers,
             groups: Vec::new(),
             active_layer: active,
+            text_session: None,
             paper: [255, 255, 255],
             symmetry: Symmetry::OFF,
             stroke: None,
@@ -242,6 +246,66 @@ impl Document {
             self.layers[from].group = next;
         }
         self.mark_dirty(self.bounds());
+        true
+    }
+
+    // --- Text layers -----------------------------------------------------------
+
+    /// The active layer is text that can still be rewritten, so it cannot be
+    /// painted on.
+    pub fn active_is_text(&self) -> bool {
+        self.active().text.is_some()
+    }
+
+    /// Adds a text layer above the active one and selects it. `rgba` is the
+    /// text as drawn: 8-bit, not premultiplied, `width * height * 4` bytes,
+    /// with its top-left corner at the spec's position.
+    pub fn add_text_layer(&mut self, spec: TextSpec, width: usize, height: usize, rgba: &[u8]) {
+        self.add_image_layer(&spec.layer_name(), width, height, rgba, spec.x, spec.y);
+        self.layers[self.active_layer].text = Some(spec);
+    }
+
+    /// Rewrites a text layer: new words, typeface, size, colour or place, with
+    /// the text drawn afresh in `rgba`. Changes made one after another to the
+    /// same layer are a single undo step. Returns whether `index` is a text layer.
+    pub fn update_text_layer(&mut self, index: usize, spec: TextSpec, width: usize, height: usize, rgba: &[u8]) -> bool {
+        let Some(old) = self.layers.get(index).and_then(|layer| layer.text.clone()) else { return false };
+        assert_eq!(rgba.len(), width * height * 4, "image buffer does not match its size");
+        let id = self.layers[index].id;
+        if self.text_session == Some(id) {
+            self.revision += 1;
+        } else {
+            self.checkpoint_layers();
+            self.text_session = Some(id);
+        }
+        let version = self.stamp();
+        let layer = &mut self.layers[index];
+        // A name that was taken from the text follows it.
+        if layer.props.name == old.layer_name() {
+            layer.props.name = spec.layer_name();
+        }
+        layer.tiles.iter_mut().for_each(|tile| *tile = None);
+        super::tools::put_image(layer, width, height, rgba, spec.x, spec.y);
+        layer.text = Some(spec);
+        layer.version = version;
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Closes the run of changes to a text layer, so the next one starts a
+    /// new undo step.
+    pub fn end_text_edit(&mut self) {
+        self.text_session = None;
+    }
+
+    /// Turns a text layer into an ordinary one: it keeps its pixels and can be
+    /// painted on, but not rewritten. Returns whether `index` was a text layer.
+    pub fn rasterize_text(&mut self, index: usize) -> bool {
+        if self.layers.get(index).is_none_or(|layer| layer.text.is_none()) {
+            return false;
+        }
+        self.checkpoint_layers();
+        self.layers[index].text = None;
         true
     }
 
@@ -447,6 +511,8 @@ impl Document {
         let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
         below.version = version;
+        // With something merged into it, text is text no longer.
+        below.text = None;
         let (opacity, mode, clipped) = (top.props.opacity15(), top.props.blend, top.props.clip);
         for (idx, src) in top.tiles.iter().enumerate() {
             let Some(src) = src else { continue };
@@ -488,6 +554,9 @@ impl Document {
     /// Empties the active layer as an undoable step.
     pub fn clear_active_layer(&mut self) {
         self.end_stroke();
+        if self.active_is_text() {
+            return;
+        }
         let li = self.active_layer;
         let tiles: Vec<_> = self.layers[li]
             .tiles
@@ -645,6 +714,9 @@ impl Document {
         if self.stroke.is_some() {
             self.end_stroke();
         }
+        if self.active_is_text() {
+            return;
+        }
         let li = self.active_layer;
         let selection = self.selection.clone();
         let (stroke, rect) =
@@ -710,6 +782,7 @@ impl Document {
 
     pub fn undo(&mut self) -> bool {
         self.end_stroke();
+        self.text_session = None;
         match self.undo.pop() {
             Some(mut entry) => {
                 self.swap_entry(&mut entry);
@@ -722,6 +795,7 @@ impl Document {
 
     pub fn redo(&mut self) -> bool {
         self.end_stroke();
+        self.text_session = None;
         match self.redo.pop() {
             Some(mut entry) => {
                 self.swap_entry(&mut entry);
@@ -867,7 +941,7 @@ impl Document {
     }
 
     /// Records the layer stack as it is now, before a structural change.
-    fn checkpoint_layers(&mut self) {
+    pub(super) fn checkpoint_layers(&mut self) {
         self.end_stroke();
         self.push_undo(HistoryEntry::Layers {
             layers: self.layers.clone(),
@@ -877,6 +951,7 @@ impl Document {
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
+        self.text_session = None;
         self.revision += 1;
         self.undo.push(entry);
         self.redo.clear();

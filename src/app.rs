@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, PROJECT_EXTENSION,
-    read_psd, render_text,
+    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
+    PROJECT_EXTENSION,
+    font_names, read_psd, render_text,
 };
 
 use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
@@ -243,15 +244,25 @@ fn list_drop(dragged: Dragged, pointer: Pos2, rows: &[(Rect, ListRow)], doc: &Do
 /// Text rendered for placing on the canvas.
 struct TextPreview {
     /// Content, size, typeface and colour it was drawn from.
-    key: (String, u32, usize, [u8; 3]),
+    key: (String, u32, String, [u8; 3]),
     width: usize,
     height: usize,
     rgba: Vec<u8>,
     texture: TextureHandle,
 }
 
-/// Font files installed on this computer, by name, sorted.
-fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
+/// A typeface on offer: its name, and where its font file is (the bundled
+/// one has none) and which face of that file it is.
+#[derive(Clone)]
+struct FontEntry {
+    name: String,
+    path: Option<PathBuf>,
+    index: u32,
+}
+
+/// The typefaces installed on this computer, by their real names, sorted.
+/// Reads every font file, so it is run away from the window's thread.
+fn installed_fonts() -> Vec<FontEntry> {
     let mut folders: Vec<PathBuf> = Vec::new();
     let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
     if cfg!(windows) {
@@ -263,7 +274,7 @@ fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
         folders.extend(var("HOME").map(|dir| dir.join(".local/share/fonts")));
         folders.extend(var("HOME").map(|dir| dir.join("Library/Fonts")));
     }
-    let mut found: Vec<(String, Option<PathBuf>)> = Vec::new();
+    let mut found: Vec<FontEntry> = Vec::new();
     // Folders nest a few levels deep on some systems.
     let mut pending: Vec<(PathBuf, u32)> = folders.into_iter().map(|dir| (dir, 0)).collect();
     while let Some((dir, depth)) = pending.pop() {
@@ -276,13 +287,22 @@ fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
                 continue;
             }
             let is_font = path.extension().is_some_and(|e| ["ttf", "otf", "ttc"].iter().any(|kind| e.eq_ignore_ascii_case(kind)));
-            if let (true, Some(name)) = (is_font, path.file_stem()) {
-                found.push((name.to_string_lossy().into_owned(), Some(path)));
+            // Very large files are skipped: reading them all would take too long.
+            let small = entry.metadata().is_ok_and(|meta| meta.len() <= 64 << 20);
+            if !is_font || !small {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            for (index, name) in font_names(&data).into_iter().enumerate() {
+                // A face that does not say its name goes by its file's.
+                let name = if name.is_empty() { format!("{stem} {}", index + 1) } else { name };
+                found.push(FontEntry { name, path: Some(path.clone()), index: index as u32 });
             }
         }
     }
-    found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    found.dedup_by(|a, b| a.0 == b.0);
+    found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    found.dedup_by(|a, b| a.name == b.name);
     found
 }
 
@@ -404,6 +424,7 @@ enum Command {
     LayerMove(bool),
     LayerMerge,
     LayerGroup,
+    RasterizeText,
     CanvasSize(bool),
     CropToSelection,
     FlipCanvas(bool),
@@ -497,10 +518,24 @@ pub struct SharkPaintApp {
     text_content: String,
     text_size: f32,
     /// Typefaces on offer: the bundled one first, then those installed.
-    text_fonts: Option<Vec<(String, Option<PathBuf>)>>,
-    text_font_index: usize,
-    /// The typeface in use, with its place in the list.
-    text_font: Option<(usize, TextFont)>,
+    text_fonts: Vec<FontEntry>,
+    /// The search for installed typefaces, while it runs; `text_fonts_asked`
+    /// tells whether it was ever started.
+    text_font_scan: Option<std::thread::JoinHandle<Vec<FontEntry>>>,
+    text_fonts_asked: bool,
+    /// Name of the typeface chosen.
+    text_font_name: String,
+    /// The typeface in hand, under the name it was asked for.
+    text_font: Option<(String, TextFont)>,
+    /// A new text is being started even though the active layer is text.
+    text_new: bool,
+    /// What the text layer being rewritten said when the panel last matched it.
+    text_applied: Option<TextSpec>,
+    /// From the text's corner to where the pointer took hold of it.
+    text_grab: Vec2,
+    /// What the last change to the text layer was (words, typeface, size,
+    /// colour or place), to tell where one undo step ends.
+    text_change: Option<u8>,
     /// Where on the canvas the text's top-left corner goes, once chosen.
     text_anchor: Option<Pos2>,
     /// The pointer is moving the text about.
@@ -664,9 +699,15 @@ impl SharkPaintApp {
             shape_opacity: 1.0,
             text_content: String::new(),
             text_size: 96.0,
-            text_fonts: None,
-            text_font_index: 0,
+            text_fonts: vec![FontEntry { name: BUILTIN_FONT.to_owned(), path: None, index: 0 }],
+            text_font_scan: None,
+            text_fonts_asked: false,
+            text_font_name: BUILTIN_FONT.to_owned(),
             text_font: None,
+            text_new: false,
+            text_applied: None,
+            text_grab: Vec2::ZERO,
+            text_change: None,
             text_anchor: None,
             text_dragging: false,
             text_preview: None,
@@ -1303,6 +1344,14 @@ impl SharkPaintApp {
                 }
                 if ui.add_enabled(active > 0, egui::Button::new("Fusionar con la inferior")).clicked() {
                     commands.push(Command::LayerMerge);
+                }
+                let rasterize = egui::Button::new("Convertir texto en imagen");
+                if ui
+                    .add_enabled(self.doc.active_is_text(), rasterize)
+                    .on_hover_text("La capa de texto pasa a ser una capa normal")
+                    .clicked()
+                {
+                    commands.push(Command::RasterizeText);
                 }
                 ui.separator();
                 if ui.add_enabled(active + 1 < self.doc.layers().len(), egui::Button::new("Subir")).clicked() {
@@ -2145,23 +2194,47 @@ impl SharkPaintApp {
         ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
     }
 
-    /// Loads the chosen typeface if it is not the one in hand. A file that
-    /// cannot be used falls back to the bundled typeface.
+    /// Loads the chosen typeface if it is not the one in hand. One that is not
+    /// installed, or cannot be read, is stood in for by the bundled typeface.
     fn text_font(&mut self) -> &TextFont {
-        let index = self.text_font_index;
-        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != index) {
-            let entry = self.text_fonts.as_ref().and_then(|fonts| fonts.get(index)).cloned();
+        let name = self.text_font_name.clone();
+        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != name) {
+            let entry = self.text_fonts.iter().find(|font| font.name == name).cloned();
             let font = entry
-                .and_then(|(name, path)| TextFont::from_bytes(name, std::fs::read(path?).ok()?))
+                .and_then(|entry| TextFont::from_bytes(entry.name, std::fs::read(entry.path?).ok()?, entry.index))
                 .unwrap_or_else(TextFont::builtin);
-            self.text_font = Some((index, font));
+            self.text_font = Some((name, font));
         }
         &self.text_font.as_ref().expect("just loaded").1
     }
 
-    /// Redraws the text waiting to be placed when what it shows has changed.
+    /// Starts looking for the installed typefaces the first time they are
+    /// wanted, and takes the list in once it is ready.
+    fn poll_fonts(&mut self, ctx: &egui::Context) {
+        if !self.text_fonts_asked {
+            self.text_fonts_asked = true;
+            self.text_font_scan = std::thread::Builder::new().name("fuentes".into()).spawn(installed_fonts).ok();
+        }
+        if self.text_font_scan.as_ref().is_some_and(|scan| scan.is_finished()) {
+            if let Some(Ok(found)) = self.text_font_scan.take().map(|scan| scan.join()) {
+                self.text_fonts.extend(found);
+                // A typeface stood in for until now may have turned up.
+                self.text_font = None;
+                self.text_preview = None;
+            }
+        } else if self.text_font_scan.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// The text layer the text tool is rewriting, if it is.
+    fn editing_text(&self) -> Option<usize> {
+        (self.tool == Tool::Texto && !self.text_new && self.doc.active_is_text()).then(|| self.doc.active_layer())
+    }
+
+    /// Redraws the text in the panel when what it shows has changed.
     fn sync_text_preview(&mut self, ctx: &egui::Context) {
-        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_index, self.color);
+        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_name.clone(), self.color);
         if self.text_preview.as_ref().is_some_and(|preview| preview.key == key) {
             return;
         }
@@ -2176,42 +2249,123 @@ impl SharkPaintApp {
         }
     }
 
-    /// Puts the text on the canvas as a layer of its own.
+    /// Keeps the text tool and the canvas in step: with a text layer active,
+    /// the panel shows that layer's text and every change to it is written
+    /// back; otherwise the panel holds a new text waiting to be placed.
+    fn sync_text(&mut self, ctx: &egui::Context) {
+        self.poll_fonts(ctx);
+        let Some(index) = self.editing_text() else {
+            if self.text_applied.take().is_some() {
+                // The layer being rewritten is no longer the one in hand.
+                self.text_anchor = None;
+            }
+            self.sync_text_preview(ctx);
+            return;
+        };
+        let Some(spec) = self.doc.layers()[index].text.clone() else { return };
+        if self.text_applied.as_ref() != Some(&spec) {
+            // A different layer, or this one changed behind the panel's back
+            // (undo, a move): the panel takes what the layer says.
+            self.text_content = spec.content.clone();
+            self.text_size = spec.size;
+            self.text_font_name = spec.font.clone();
+            self.color = spec.color;
+            self.text_anchor = Some(Pos2::new(spec.x as f32, spec.y as f32));
+            self.text_applied = Some(spec.clone());
+        }
+        self.sync_text_preview(ctx);
+        let anchor = self.text_anchor.unwrap_or(Pos2::new(spec.x as f32, spec.y as f32));
+        let wanted = TextSpec {
+            content: self.text_content.clone(),
+            font: self.text_font_name.clone(),
+            size: self.text_size,
+            color: self.color,
+            x: anchor.x.round() as i32,
+            y: anchor.y.round() as i32,
+        };
+        if wanted != spec {
+            // Typing is one undo step, a change of typeface another, a move
+            // another: a different kind of change starts a new step.
+            let kind = if wanted.content != spec.content {
+                0
+            } else if wanted.font != spec.font {
+                1
+            } else if wanted.size != spec.size {
+                2
+            } else if wanted.color != spec.color {
+                3
+            } else {
+                4
+            };
+            if self.text_change != Some(kind) {
+                self.doc.end_text_edit();
+                self.text_change = Some(kind);
+            }
+            let (width, height, rgba) = match &self.text_preview {
+                Some(preview) => (preview.width, preview.height, preview.rgba.as_slice()),
+                None => (0, 0, &[][..]),
+            };
+            self.doc.update_text_layer(index, wanted.clone(), width, height, rgba);
+            self.text_applied = Some(wanted);
+        }
+    }
+
+    /// Puts the new text on the canvas as a text layer of its own.
     fn place_text(&mut self, ctx: &egui::Context) {
         self.sync_text_preview(ctx);
         let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) else { return };
-        let name: String = self.text_content.lines().next().unwrap_or("Texto").chars().take(24).collect();
-        self.doc.add_image_layer(name.trim(), preview.width, preview.height, &preview.rgba, anchor.x as i32, anchor.y as i32);
+        let spec = TextSpec {
+            content: self.text_content.clone(),
+            font: self.text_font_name.clone(),
+            size: self.text_size,
+            color: self.color,
+            x: anchor.x.round() as i32,
+            y: anchor.y.round() as i32,
+        };
+        self.doc.add_text_layer(spec.clone(), preview.width, preview.height, &preview.rgba);
         self.note_color();
-        self.text_anchor = None;
-        self.status = "Texto colocado en una capa nueva. Muévelo o transfórmalo como cualquier capa.".into();
+        // The new layer is the active one, so the panel goes on to rewrite it.
+        self.text_new = false;
+        self.text_applied = Some(spec);
+        self.active_group = None;
+        self.status = "Texto colocado en una capa de texto: puedes seguir cambiándolo con esta herramienta.".into();
     }
 
     /// What to write, in which typeface and how tall.
     fn text_panel(&mut self, ui: &mut egui::Ui) {
         ui.set_width(248.0);
-        let fonts = self.text_fonts.get_or_insert_with(|| {
-            let mut fonts = vec![("Ubuntu Light (incluida)".to_owned(), None)];
-            fonts.extend(installed_fonts());
-            fonts
+        let editing = self.editing_text();
+        ui.horizontal(|ui| {
+            if editing.is_some() {
+                ui.strong("Editando la capa de texto");
+                if ui.small_button("Nuevo texto").on_hover_text("Deja esta capa como está y empieza otro texto").clicked() {
+                    self.text_new = true;
+                    self.text_content.clear();
+                    self.text_anchor = None;
+                }
+            } else {
+                ui.strong("Texto nuevo");
+                if self.doc.active_is_text() && ui.small_button("Editar la capa").on_hover_text("Vuelve al texto de la capa activa").clicked() {
+                    self.text_new = false;
+                }
+            }
         });
-        self.text_font_index = self.text_font_index.min(fonts.len() - 1);
         ui.add(
             egui::TextEdit::multiline(&mut self.text_content)
                 .hint_text("Escribe aquí el texto")
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
+        let installed = self.text_fonts.iter().any(|font| font.name == self.text_font_name);
         egui::Grid::new("texto").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Fuente");
-            let fonts = self.text_fonts.as_ref().expect("filled above");
             egui::ComboBox::from_id_salt("fuente_texto")
-                .selected_text(fonts[self.text_font_index].0.as_str())
+                .selected_text(self.text_font_name.as_str())
                 .width(170.0)
                 .height(320.0)
                 .show_ui(ui, |ui| {
-                    for (i, (name, _)) in fonts.iter().enumerate() {
-                        ui.selectable_value(&mut self.text_font_index, i, name);
+                    for font in &self.text_fonts {
+                        ui.selectable_value(&mut self.text_font_name, font.name.clone(), font.name.as_str());
                     }
                 });
             ui.end_row();
@@ -2219,29 +2373,47 @@ impl SharkPaintApp {
             ui.add(egui::Slider::new(&mut self.text_size, 8.0..=1000.0).logarithmic(true).fixed_decimals(0).suffix(" px"));
             ui.end_row();
         });
-        let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+        if self.text_font_scan.is_some() {
+            ui.weak("Buscando las fuentes instaladas…");
+        } else if !installed {
+            ui.weak("Esa fuente no está instalada en este equipo: al cambiar el texto se dibujará con la fuente incluida.");
+        }
+        if let Some(index) = editing {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Convertir en imagen")
+                    .on_hover_text("La capa deja de ser texto: se podrá pintar sobre ella y transformarla,\npero ya no reescribirla")
+                    .clicked()
+                {
+                    self.doc.rasterize_text(index);
+                    self.text_anchor = None;
+                    self.status = "La capa de texto es ahora una imagen.".into();
+                }
+            });
+            ui.label("Cambia el texto, la fuente, el tamaño o el color y la capa se actualiza. Arrastra sobre el lienzo para moverla.");
+        } else {
+            let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+                    self.place_text(ui.ctx());
+                }
+                if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+                    self.text_anchor = None;
+                }
+            });
+            ui.label(if self.text_anchor.is_some() {
+                "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
+            } else {
+                "Haz clic en el lienzo donde quieras el texto."
+            });
+            ui.label("Queda en una capa de texto, que podrás reescribir cuando quieras.");
+            // Shortcuts work while typing too.
+            let (place, cancel) = ui.input(|i| (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+            if place && ready {
                 self.place_text(ui.ctx());
-            }
-            if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+            } else if cancel {
                 self.text_anchor = None;
             }
-        });
-        ui.label(if self.text_anchor.is_some() {
-            "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
-        } else {
-            "Haz clic en el lienzo donde quieras el texto."
-        });
-        ui.label("Al colocarlo queda en una capa nueva, como imagen: después no se puede reescribir.");
-        // Shortcuts work while typing too.
-        let (place, cancel) = ui.input(|i| {
-            (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
-        });
-        if place && ready {
-            self.place_text(ui.ctx());
-        } else if cancel {
-            self.text_anchor = None;
         }
     }
 
@@ -2872,6 +3044,12 @@ impl SharkPaintApp {
                         );
                         icon("candado", 14.0, ink).paint_at(ui, at);
                     }
+                    if layer.text.is_some() {
+                        // A text layer wears the text tool's mark.
+                        let x = row.right() - if props.alpha_lock { 32.0 } else { 14.0 };
+                        let at = Rect::from_center_size(Pos2::new(x, row.center().y), Vec2::splat(14.0));
+                        icon("texto", 14.0, ink).paint_at(ui, at);
+                    }
                     if response.clicked() {
                         select = Some(i);
                     }
@@ -3345,9 +3523,30 @@ impl SharkPaintApp {
                     }
                     let c = to_canvas(*pos);
                     if self.tool == Tool::Texto && !alt {
-                        // Press to put the text there; keep holding to move it.
-                        self.text_anchor = Some(c.round());
+                        // A new text goes where the press is; one being rewritten
+                        // is taken hold of and moved. Keep holding to move either.
+                        match (self.editing_text(), self.text_anchor) {
+                            (Some(_), Some(anchor)) => {
+                                self.text_grab = c - anchor;
+                                // Each drag is a move of its own.
+                                self.text_change = None;
+                            }
+                            _ => {
+                                self.text_grab = Vec2::ZERO;
+                                self.text_anchor = Some(c.round());
+                            }
+                        }
                         self.text_dragging = true;
+                        continue;
+                    }
+                    let paints = matches!(
+                        self.tool,
+                        Tool::Pincel | Tool::Borrador | Tool::Difuminar | Tool::Relleno | Tool::Forma | Tool::Transformar
+                    );
+                    if paints && !alt && self.doc.active_is_text() {
+                        self.status =
+                            "Es una capa de texto: cámbiala con la herramienta Texto, o conviértela en imagen (menú Capa) para pintar en ella."
+                                .into();
                         continue;
                     }
                     if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
@@ -3431,7 +3630,9 @@ impl SharkPaintApp {
                     }
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
-                Event::PointerMoved(pos) if self.text_dragging => self.text_anchor = Some(to_canvas(*pos).round()),
+                Event::PointerMoved(pos) if self.text_dragging => {
+                    self.text_anchor = Some((to_canvas(*pos) - self.text_grab).round());
+                }
                 Event::PointerMoved(pos) if self.symmetry_dragging => self.symmetry_center = Some(to_canvas(*pos).round()),
                 Event::PointerMoved(pos) if self.select_drag.is_some() => {
                     if let Some(drag) = &mut self.select_drag {
@@ -3663,19 +3864,26 @@ impl SharkPaintApp {
             }
         }
 
-        // Text waiting to be placed, shown where it will go.
+        // Text: a new one waiting to be placed is shown where it will go; one
+        // being rewritten is already on its layer and only gets a frame.
+        if self.tool != Tool::Texto {
+            self.text_applied = None;
+        }
         if self.tool == Tool::Texto {
-            self.sync_text_preview(&ctx);
+            self.sync_text(&ctx);
+            let rewriting = self.editing_text().is_some();
             if let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) {
                 let size = Vec2::new(preview.width as f32, preview.height as f32);
                 let corners = [Vec2::ZERO, Vec2::new(size.x, 0.0), size, Vec2::new(0.0, size.y)]
                     .map(|offset| self.view.to_screen(anchor + offset, viewport, doc_size));
-                let mut mesh = Mesh::with_texture(preview.texture.id());
-                for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
-                    mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                if !rewriting {
+                    let mut mesh = Mesh::with_texture(preview.texture.id());
+                    for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
+                        mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                    }
+                    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+                    painter.add(Shape::mesh(mesh));
                 }
-                mesh.indices.extend([0, 1, 2, 0, 2, 3]);
-                painter.add(Shape::mesh(mesh));
                 let mut outline = corners.to_vec();
                 outline.push(corners[0]);
                 painter.extend(Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_rgb(111, 227, 240)), 5.0, 5.0));
@@ -4019,7 +4227,19 @@ impl SharkPaintApp {
             Command::Deselect => self.doc.deselect(),
             Command::InvertSelection => self.doc.invert_selection(),
             Command::DeleteSelected => self.doc.clear_selection_contents(),
-            Command::FlipContents(horizontal) => self.doc.flip(horizontal),
+            Command::FlipContents(horizontal) => {
+                if self.doc.active_is_text() {
+                    self.status = "Es una capa de texto: conviértela en imagen (menú Capa) para voltearla.".into();
+                } else {
+                    self.doc.flip(horizontal);
+                }
+            }
+            Command::RasterizeText => {
+                if self.doc.rasterize_text(self.doc.active_layer()) {
+                    self.text_anchor = None;
+                    self.status = "La capa de texto es ahora una imagen.".into();
+                }
+            }
             Command::Fullscreen => {
                 let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));

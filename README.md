@@ -45,7 +45,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Lienzo: cambiar su tamaño, redimensionar la imagen, recortar a la selección y
   voltear todas las capas a la vez.
 - Formas: líneas, rectángulos y elipses, rellenas o de contorno.
-- Texto con la fuente incluida o las instaladas en el equipo; se coloca como capa.
+- Texto con la fuente incluida o las instaladas en el equipo, en capas de texto que
+  se pueden reescribir hasta que se convierten en imagen.
 - Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
@@ -67,10 +68,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 Para la 0.1.4:
 
-- Texto editable: una capa de texto sigue siendo texto (se puede reescribir, cambiar
-  de fuente y de tamaño) hasta que se convierte en imagen.
 - Máscaras de capa: ocultar partes de una capa sin borrarlas.
-- Nombres reales de las fuentes en la herramienta de texto.
 
 Más adelante:
 
@@ -88,7 +86,7 @@ Más adelante:
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
-| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela) |
+| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela); con una capa de texto activa, la reescribe |
 | `Y` | Simetría: clic o arrastre para colocar los ejes |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |

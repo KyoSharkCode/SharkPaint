@@ -76,7 +76,14 @@ impl Document {
             .iter()
             .map(|layer| {
                 let reads = |area: IRect| IRect::new(area.x0 - dx, area.y0 - dy, area.x1 - dx, area.y1 - dy);
-                rebuilt(layer, width, height, version, reads, |x, y| layer.pixel(x - dx, y - dy))
+                let mut moved = rebuilt(layer, width, height, version, reads, |x, y| layer.pixel(x - dx, y - dy));
+                // Text keeps being text, in its new place.
+                moved.text = layer.text.clone().map(|mut text| {
+                    text.x += dx;
+                    text.y += dy;
+                    text
+                });
+                moved
             })
             .collect();
         self.replace_canvas(width, height, layers);
@@ -90,8 +97,8 @@ impl Document {
         self.resize_canvas(bounds.width(), bounds.height(), -bounds.x0, -bounds.y0)
     }
 
-    /// Rescales the whole picture to a new canvas size, smoothly. One
-    /// undoable step. Returns whether anything changed.
+    /// Rescales the whole picture to a new canvas size, smoothly. Text layers
+    /// become ordinary ones. One undoable step. Returns whether anything changed.
     pub fn scale_image(&mut self, width: usize, height: usize) -> bool {
         let (width, height) = (width.max(MIN_SIDE), height.max(MIN_SIDE));
         if (width, height) == (self.width, self.height) {
@@ -162,7 +169,8 @@ impl Document {
     }
 
     /// Turns the whole picture over, every layer at once: left to right
-    /// (`horizontal`) or top to bottom. One undoable step.
+    /// (`horizontal`) or top to bottom. Text layers become ordinary ones. One
+    /// undoable step.
     pub fn flip_canvas(&mut self, horizontal: bool) {
         self.end_stroke();
         let version = self.next_version();
