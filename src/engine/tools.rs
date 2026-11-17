@@ -390,6 +390,8 @@ fn smudge_step(
 pub(super) struct MoveSession {
     layer: usize,
     original: Vec<Option<Arc<Tile>>>,
+    /// The layer's mask as it was, which moves along with the layer.
+    original_mask: Option<Vec<Option<Arc<Tile>>>>,
     offset: (i32, i32),
 }
 
@@ -398,7 +400,12 @@ impl Document {
     pub fn begin_layer_move(&mut self) {
         self.end_stroke();
         let layer = self.active_layer;
-        self.moving = Some(MoveSession { layer, original: self.layers[layer].tiles.clone(), offset: (0, 0) });
+        self.moving = Some(MoveSession {
+            layer,
+            original: self.layers[layer].tiles.clone(),
+            original_mask: self.layers[layer].mask.as_ref().map(|mask| mask.tiles.clone()),
+            offset: (0, 0),
+        });
     }
 
     /// Places the layer `dx`, `dy` pixels from where the move began. Pixels
@@ -412,6 +419,9 @@ impl Document {
         session.offset = (dx, dy);
         let layer = &mut self.layers[session.layer];
         layer.tiles = shifted(layer, &session.original, dx, dy);
+        if let (Some(mask), Some(original)) = (layer.mask.as_deref_mut(), &session.original_mask) {
+            mask.tiles = shifted(mask, original, dx, dy);
+        }
         self.mark_dirty(self.bounds());
     }
 
@@ -420,14 +430,23 @@ impl Document {
             if session.offset == (0, 0) {
                 return;
             }
-            if self.layers[session.layer].text.is_some() {
-                // Text remembers where it is, so the move is recorded with the
-                // layer as a whole rather than as changed pixels.
-                let moved = std::mem::replace(&mut self.layers[session.layer].tiles, session.original);
+            if self.layers[session.layer].text.is_some() || session.original_mask.is_some() {
+                // Text remembers where it is, and a mask moves with its layer,
+                // so the move is recorded with the layer as a whole rather
+                // than as changed pixels.
+                let layer = &mut self.layers[session.layer];
+                let moved = std::mem::replace(&mut layer.tiles, session.original);
+                let moved_mask = match (layer.mask.as_deref_mut(), session.original_mask) {
+                    (Some(mask), Some(original)) => Some(std::mem::replace(&mut mask.tiles, original)),
+                    _ => None,
+                };
                 self.checkpoint_layers();
                 let version = self.next_version();
                 let layer = &mut self.layers[session.layer];
                 layer.tiles = moved;
+                if let (Some(mask), Some(moved)) = (layer.mask.as_deref_mut(), moved_mask) {
+                    mask.tiles = moved;
+                }
                 layer.version = version;
                 if let Some(text) = &mut layer.text {
                     text.x += session.offset.0;
@@ -449,7 +468,11 @@ impl Document {
 
     pub(super) fn cancel_layer_move(&mut self) {
         if let Some(session) = self.moving.take() {
-            self.layers[session.layer].tiles = session.original;
+            let layer = &mut self.layers[session.layer];
+            layer.tiles = session.original;
+            if let (Some(mask), Some(original)) = (layer.mask.as_deref_mut(), session.original_mask) {
+                mask.tiles = original;
+            }
             self.mark_dirty(self.bounds());
         }
     }
@@ -607,7 +630,8 @@ impl Document {
     /// move, or `None` (and starts nothing) if there are none.
     pub fn begin_transform(&mut self) -> Option<IRect> {
         self.end_stroke();
-        if self.active_is_text() {
+        // Text cannot be reshaped, and a mask would be left behind.
+        if self.active_is_text() || self.active().mask.is_some() {
             return None;
         }
         let li = self.active_layer;
@@ -893,7 +917,7 @@ impl Document {
     /// selection's bounding box.
     pub fn flip(&mut self, horizontal: bool) {
         self.end_stroke();
-        if self.active_is_text() {
+        if self.active_is_text() || self.active().mask.is_some() {
             return;
         }
         let li = self.active_layer;

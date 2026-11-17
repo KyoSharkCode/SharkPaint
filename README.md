@@ -26,6 +26,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
 - Capas y grupos se reordenan arrastrándolos en la lista.
+- Máscaras de capa: ocultan partes de una capa sin borrarlas; el borrador oculta y
+  el pincel vuelve a mostrar. Se crean vacías o desde la selección.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
   con modo de fusión propio.
 - Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
@@ -65,12 +67,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Aviso antes de descartar cambios sin guardar.
 
 ## Pendiente
-
-Para la 0.1.4:
-
-- Máscaras de capa: ocultar partes de una capa sin borrarlas.
-
-Más adelante:
 
 - Abrir y guardar `.ora` y `.kra`.
 - Importar papeles propios para la textura de los pinceles.

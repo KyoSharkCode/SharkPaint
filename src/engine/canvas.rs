@@ -76,7 +76,9 @@ impl Document {
             .iter()
             .map(|layer| {
                 let reads = |area: IRect| IRect::new(area.x0 - dx, area.y0 - dy, area.x1 - dx, area.y1 - dy);
-                let mut moved = rebuilt(layer, width, height, version, reads, |x, y| layer.pixel(x - dx, y - dy));
+                let shift = |layer: &Layer| rebuilt(layer, width, height, version, reads, |x, y| layer.pixel(x - dx, y - dy));
+                let mut moved = shift(layer);
+                moved.mask = layer.mask.as_deref().map(|mask| Box::new(shift(mask)));
                 // Text keeps being text, in its new place.
                 moved.text = layer.text.clone().map(|mut text| {
                     text.x += dx;
@@ -108,10 +110,7 @@ impl Document {
         let version = self.next_version();
         // Old pixels per new pixel, along each axis.
         let (sx, sy) = (self.width as f32 / width as f32, self.height as f32 / height as f32);
-        let layers = self
-            .layers
-            .iter()
-            .map(|layer| {
+        let scale = |layer: &Layer| {
                 let reads = |area: IRect| {
                     IRect::new(
                         (area.x0 as f32 * sx).floor() as i32 - 1,
@@ -162,6 +161,14 @@ impl Document {
                     sum.map(|v| (v / total).round() as u16)
                 };
                 rebuilt(layer, width, height, version, reads, pixel)
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let mut scaled = scale(layer);
+                scaled.mask = layer.mask.as_deref().map(|mask| Box::new(scale(mask)));
+                scaled
             })
             .collect();
         self.replace_canvas(width, height, layers);
@@ -175,10 +182,8 @@ impl Document {
         self.end_stroke();
         let version = self.next_version();
         let (w, h) = (self.width as i32, self.height as i32);
-        let layers = self
-            .layers
-            .iter()
-            .map(|layer| {
+        let (width, height) = (self.width, self.height);
+        let turn = |layer: &Layer| {
                 let reads = |area: IRect| {
                     if horizontal {
                         IRect::new(w - area.x1, area.y0, w - area.x0, area.y1)
@@ -187,7 +192,15 @@ impl Document {
                     }
                 };
                 let pixel = |x: i32, y: i32| if horizontal { layer.pixel(w - 1 - x, y) } else { layer.pixel(x, h - 1 - y) };
-                rebuilt(layer, self.width, self.height, version, reads, pixel)
+                rebuilt(layer, width, height, version, reads, pixel)
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let mut turned = turn(layer);
+                turned.mask = layer.mask.as_deref().map(|mask| Box::new(turn(mask)));
+                turned
             })
             .collect();
         self.replace_canvas(self.width, self.height, layers);

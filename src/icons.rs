@@ -27,6 +27,7 @@ pub const TRAZOS: &[(&str, &str)] = &[
     ("mas", "M12 5v14M5 12h14"),
     ("voltearH", "M12 3v18M9 7l-5 5 5 5zM15 7l5 5-5 5z"),
     ("voltearV", "M3 12h18M7 9l5-5 5 5zM7 15l5 5 5-5z"),
+    ("mascara", "M4 5h16v14H4zM16 12a4 4 0 1 1-8 0a4 4 0 1 1 8 0"),
     ("carpeta", "M3 6h6l2 2.5h10V19H3z"),
     ("duplicar", "M9 9h11v11H9zM15 9V4H4v11h5"),
     ("subir", "M12 19V5M6 11l6-6 6 6"),

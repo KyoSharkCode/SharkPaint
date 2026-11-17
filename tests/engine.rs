@@ -2024,3 +2024,152 @@ fn text_layers_stay_text_until_turned_into_pictures() {
     assert!(doc.merge_down());
     assert!(!doc.active_is_text());
 }
+
+#[test]
+fn a_layer_mask_hides_without_erasing() {
+    // A red block; under it, on another layer, a blue one.
+    let mut doc = Document::new(200, 100);
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (200.0, 100.0), [0, 0, 255], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (20.0, 20.0), (180.0, 80.0), [255, 0, 0], 1.0, true, 1.0);
+    let whole = doc.render_rgba8(doc.bounds());
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+
+    // A fresh mask hides nothing; without it, strokes go to the pixels.
+    assert!(doc.add_mask());
+    assert!(!doc.add_mask(), "one mask per layer");
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    assert!(!doc.is_editing_mask());
+    doc.edit_mask = true;
+    assert!(doc.is_editing_mask());
+
+    // On the mask the eraser hides: the layer beneath shows through.
+    line(&mut doc, &hard_brush(20.0), [0, 0, 0], true, (60.0, 50.0), (140.0, 50.0));
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 25), red);
+    assert_eq!(doc.layers()[1].pixel(100, 50), doc.layers()[1].pixel(100, 25), "the pixels themselves are untouched");
+    // And the brush brings it back, whatever its colour.
+    line(&mut doc, &hard_brush(10.0), [0, 255, 0], false, (90.0, 50.0), (110.0, 50.0));
+    assert_eq!(pixel(&doc, 100, 50), red);
+    assert_eq!(pixel(&doc, 70, 50), blue);
+    // Each stroke is an undo step of its own.
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    doc.redo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+
+    // Switched off, everything shows; switched on again, it hides again.
+    assert!(doc.set_mask_enabled(false));
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    assert!(doc.set_mask_enabled(true));
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    // Turned inside out, only what was hidden shows.
+    assert!(doc.invert_mask());
+    assert_eq!(pixel(&doc, 100, 50), red);
+    assert_eq!(pixel(&doc, 100, 25), blue);
+    assert!(doc.invert_mask());
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 25), red);
+
+    // With the mask not chosen, strokes paint the layer; the mask still hides.
+    doc.edit_mask = false;
+    line(&mut doc, &hard_brush(10.0), [0, 255, 0], false, (30.0, 30.0), (170.0, 70.0));
+    assert_eq!(pixel(&doc, 30, 30), [0, 255, 0, 255]);
+    assert_eq!(pixel(&doc, 100, 50), blue, "painted, but hidden");
+    doc.undo();
+
+    // It moves with its layer, as one undo step.
+    doc.begin_layer_move();
+    doc.move_layer_to(0, 20);
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 70), blue, "the hidden band went down with the layer");
+    assert_eq!(pixel(&doc, 100, 50), red);
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 70), red);
+    // A masked layer is not reshaped or turned over, which would leave the mask behind.
+    assert!(doc.begin_transform().is_none());
+    let before = doc.render_rgba8(doc.bounds());
+    doc.flip(true);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // Saved and read back, the mask is still a mask.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert!(loaded.layers()[1].mask.is_some() && loaded.layers()[0].mask.is_none());
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), before);
+    for cut in file.len() - 60..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+    // A Photoshop file carries the layer as it shows.
+    let mut psd = Vec::new();
+    doc.write_psd(&mut psd).unwrap();
+    let from_psd = read_psd(&psd).unwrap();
+    assert_eq!(from_psd.render_rgba8(from_psd.bounds()), before);
+    // The canvas resized and turned over takes the mask along.
+    doc.resize_canvas(240, 120, 20, 10);
+    assert_eq!(pixel(&doc, 120, 60), blue);
+    assert_eq!(pixel(&doc, 120, 35), red);
+    doc.flip_canvas(false);
+    assert_eq!(pixel(&doc, 120, 59), blue);
+    doc.undo();
+    doc.undo();
+
+    // Applied, the hidden part is erased for good and the mask goes.
+    assert!(doc.apply_mask());
+    assert!(doc.active().mask.is_none());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.layers()[1].pixel(100, 50)[3], 0);
+    assert!(!doc.apply_mask() && !doc.invert_mask() && !doc.remove_mask());
+    doc.undo();
+    // Removed, everything shows again.
+    assert!(doc.remove_mask());
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    doc.undo();
+    // Merged down, the mask is worked in.
+    assert!(doc.merge_down());
+    assert_eq!(doc.layers().len(), 1);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+}
+
+#[test]
+fn a_mask_can_start_from_the_selection() {
+    let mut doc = Document::new(300, 200);
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (300.0, 200.0), [255, 0, 0], 1.0, true, 1.0);
+    let circle: Vec<(f32, f32)> = (0..64)
+        .map(|i| {
+            let a = i as f32 / 64.0 * std::f32::consts::TAU;
+            (150.0 + 60.0 * a.cos(), 100.0 + 60.0 * a.sin())
+        })
+        .collect();
+    doc.select_polygon(&circle);
+    assert!(doc.add_mask());
+    doc.deselect();
+    assert_eq!(pixel(&doc, 150, 100), [255, 0, 0, 255], "inside the selection shows");
+    assert_eq!(pixel(&doc, 20, 20), [255, 255, 255, 255], "outside is hidden");
+    assert_eq!(pixel(&doc, 280, 190), [255, 255, 255, 255]);
+    // Somewhere along the rim a pixel is partly shown: the edge is smooth.
+    let rim: Vec<u8> = (190..215).map(|x| pixel(&doc, x, 130)[1]).collect();
+    assert!(rim.iter().any(|&green| green > 20 && green < 235), "{rim:?}");
+    // Clipped layers follow what the mask leaves showing.
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (300.0, 200.0), [0, 0, 255], 1.0, true, 1.0);
+    let mut props = doc.active().props.clone();
+    props.clip = true;
+    doc.set_layer_props(1, props, false);
+    assert_eq!(pixel(&doc, 150, 100), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 20, 20), [255, 255, 255, 255]);
+    // Text layers can be masked too, though not painted on.
+    let (spec, w, h, rgba) = written("Hola", 60.0, 100, 70);
+    doc.add_text_layer(spec, w, h, &rgba);
+    assert!(doc.add_mask());
+    doc.edit_mask = true;
+    let before = doc.render_rgba8(doc.bounds());
+    line(&mut doc, &hard_brush(80.0), [0, 0, 0], true, (90.0, 100.0), (260.0, 100.0));
+    assert_ne!(doc.render_rgba8(doc.bounds()), before, "the eraser hid the text");
+    assert!(doc.active_is_text());
+}

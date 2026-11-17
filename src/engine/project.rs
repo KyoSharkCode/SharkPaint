@@ -68,6 +68,23 @@
 //!   font     u32 length + UTF-8 bytes
 //!   content  u32 length + UTF-8 bytes
 //! ```
+//!
+//! A fourth optional trailer holds the layer masks (older readers show the
+//! layers whole):
+//!
+//! ```text
+//! magic      4 bytes  "MASK"
+//! count      u32
+//! per mask:
+//!   layer    u32      position of the layer in the file
+//!   flags    u8       bit 0 = the mask is in effect
+//!   tiles    u32      number of stored tiles
+//!   per tile:
+//!     index  u32      position in the layer's tile grid
+//!     size   u32      compressed byte count
+//!     data   zlib stream of 64×64 values, u16 each: how much of the layer
+//!            is hidden there, 0..=32768
+//! ```
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -92,6 +109,7 @@ const TILE_BYTES: usize = TILE * TILE * 8;
 const REFERENCES_MAGIC: &[u8; 4] = b"REFS";
 const GROUPS_MAGIC: &[u8; 4] = b"GRPS";
 const TEXT_MAGIC: &[u8; 4] = b"TEXT";
+const MASK_MAGIC: &[u8; 4] = b"MASK";
 /// Largest reference image side accepted when reading a file.
 const MAX_REFERENCE_SIDE: u32 = 16_384;
 
@@ -225,6 +243,36 @@ impl ProjectSnapshot {
                 }
             }
         }
+        let masks: Vec<(usize, &Layer)> =
+            self.layers.iter().enumerate().filter_map(|(i, layer)| layer.mask.as_deref().map(|mask| (i, mask))).collect();
+        if !masks.is_empty() {
+            w.write_all(MASK_MAGIC)?;
+            w.write_all(&(masks.len() as u32).to_le_bytes())?;
+            let mut values = vec![0u8; TILE * TILE * 2];
+            for (index, mask) in masks {
+                w.write_all(&(index as u32).to_le_bytes())?;
+                w.write_all(&[mask.props.visible as u8])?;
+                let stored: Vec<(usize, &Tile)> = mask
+                    .tiles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, t)| t.as_deref().map(|t| (idx, t)))
+                    .filter(|(_, t)| t.0.iter().any(|px| px[3] != 0))
+                    .collect();
+                w.write_all(&(stored.len() as u32).to_le_bytes())?;
+                for (idx, tile) in stored {
+                    for (px, out) in tile.0.iter().zip(values.chunks_exact_mut(2)) {
+                        out.copy_from_slice(&px[3].to_le_bytes());
+                    }
+                    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+                    encoder.write_all(&values)?;
+                    let data = encoder.finish()?;
+                    w.write_all(&(idx as u32).to_le_bytes())?;
+                    w.write_all(&(data.len() as u32).to_le_bytes())?;
+                    w.write_all(&data)?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -319,6 +367,7 @@ impl Document {
         let mut references = Vec::new();
         let mut groups: Vec<LayerGroup> = Vec::new();
         let mut texts_read = false;
+        let mut masks_read = false;
         loop {
             let mut magic = [0u8; 4];
             match r.read(&mut magic)? {
@@ -356,6 +405,55 @@ impl Document {
                         return Err(invalid("grupo de capa no válido"));
                     }
                     layer.group = place as u64;
+                }
+                continue;
+            }
+            if &magic == MASK_MAGIC && !masks_read {
+                masks_read = true;
+                let count = read_u32(r)? as usize;
+                if count > layers.len() {
+                    return Err(invalid("lista de máscaras no válida"));
+                }
+                // Stretches hidden outright share one tile.
+                let mut hidden: Option<Arc<Tile>> = None;
+                let mut values = vec![0u8; TILE * TILE * 2];
+                for _ in 0..count {
+                    let index = read_u32(r)? as usize;
+                    let enabled = read_u8(r)? & 1 != 0;
+                    let stored = read_u32(r)? as usize;
+                    let layer = layers.get_mut(index).ok_or_else(|| invalid("capa de máscara no válida"))?;
+                    let mut mask = Layer::new(layer.width, layer.height, "máscara");
+                    mask.props.visible = enabled;
+                    if stored > mask.tiles.len() {
+                        return Err(invalid("máscara no válida"));
+                    }
+                    for _ in 0..stored {
+                        let place = read_u32(r)? as usize;
+                        let size = read_u32(r)? as u64;
+                        if place >= mask.tiles.len() {
+                            return Err(invalid("máscara no válida"));
+                        }
+                        let mut decoder = ZlibDecoder::new(r.by_ref().take(size));
+                        decoder.read_exact(&mut values)?;
+                        io::copy(&mut decoder, &mut io::sink())?;
+                        io::copy(&mut decoder.into_inner(), &mut io::sink())?;
+                        let amounts = values.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]]).min(ONE as u16));
+                        let tile = if amounts.clone().all(|amount| amount as u32 == ONE) {
+                            hidden
+                                .get_or_insert_with(|| {
+                                    Arc::new(Tile(vec![[0, 0, 0, ONE as u16]; TILE * TILE].into_boxed_slice().try_into().unwrap()))
+                                })
+                                .clone()
+                        } else {
+                            let mut tile = Tile::empty();
+                            for (px, amount) in tile.0.iter_mut().zip(amounts) {
+                                px[3] = amount;
+                            }
+                            Arc::new(tile)
+                        };
+                        mask.tiles[place] = Some(tile);
+                    }
+                    layer.mask = Some(Box::new(mask));
                 }
                 continue;
             }

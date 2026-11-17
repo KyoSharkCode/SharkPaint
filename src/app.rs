@@ -425,6 +425,11 @@ enum Command {
     LayerMerge,
     LayerGroup,
     RasterizeText,
+    MaskAdd,
+    MaskRemove,
+    MaskApply,
+    MaskInvert,
+    MaskToggle,
     CanvasSize(bool),
     CropToSelection,
     FlipCanvas(bool),
@@ -619,6 +624,8 @@ pub struct SharkPaintApp {
     active_group: Option<u64>,
     /// The layer or group being dragged in the layer list.
     layer_drag: Option<Dragged>,
+    /// The brush and the eraser work on the active layer's mask, not on its pixels.
+    mask_editing: bool,
     /// The side panel shows the navigator (a small view of the whole canvas)
     /// in place of the colour picker.
     nav_open: bool,
@@ -752,6 +759,7 @@ impl SharkPaintApp {
             refs_open: false,
             active_group: None,
             layer_drag: None,
+            mask_editing: false,
             nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
@@ -1353,6 +1361,34 @@ impl SharkPaintApp {
                 {
                     commands.push(Command::RasterizeText);
                 }
+                ui.menu_button("Máscara", |ui| {
+                    let mask = self.doc.active().mask.as_ref().map(|mask| mask.props.visible);
+                    let add = if self.doc.selection().is_some() { "Añadir desde la selección" } else { "Añadir" };
+                    if ui.add_enabled(mask.is_none(), egui::Button::new(add)).clicked() {
+                        commands.push(Command::MaskAdd);
+                    }
+                    let toggle = if mask == Some(false) { "Activar" } else { "Desactivar" };
+                    if ui.add_enabled(mask.is_some(), egui::Button::new(toggle)).clicked() {
+                        commands.push(Command::MaskToggle);
+                    }
+                    if ui.add_enabled(mask.is_some(), egui::Button::new("Invertir")).clicked() {
+                        commands.push(Command::MaskInvert);
+                    }
+                    if ui
+                        .add_enabled(mask.is_some(), egui::Button::new("Aplicar"))
+                        .on_hover_text("Borra de la capa lo que la máscara oculta y quita la máscara")
+                        .clicked()
+                    {
+                        commands.push(Command::MaskApply);
+                    }
+                    if ui
+                        .add_enabled(mask.is_some(), egui::Button::new("Eliminar"))
+                        .on_hover_text("Quita la máscara; la capa vuelve a verse entera")
+                        .clicked()
+                    {
+                        commands.push(Command::MaskRemove);
+                    }
+                });
                 ui.separator();
                 if ui.add_enabled(active + 1 < self.doc.layers().len(), egui::Button::new("Subir")).clicked() {
                     commands.push(Command::LayerMove(true));
@@ -2790,6 +2826,24 @@ impl SharkPaintApp {
                 }
             }
             ui.weak("Voltear");
+            ui.add_space(8.0);
+            let has_mask = self.doc.active().mask.is_some();
+            let tip = if has_mask {
+                "Máscara de capa: trabajar en la máscara o en la capa"
+            } else if self.doc.selection().is_some() {
+                "Añadir máscara desde la selección: oculta lo de fuera sin borrarlo"
+            } else {
+                "Añadir máscara: oculta partes de la capa sin borrarlas"
+            };
+            let button = egui::Button::image(icon("mascara", 18.0, text)).selected(self.mask_editing).min_size(Vec2::splat(28.0));
+            if ui.add_enabled(chosen_group.is_none(), button).on_hover_text(tip).clicked() {
+                if has_mask {
+                    self.mask_editing = !self.mask_editing;
+                } else {
+                    commands.push(Command::MaskAdd);
+                }
+            }
+            ui.weak("Máscara");
         });
 
         // Properties of the chosen group, or of the active layer.
@@ -2868,6 +2922,33 @@ impl SharkPaintApp {
         } else if !continuous {
             self.prop_edit_active = false;
         }
+        // The layer's mask, when it has one.
+        if let Some(enabled) = self.doc.active().mask.as_ref().map(|mask| mask.props.visible) {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label("Máscara:");
+                ui.selectable_value(&mut self.mask_editing, false, "Capa").on_hover_text("El pincel y el borrador pintan la capa");
+                ui.selectable_value(&mut self.mask_editing, true, "Máscara")
+                    .on_hover_text("El borrador oculta y el pincel vuelve a mostrar, sin borrar nada");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let mut on = enabled;
+                if ui.checkbox(&mut on, "Activa").on_hover_text("Desmarcada, la capa se ve entera sin perder la máscara").changed() {
+                    self.doc.set_mask_enabled(on);
+                }
+                if ui.small_button("Invertir").clicked() {
+                    self.doc.invert_mask();
+                }
+                if ui.small_button("Aplicar").on_hover_text("Borra de la capa lo oculto y quita la máscara").clicked() {
+                    self.doc.apply_mask();
+                }
+                if ui.small_button("Eliminar").on_hover_text("Quita la máscara; la capa vuelve a verse entera").clicked() {
+                    self.doc.remove_mask();
+                }
+            });
+        }
     }
 
     /// The stack, top layer first: visibility, preview, name. A group shows as
@@ -2876,6 +2957,7 @@ impl SharkPaintApp {
         let chosen_group = self.active_group;
         ui.add_space(4.0);
         let mut select = None;
+        let mut select_mask = None;
         let mut toggle = None;
         let mut select_group = None;
         let mut toggle_group = None;
@@ -3016,8 +3098,23 @@ impl SharkPaintApp {
                         painter.rect_stroke(thumb, 1.0, Stroke::new(1.0, border), egui::StrokeKind::Outside);
                     }
 
+                    // A layer with a mask shows it as a chip beside the preview;
+                    // a click on the chip chooses the mask to work on.
+                    let chip = layer.mask.as_ref().map(|mask| {
+                        let chip = Rect::from_min_size(slot.right_top() + Vec2::new(5.0, 0.0), Vec2::new(26.0, slot.height()));
+                        let working = selected && self.mask_editing;
+                        painter.rect_filled(chip, 3.0, Color32::from_gray(if mask.props.visible { 235 } else { 120 }));
+                        icon("mascara", 16.0, Color32::from_gray(40)).paint_at(ui, Rect::from_center_size(chip.center(), Vec2::splat(16.0)));
+                        if !mask.props.visible {
+                            // Struck through while it is switched off.
+                            painter.line_segment([chip.left_bottom(), chip.right_top()], Stroke::new(2.0, Color32::from_rgb(220, 70, 70)));
+                        }
+                        let border = if working { Color32::from_rgb(111, 227, 240) } else { Color32::from_gray(90) };
+                        painter.rect_stroke(chip, 3.0, Stroke::new(if working { 2.0 } else { 1.0 }, border), egui::StrokeKind::Outside);
+                        chip
+                    });
                     let ink = if selected { ui.visuals().selection.stroke.color } else { ink };
-                    let left = slot.right() + 8.0;
+                    let left = chip.map_or(slot.right(), |chip| chip.right()) + 8.0;
                     let detail = (props.blend != BlendMode::Normal || props.opacity < 1.0)
                         .then(|| format!("{} · {:.0} %", props.blend.name(), props.opacity * 100.0));
                     let name_y = if detail.is_some() { row.center().y - 8.0 } else { row.center().y };
@@ -3052,6 +3149,8 @@ impl SharkPaintApp {
                     }
                     if response.clicked() {
                         select = Some(i);
+                        let on_chip = chip.zip(response.interact_pointer_pos()).is_some_and(|(chip, pos)| chip.expand(2.0).contains(pos));
+                        select_mask = Some(on_chip);
                     }
                     // What is being dragged is marked, with its whole group.
                     let carried = match dragging {
@@ -3107,6 +3206,8 @@ impl SharkPaintApp {
         if let Some(i) = select {
             self.doc.set_active_layer(i);
             self.active_group = None;
+            // A click on the row works on the layer; on its chip, on the mask.
+            self.mask_editing = select_mask == Some(true);
         }
         if let Some(id) = select_group {
             self.active_group = Some(id);
@@ -3132,6 +3233,10 @@ impl SharkPaintApp {
                 ui.label(format!("Presión {:.0} %", self.last_pressure * 100.0));
             } else {
                 ui.label("Lápiz: sin detectar (usando ratón)");
+            }
+            if self.doc.is_editing_mask() {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(111, 227, 240), "Máscara: el borrador oculta, el pincel muestra");
             }
             if !self.status.is_empty() {
                 ui.separator();
@@ -3454,6 +3559,9 @@ impl SharkPaintApp {
         }
 
         self.doc.symmetry = self.symmetry_lines();
+        // The mask can only be worked on while the active layer has one.
+        self.mask_editing &= self.doc.active().mask.is_some();
+        self.doc.edit_mask = self.mask_editing;
         self.sync_transform();
         let free = ctx.input(|i| i.modifiers.shift);
         let mut transform_changed = false;
@@ -3543,7 +3651,18 @@ impl SharkPaintApp {
                         self.tool,
                         Tool::Pincel | Tool::Borrador | Tool::Difuminar | Tool::Relleno | Tool::Forma | Tool::Transformar
                     );
-                    if paints && !alt && self.doc.active_is_text() {
+                    if !alt && self.doc.is_editing_mask() && paints && !matches!(self.tool, Tool::Pincel | Tool::Borrador) {
+                        self.status =
+                            "Está elegida la máscara: en ella solo trabajan el borrador (oculta) y el pincel (muestra). Elige la capa para usar otra herramienta."
+                                .into();
+                        continue;
+                    }
+                    if !alt && self.tool == Tool::Transformar && self.doc.active().mask.is_some() {
+                        self.status =
+                            "La capa tiene una máscara: aplícala o elimínala (menú Capa → Máscara) antes de transformarla.".into();
+                        continue;
+                    }
+                    if paints && !alt && self.doc.active_is_text() && !self.doc.is_editing_mask() {
                         self.status =
                             "Es una capa de texto: cámbiala con la herramienta Texto, o conviértela en imagen (menú Capa) para pintar en ella."
                                 .into();
@@ -4230,9 +4349,40 @@ impl SharkPaintApp {
             Command::FlipContents(horizontal) => {
                 if self.doc.active_is_text() {
                     self.status = "Es una capa de texto: conviértela en imagen (menú Capa) para voltearla.".into();
+                } else if self.doc.active().mask.is_some() {
+                    self.status = "La capa tiene una máscara: aplícala o elimínala (menú Capa → Máscara) antes de voltearla.".into();
                 } else {
                     self.doc.flip(horizontal);
                 }
+            }
+            Command::MaskAdd => {
+                let selected = self.doc.selection().is_some();
+                if self.doc.add_mask() {
+                    self.mask_editing = true;
+                    self.active_group = None;
+                    self.status = if selected {
+                        "Máscara creada desde la selección: lo de fuera queda oculto. El borrador oculta más y el pincel vuelve a mostrar.".into()
+                    } else {
+                        "Máscara añadida. Con ella elegida, el borrador oculta y el pincel vuelve a mostrar, sin borrar nada.".into()
+                    };
+                }
+            }
+            Command::MaskRemove => {
+                if self.doc.remove_mask() {
+                    self.status = "Máscara eliminada: la capa se ve entera otra vez.".into();
+                }
+            }
+            Command::MaskApply => {
+                if self.doc.apply_mask() {
+                    self.status = "Máscara aplicada: lo que ocultaba se ha borrado de la capa.".into();
+                }
+            }
+            Command::MaskInvert => {
+                self.doc.invert_mask();
+            }
+            Command::MaskToggle => {
+                let enabled = self.doc.active().mask.as_ref().is_some_and(|mask| mask.props.visible);
+                self.doc.set_mask_enabled(!enabled);
             }
             Command::RasterizeText => {
                 if self.doc.rasterize_text(self.doc.active_layer()) {
