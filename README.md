@@ -75,6 +75,8 @@ Para la 0.1.5:
 - Capas de referencia: elegir qué capa sirve de referencia (por ejemplo, el lineart)
   para que el relleno y la varita mágica se guíen solo por ella. El relleno podrá
   mirar la capa actual, la capa de referencia o todas las capas.
+- Zoom a la vista en el panel de referencias: botones para acercar, alejar y ajustar,
+  porque hoy solo se puede con la rueda del ratón y el lápiz no tiene.
 
 Más adelante:
 
