@@ -158,6 +158,10 @@ cargo test
   generan hojas de muestra de los pinceles, las puntas, los papeles y la mezcla de
   color sin abrir ventana. `examples/abr.rs` lista y dibuja las puntas de un `.abr`.
   `examples/psd.rs` lista las capas de un `.psd` y lo vuelve a escribir.
+  `examples/plantillas.rs` genera las plantillas de dibujo de `plantillas/`.
+- `plantillas/`: proyectos listos para dibujar, con capas nombradas (Color, Sombra,
+  Brillos, Boceto, Línea, Efectos) y un grupo de guías de construcción: una figura de
+  cuatro cabezas en 1080×1920 y una hoja de nueve expresiones.
 - `tools/icono/generar_icono.py`: genera el icono (`assets/icons/`).
 
 ## Licencia y contribuciones
