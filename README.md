@@ -26,6 +26,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
 - Capas y grupos se reordenan arrastrándolos en la lista.
+- Capas de referencia: el relleno y la varita mágica pueden guiarse solo por las capas
+  marcadas como referencia (el lineart), por la capa actual o por todas.
 - Máscaras de capa: ocultan partes de una capa sin borrarlas; el borrador oculta y
   el pincel vuelve a mostrar. Se crean vacías o desde la selección.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
@@ -55,8 +57,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
-- Simetría (`Y`): los trazos se repiten en espejo respecto a un eje vertical, uno
-  horizontal o los dos, colocados donde haga falta.
+- Simetría (menú Simetría): los trazos se repiten en espejo respecto a un eje vertical,
+  uno horizontal o los dos, colocados donde haga falta.
 - Paleta de colores guardados e historial de colores recientes.
 - Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
 - Atajos de herramientas configurables (Editar → Preferencias).
@@ -72,14 +74,7 @@ Para la 0.1.5:
 
 - Autoguardado del proyecto: además de la copia de recuperación, guardar solo cada
   cierto tiempo en el propio archivo, con el intervalo a elegir.
-- Capas de referencia: elegir qué capa sirve de referencia (por ejemplo, el lineart)
-  para que el relleno y la varita mágica se guíen solo por ella. El relleno podrá
-  mirar la capa actual, la capa de referencia o todas las capas.
-- Zoom a la vista en el panel de referencias: botones para acercar, alejar y ajustar,
-  porque hoy solo se puede con la rueda del ratón y el lápiz no tiene.
 - Grupos dentro de grupos: meter un grupo de capas en otro, en varios niveles.
-- Simetría como función de la barra superior en lugar de herramienta de la barra
-  izquierda: activarla, elegir los ejes y colocarlos desde arriba.
 
 Más adelante:
 
@@ -98,7 +93,6 @@ Más adelante:
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
 | `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela); con una capa de texto activa, la reescribe |
-| `Y` | Simetría: clic o arrastre para colocar los ejes |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
+    FillSource, LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
     PROJECT_EXTENSION,
     font_names, read_psd, render_text,
 };
@@ -64,12 +64,11 @@ enum Tool {
     Seleccion,
     Forma,
     Texto,
-    Simetria,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 11] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -80,7 +79,6 @@ impl Tool {
         (Tool::Seleccion, "seleccion", "Selección", "S"),
         (Tool::Forma, "forma", "Formas", "U"),
         (Tool::Texto, "texto", "Texto", "A"),
-        (Tool::Simetria, "simetria", "Simetría", "Y"),
     ];
 
     fn name(self) -> &'static str {
@@ -502,7 +500,8 @@ pub struct SharkPaintApp {
     /// How different a pixel may be and still be filled (0..=1).
     fill_tolerance: f32,
     /// The fill looks at the whole picture rather than only the active layer.
-    fill_all_layers: bool,
+    /// Which layers the fill goes by.
+    fill_source: FillSource,
     /// Canvas position where a layer move began.
     move_origin: Option<Pos2>,
     /// The eyedropper is being dragged.
@@ -554,7 +553,7 @@ pub struct SharkPaintApp {
     /// The magic wand stops at the edges of the area clicked.
     select_contiguous: bool,
     /// The magic wand looks at the whole picture rather than the active layer.
-    select_all_layers: bool,
+    select_source: FillSource,
     /// What Copy or Cut last took: where it was on the canvas and its pixels.
     clip: Option<(IRect, Vec<u8>)>,
     /// The brushes on offer and the tip shapes they use.
@@ -657,6 +656,8 @@ pub struct SharkPaintApp {
     symmetry_center: Option<Pos2>,
     /// The pointer is moving the symmetry lines.
     symmetry_dragging: bool,
+    /// The next press on the canvas places the symmetry lines, whatever tool is in hand.
+    symmetry_placing: bool,
     /// When and at which document revision the recovery file was last written.
     autosave_time: f64,
     autosave_revision: u64,
@@ -693,7 +694,7 @@ impl SharkPaintApp {
                 ..BrushSettings::round(60.0)
             },
             fill_tolerance: 0.15,
-            fill_all_layers: true,
+            fill_source: FillSource::Reference,
             move_origin: None,
             picking: false,
             xform: None,
@@ -721,7 +722,7 @@ impl SharkPaintApp {
             select_mode: SelectMode::Replace,
             select_tolerance: 0.15,
             select_contiguous: true,
-            select_all_layers: true,
+            select_source: FillSource::Reference,
             clip: None,
             library: BrushLibrary { brushes: Vec::new(), tips: Vec::new(), papers: Vec::new() },
             brush_index: Some(1),
@@ -776,6 +777,7 @@ impl SharkPaintApp {
             symmetry_horizontal: false,
             symmetry_center: None,
             symmetry_dragging: false,
+            symmetry_placing: false,
             autosave_time: 0.0,
             autosave_revision: 0,
             autosave_thread: None,
@@ -1471,9 +1473,6 @@ impl SharkPaintApp {
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
                 }
-                if ui.add(egui::Button::new("Simetría").selected(self.symmetry)).clicked() {
-                    commands.push(Command::ToggleSymmetry);
-                }
                 if item(ui, "Referencias", "F6") {
                     commands.push(Command::ToggleReferences);
                 }
@@ -1482,6 +1481,41 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Pantalla completa", "F11") {
                     commands.push(Command::Fullscreen);
+                }
+            });
+            ui.menu_button("Simetría", |ui| {
+                if ui
+                    .add(egui::Button::new("Activa").selected(self.symmetry))
+                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo")
+                    .clicked()
+                {
+                    commands.push(Command::ToggleSymmetry);
+                }
+                ui.separator();
+                let both = (self.symmetry_vertical, self.symmetry_horizontal);
+                for (axes, name, tip) in [
+                    ((true, false), "Eje vertical", "Espejo de izquierda a derecha"),
+                    ((false, true), "Eje horizontal", "Espejo de arriba abajo"),
+                    ((true, true), "Los dos ejes", "Cuatro copias de cada trazo"),
+                ] {
+                    if ui.add(egui::Button::new(name).selected(self.symmetry && both == axes)).on_hover_text(tip).clicked() {
+                        (self.symmetry_vertical, self.symmetry_horizontal) = axes;
+                        self.symmetry = true;
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button("Colocar ejes")
+                    .on_hover_text("Después, haz clic o arrastra sobre el lienzo para ponerlos donde quieras")
+                    .clicked()
+                {
+                    self.symmetry = true;
+                    self.symmetry_placing = true;
+                    self.status = "Simetría: haz clic o arrastra sobre el lienzo para colocar los ejes.".into();
+                }
+                if ui.button("Centrar en el lienzo").clicked() {
+                    self.symmetry_center = None;
+                    self.symmetry_placing = false;
                 }
             });
             ui.menu_button("Ayuda", |ui| {
@@ -1732,6 +1766,26 @@ impl SharkPaintApp {
                     let image = ColorImage::from_rgba_unmultiplied([reference.width, reference.height], &reference.rgba);
                     self.ref_texture = Some((key, ui.ctx().load_texture("referencia", image, TextureOptions::LINEAR)));
                 }
+                // Zoom within reach of a pen, which has no wheel.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let zoom_by = |factor: f32, view: &mut (Vec2, f32)| {
+                        let old = view.1;
+                        view.1 = (old * factor).clamp(0.2, 40.0);
+                        // What is in the middle of the window stays there.
+                        view.0 *= view.1 / old;
+                    };
+                    if ui.button("−").on_hover_text("Alejar").clicked() {
+                        zoom_by(1.0 / 1.25, &mut self.ref_view);
+                    }
+                    if ui.button("+").on_hover_text("Acercar").clicked() {
+                        zoom_by(1.25, &mut self.ref_view);
+                    }
+                    if ui.button("Ajustar").on_hover_text("Ver la imagen entera (también con doble clic)").clicked() {
+                        self.ref_view = (Vec2::ZERO, 1.0);
+                    }
+                    ui.weak(format!("{:.0} %", self.ref_view.1 * 100.0));
+                });
                 let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
                 let area = response.rect;
                 painter.rect_filled(area, 2.0, Color32::from_gray(24));
@@ -2483,8 +2537,8 @@ impl SharkPaintApp {
                     ui.label("Tolerancia");
                     ui.add(egui::Slider::new(&mut self.fill_tolerance, 0.0..=1.0).custom_formatter(percent));
                 });
-                ui.checkbox(&mut self.fill_all_layers, "Tener en cuenta todas las capas")
-                    .on_hover_text("El relleno se detiene en las líneas de cualquier capa visible,\nno solo en las de la capa activa");
+                ui.set_width(248.0);
+                self.fill_source = self.source_picker(ui, self.fill_source);
                 ui.label("Rellena la capa activa con el color elegido.");
                 return;
             }
@@ -2532,52 +2586,6 @@ impl SharkPaintApp {
                 self.text_panel(ui);
                 return;
             }
-            Tool::Simetria => {
-                ui.set_width(248.0);
-                ui.checkbox(&mut self.symmetry, "Simetría activa")
-                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo");
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    let both = (self.symmetry_vertical, self.symmetry_horizontal);
-                    for (axes, name, tip) in [
-                        ((true, false), "Vertical", "Espejo de izquierda a derecha"),
-                        ((false, true), "Horizontal", "Espejo de arriba abajo"),
-                        ((true, true), "Las dos", "Cuatro copias de cada trazo"),
-                    ] {
-                        if ui.selectable_label(both == axes, name).on_hover_text(tip).clicked() {
-                            (self.symmetry_vertical, self.symmetry_horizontal) = axes;
-                            self.symmetry = true;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                let mut center = self.symmetry_point();
-                let before = center;
-                let (width, height) = (self.doc.width as f32, self.doc.height as f32);
-                egui::Grid::new("simetria").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Eje vertical en");
-                    ui.add_enabled(
-                        self.symmetry_vertical,
-                        egui::DragValue::new(&mut center.x).range(0.0..=width).fixed_decimals(0).suffix(" px"),
-                    );
-                    ui.end_row();
-                    ui.label("Eje horizontal en");
-                    ui.add_enabled(
-                        self.symmetry_horizontal,
-                        egui::DragValue::new(&mut center.y).range(0.0..=height).fixed_decimals(0).suffix(" px"),
-                    );
-                    ui.end_row();
-                });
-                if center != before {
-                    self.symmetry_center = Some(center);
-                }
-                if ui.button("Centrar en el lienzo").clicked() {
-                    self.symmetry_center = None;
-                }
-                ui.label("Haz clic o arrastra sobre el lienzo para colocar los ejes donde quieras.");
-                ui.label("Después vuelve al pincel: la simetría sigue activa hasta que la apagues.");
-                return;
-            }
             Tool::Seleccion => {
                 ui.horizontal_wrapped(|ui| {
                     for (shape, name) in SelectShape::ALL {
@@ -2603,7 +2611,7 @@ impl SharkPaintApp {
                     });
                     ui.checkbox(&mut self.select_contiguous, "Solo la zona tocada")
                         .on_hover_text("Desmarcado, toma ese color en todo el lienzo");
-                    ui.checkbox(&mut self.select_all_layers, "Tener en cuenta todas las capas");
+                    self.select_source = self.source_picker(ui, self.select_source);
                     ui.label("Haz clic sobre un color para seleccionar su zona.");
                 } else {
                     ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
@@ -2701,7 +2709,7 @@ impl SharkPaintApp {
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.symmetry, "Simetría")
-                    .on_hover_text("Repite cada trazo en espejo. Los ejes se colocan con la herramienta Simetría.");
+                    .on_hover_text("Repite cada trazo en espejo. Los ejes se eligen y se colocan desde el menú Simetría.");
             }
             egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
                 let b = self.active_brush();
@@ -2912,6 +2920,8 @@ impl SharkPaintApp {
         });
         ui.checkbox(&mut props.alpha_lock, "Bloquear transparencia")
             .on_hover_text("Pinta solo sobre lo que ya está dibujado en la capa");
+        ui.checkbox(&mut props.reference, "Capa de referencia")
+            .on_hover_text("El relleno y la varita mágica pueden guiarse solo por las capas de referencia.\nMarca aquí tu lineart y pinta en otra capa.");
         ui.add_enabled_ui(active > 0, |ui| {
             ui.checkbox(&mut props.clip, "Recortar a la capa inferior")
                 .on_hover_text("La capa solo se ve donde la capa de debajo tiene dibujo.\nÚtil para sombras y luces sin salirse del color base.");
@@ -3140,6 +3150,14 @@ impl SharkPaintApp {
                             Vec2::splat(14.0),
                         );
                         icon("candado", 14.0, ink).paint_at(ui, at);
+                    }
+                    if props.reference {
+                        let taken = props.alpha_lock as u8 + layer.text.is_some() as u8;
+                        let at = Rect::from_center_size(
+                            Pos2::new(row.right() - 14.0 - 18.0 * taken as f32, row.center().y),
+                            Vec2::splat(14.0),
+                        );
+                        icon("referencia", 14.0, ink).paint_at(ui, at);
                     }
                     if layer.text.is_some() {
                         // A text layer wears the text tool's mark.
@@ -3630,6 +3648,13 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
+                    if self.symmetry_placing && !alt {
+                        // Press to put the lines there; keep holding to move them.
+                        self.symmetry = true;
+                        self.symmetry_center = Some(c.round());
+                        self.symmetry_dragging = true;
+                        continue;
+                    }
                     if self.tool == Tool::Texto && !alt {
                         // A new text goes where the press is; one being rewritten
                         // is taken hold of and moved. Keep holding to move either.
@@ -3670,21 +3695,14 @@ impl SharkPaintApp {
                     }
                     if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
                         let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
-                        self.doc.select_similar(
+                        self.doc.select_similar_from(
                             x,
                             y,
                             self.select_tolerance,
-                            self.select_all_layers,
+                            self.select_source,
                             self.select_contiguous,
                             self.select_mode,
                         );
-                        continue;
-                    }
-                    if self.tool == Tool::Simetria && !alt {
-                        // Press to put the lines there; keep holding to move them.
-                        self.symmetry = true;
-                        self.symmetry_center = Some(c.round());
-                        self.symmetry_dragging = true;
                         continue;
                     }
                     if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
@@ -3704,7 +3722,7 @@ impl SharkPaintApp {
                         Tool::Relleno => {
                             let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
                             self.note_color();
-                            self.doc.flood_fill(x, y, self.color, self.fill_tolerance, self.fill_all_layers);
+                            self.doc.flood_fill_from(x, y, self.color, self.fill_tolerance, self.fill_source);
                             continue;
                         }
                         Tool::Mover => {
@@ -3788,6 +3806,10 @@ impl SharkPaintApp {
                 | Event::PointerGone => {
                     if self.text_dragging || self.symmetry_dragging {
                         self.text_dragging = false;
+                        // The lines are placed: back to whatever tool is in hand.
+                        if self.symmetry_dragging {
+                            self.symmetry_placing = false;
+                        }
                         self.symmetry_dragging = false;
                         continue;
                     }
@@ -3916,7 +3938,7 @@ impl SharkPaintApp {
         if let Some(y) = lines.horizontal {
             draw_guide(screen(0.0, y), screen(doc_size.x, y));
         }
-        if self.symmetry && self.tool == Tool::Simetria {
+        if self.symmetry && self.symmetry_placing {
             let center = self.symmetry_point();
             let at = screen(center.x, center.y);
             painter.circle_filled(at, 5.0, Color32::from_rgb(111, 227, 240));
@@ -4030,7 +4052,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto | Tool::Simetria) {
+            } else if alt || self.symmetry_placing || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -4067,6 +4089,22 @@ impl SharkPaintApp {
             vertical: self.symmetry_vertical.then_some(center.x),
             horizontal: self.symmetry_horizontal.then_some(center.y),
         }
+    }
+
+    /// The choice of which layers a fill or the magic wand goes by.
+    fn source_picker(&self, ui: &mut egui::Ui, current: FillSource) -> FillSource {
+        let mut chosen = current;
+        ui.label("Guiarse por:");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut chosen, FillSource::Layer, "Capa actual").on_hover_text("Solo cuenta lo que hay en la capa en la que trabajas");
+            ui.selectable_value(&mut chosen, FillSource::Reference, "Capas de referencia")
+                .on_hover_text("Solo cuentan las capas marcadas como referencia (por ejemplo, el lineart),\nsin importar el color que haya en las demás");
+            ui.selectable_value(&mut chosen, FillSource::All, "Todas las capas").on_hover_text("Cuentan las líneas y el color de cualquier capa visible");
+        });
+        if chosen == FillSource::Reference && !self.doc.has_reference_layers() {
+            ui.weak("Aún no hay ninguna capa de referencia: márcala en el panel de capas. Mientras tanto se guía por todas.");
+        }
+        chosen
     }
 
     /// What every change of canvas size leaves to do: show all of it again.

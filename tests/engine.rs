@@ -1,5 +1,5 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, font_names, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    builtin_papers, builtin_tips, font_names, read_abr, read_psd, render_text, BlendMode, FillSource, BrushPreset, BrushSettings, BrushTip, Document, IRect,
     LayerTransform, Reference, SelectMode, Shape, StrokePoint, Symmetry, TextFont, TextSpec,
 };
 
@@ -2172,4 +2172,64 @@ fn a_mask_can_start_from_the_selection() {
     line(&mut doc, &hard_brush(80.0), [0, 0, 0], true, (90.0, 100.0), (260.0, 100.0));
     assert_ne!(doc.render_rgba8(doc.bounds()), before, "the eraser hid the text");
     assert!(doc.active_is_text());
+}
+
+#[test]
+fn fills_can_go_by_the_reference_layers_alone() {
+    // Bottom: a splash of yellow. Middle: the layer to colour. Top: line art,
+    // a closed box.
+    let mut doc = Document::new(200, 200);
+    doc.draw_shape(Shape::Ellipse, (60.0, 60.0), (120.0, 120.0), [255, 255, 0], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (40.0, 40.0), (160.0, 160.0), [0, 0, 0], 6.0, false, 1.0);
+    let mut props = doc.active().props.clone();
+    props.reference = true;
+    doc.set_layer_props(2, props, false);
+    assert!(doc.has_reference_layers());
+    doc.set_active_layer(1);
+
+    // Going by every layer, the fill stops at the yellow as well as at the lines.
+    assert!(doc.flood_fill_from(150, 150, [255, 0, 0], 0.1, FillSource::All));
+    assert_eq!(doc.layers()[1].pixel(150, 150)[3], 32768);
+    assert_eq!(doc.layers()[1].pixel(90, 90)[3], 0, "the yellow kept the fill out");
+    doc.undo();
+    // Going by the line art alone, it fills the whole box, on the layer in hand.
+    assert!(doc.flood_fill_from(150, 150, [255, 0, 0], 0.1, FillSource::Reference));
+    assert_eq!(doc.layers()[1].pixel(150, 150)[3], 32768);
+    assert_eq!(doc.layers()[1].pixel(90, 90)[3], 32768, "the yellow is ignored");
+    assert_eq!(doc.layers()[1].pixel(20, 20)[3], 0, "outside the lines stays empty");
+    assert_eq!(doc.layers()[2].pixel(100, 100)[3], 0, "the line art itself is untouched");
+    assert_eq!(pixel(&doc, 40, 100), [0, 0, 0, 255], "and still on top");
+    // Filling again recolours the same area: what is already there does not count.
+    assert!(doc.flood_fill_from(100, 100, [0, 0, 255], 0.1, FillSource::Reference));
+    assert_eq!(pixel(&doc, 150, 150), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 90, 90), [0, 0, 255, 255]);
+    // Going by the layer in hand, the whole of the earlier fill is one area.
+    doc.undo();
+    assert!(doc.flood_fill_from(100, 100, [0, 255, 0], 0.1, FillSource::Layer));
+    assert_eq!(pixel(&doc, 150, 150), [0, 255, 0, 255]);
+
+    // The magic wand goes by them too.
+    doc.select_similar_from(100, 100, 0.1, FillSource::Reference, true, SelectMode::Replace);
+    let selection = doc.selection().unwrap();
+    assert_eq!((selection.coverage(90, 90), selection.coverage(150, 150), selection.coverage(20, 20)), (255, 255, 0));
+    doc.deselect();
+
+    // The mark is saved with the project.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    let marks: Vec<bool> = loaded.layers().iter().map(|l| l.props.reference).collect();
+    assert_eq!(marks, [false, false, true]);
+
+    // With no layer marked, asking for the reference goes by everything.
+    let mut props = doc.layers()[2].props.clone();
+    props.reference = false;
+    doc.set_layer_props(2, props, false);
+    assert!(!doc.has_reference_layers());
+    doc.set_active_layer(1);
+    doc.clear_active_layer();
+    assert!(doc.flood_fill_from(150, 150, [255, 0, 0], 0.1, FillSource::Reference));
+    assert_eq!(doc.layers()[1].pixel(90, 90)[3], 0, "the yellow counts again");
 }

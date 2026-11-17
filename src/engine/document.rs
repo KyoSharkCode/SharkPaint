@@ -1006,6 +1006,20 @@ impl Document {
     /// Flattens `rect` (clipped to the canvas) over the paper into opaque 8-bit
     /// RGBA, row-major, `rect.width() * rect.height() * 4` bytes.
     pub fn render_rgba8(&self, rect: IRect) -> Vec<u8> {
+        self.render_some(rect, false)
+    }
+
+    /// As [`Document::render_rgba8`], but showing only the reference layers.
+    pub fn render_reference_rgba8(&self, rect: IRect) -> Vec<u8> {
+        self.render_some(rect, true)
+    }
+
+    /// Whether any layer is marked as a reference for fills.
+    pub fn has_reference_layers(&self) -> bool {
+        self.layers.iter().any(|layer| layer.props.reference)
+    }
+
+    fn render_some(&self, rect: IRect, only_reference: bool) -> Vec<u8> {
         let rect = rect.intersect(&self.bounds());
         let (w, h) = (rect.width(), rect.height());
         let mut out = vec![255u8; w * h * 4];
@@ -1017,7 +1031,14 @@ impl Document {
         let paper8 = [to8(paper[0]), to8(paper[1]), to8(paper[2])];
 
         // Whether each layer shows and how strongly, groups counted in.
-        let display: Vec<(bool, u32)> = self.layers.iter().map(|layer| self.layer_display(layer)).collect();
+        let display: Vec<(bool, u32)> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let (shown, opacity) = self.layer_display(layer);
+                (shown && (!only_reference || layer.props.reference), opacity)
+            })
+            .collect();
         // The group each layer is gathered into, if its group blends as one.
         let isolated: Vec<Option<Isolated>> = self
             .layers

@@ -29,4 +29,4 @@ pub use selection::{SelectMode, Selection};
 pub use shapes::Shape;
 pub use stroke::{StrokePoint, Symmetry};
 pub use text::{font_names, render_text, TextFont, BUILTIN_FONT};
-pub use tools::{brush_preview, LayerTransform};
+pub use tools::{brush_preview, FillSource, LayerTransform};
