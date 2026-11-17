@@ -78,6 +78,8 @@ Para la 0.1.5:
 - Zoom a la vista en el panel de referencias: botones para acercar, alejar y ajustar,
   porque hoy solo se puede con la rueda del ratón y el lápiz no tiene.
 - Grupos dentro de grupos: meter un grupo de capas en otro, en varios niveles.
+- Simetría como función de la barra superior en lugar de herramienta de la barra
+  izquierda: activarla, elegir los ejes y colocarlos desde arriba.
 
 Más adelante:
 
