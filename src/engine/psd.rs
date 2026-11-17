@@ -7,6 +7,9 @@
 //! counterpart here and are left out when reading; text and shapes come in as
 //! the pixels Photoshop stored for them.
 //!
+//! A layer's mask is not written as a mask: the layer goes out as it shows,
+//! with the hidden parts left out.
+//!
 //! Only 8- and 16-bit RGB and greyscale documents are read. Files are always
 //! written as 8-bit RGB.
 //!
@@ -575,7 +578,7 @@ fn layer_entry(layer: &Layer) -> Entry {
     let mut planes: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::with_capacity(size));
     for y in rect.y0..rect.y1 {
         for x in rect.x0..rect.x1 {
-            let px = layer.pixel(x, y);
+            let px = layer.shown_pixel(x, y);
             let a = px[3] as u32;
             planes[0].push(((a * 255 + ONE / 2) >> 15) as u8);
             for c in 0..3 {

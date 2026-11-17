@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use super::brush::BrushSettings;
-use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, Tile, ONE, TILE};
+use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, TextSpec, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
-use super::stroke::{ActiveStroke, StrokePoint};
+use super::stroke::{ActiveStroke, StrokePoint, Symmetry};
 use super::tools::{MoveSession, SmudgeStroke, TransformSession};
 
 const MAX_UNDO_STEPS: usize = 200;
@@ -14,8 +14,9 @@ const EMPTY: IRect = IRect { x0: 0, y0: 0, x1: 0, y1: 0 };
 /// One undoable step. Applying an entry swaps its contents with the document's,
 /// which turns it into the entry that reverses itself.
 enum HistoryEntry {
-    /// Pixels of one layer: tile indices and the contents to swap them with.
-    Tiles { layer: usize, tiles: Vec<(usize, Option<Arc<Tile>>)> },
+    /// Pixels of one layer, or of its mask: tile indices and the contents to
+    /// swap them with.
+    Tiles { layer: usize, mask: bool, tiles: Vec<(usize, Option<Arc<Tile>>)> },
     /// The whole layer stack (add, delete, reorder, merge). Tiles are shared,
     /// so the snapshot only costs the per-layer tile tables.
     Layers { layers: Vec<Layer>, groups: Vec<LayerGroup>, active: usize },
@@ -25,6 +26,32 @@ enum HistoryEntry {
     Props { layer: usize, props: LayerProps },
     /// The selection as it was.
     Selection(Option<Arc<Selection>>),
+    /// The whole picture, before the canvas changed size or was turned over.
+    Canvas {
+        width: usize,
+        height: usize,
+        layers: Vec<Layer>,
+        groups: Vec<LayerGroup>,
+        active: usize,
+        selection: Option<Arc<Selection>>,
+    },
+}
+
+/// A layer's tile with the tile of its mask, if the mask hides anything there.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    tile: &'a Tile,
+    mask: Option<&'a Tile>,
+}
+
+impl Source<'_> {
+    /// `opacity` (0..=32768) with what the mask hides at pixel `i` taken off.
+    fn shown(&self, opacity: u32, i: usize) -> u32 {
+        match self.mask {
+            Some(mask) => (opacity * (ONE - (mask.0[i][3] as u32).min(ONE))) >> 15,
+            None => opacity,
+        }
+    }
 }
 
 /// A group whose layers are combined apart and blended in as one.
@@ -68,11 +95,18 @@ pub struct Document {
     /// Layer groups, in no particular order; layers refer to them by id.
     pub(super) groups: Vec<LayerGroup>,
     pub(super) active_layer: usize,
+    /// The text layer being rewritten, by id: its changes so far are one undo
+    /// step, until anything else is done.
+    pub(super) text_session: Option<u64>,
+    /// Brush and eraser strokes go to the active layer's mask, if it has one,
+    /// rather than to its pixels: the eraser hides and the brush shows again.
+    pub edit_mask: bool,
+    /// The stroke in progress is on a mask.
+    stroke_on_mask: bool,
     /// Opaque paper colour shown under the layers (sRGB).
     pub paper: [u8; 3],
-    /// Brush and eraser strokes are mirrored across the canvas's vertical
-    /// centre line.
-    pub symmetry: bool,
+    /// Lines across which brush and eraser strokes are mirrored.
+    pub symmetry: Symmetry,
     stroke: Option<ActiveStroke>,
     pub(super) smudge: Option<SmudgeStroke>,
     pub(super) moving: Option<MoveSession>,
@@ -114,8 +148,11 @@ impl Document {
             layers,
             groups: Vec::new(),
             active_layer: active,
+            text_session: None,
+            edit_mask: false,
+            stroke_on_mask: false,
             paper: [255, 255, 255],
-            symmetry: false,
+            symmetry: Symmetry::OFF,
             stroke: None,
             smudge: None,
             moving: None,
@@ -237,6 +274,194 @@ impl Document {
         true
     }
 
+    // --- Layer masks -----------------------------------------------------------
+
+    /// Brush strokes are going to the active layer's mask right now.
+    pub fn is_editing_mask(&self) -> bool {
+        self.edit_mask && self.active().mask.is_some()
+    }
+
+    /// Gives the active layer a mask. With a selection, only what is selected
+    /// stays on show; without one, everything does, ready to be hidden with
+    /// the eraser. Returns `false` if the layer already has a mask.
+    pub fn add_mask(&mut self) -> bool {
+        if self.active().mask.is_some() {
+            return false;
+        }
+        self.checkpoint_layers();
+        let version = self.stamp();
+        let selection = self.selection.clone();
+        let layer = &mut self.layers[self.active_layer];
+        let mut mask = Layer::new(layer.width, layer.height, "máscara");
+        if let Some(selection) = selection {
+            // One tile stands for every stretch that is hidden outright.
+            let hidden = Arc::new(Tile(vec![[0, 0, 0, ONE as u16]; TILE * TILE].into_boxed_slice().try_into().unwrap()));
+            for ty in 0..mask.tiles_y {
+                for tx in 0..mask.tiles_x {
+                    let (ox, oy) = ((tx * TILE) as i32, (ty * TILE) as i32);
+                    let area = IRect::new(ox, oy, ox + TILE as i32, oy + TILE as i32);
+                    let index = mask.tile_index(tx, ty);
+                    if area.intersect(&selection.bounds).is_empty() {
+                        mask.tiles[index] = Some(hidden.clone());
+                        continue;
+                    }
+                    let mut tile = Tile::empty();
+                    let mut any = false;
+                    for y in 0..TILE as i32 {
+                        for x in 0..TILE as i32 {
+                            let shown = selection.coverage(ox + x, oy + y) as u32;
+                            let amount = (255 - shown) * ONE / 255;
+                            tile.0[y as usize * TILE + x as usize][3] = amount as u16;
+                            any |= amount != 0;
+                        }
+                    }
+                    if any {
+                        mask.tiles[index] = Some(Arc::new(tile));
+                    }
+                }
+            }
+        }
+        layer.mask = Some(Box::new(mask));
+        layer.version = version;
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Takes the active layer's mask away; everything it hid shows again.
+    pub fn remove_mask(&mut self) -> bool {
+        if self.active().mask.is_none() {
+            return false;
+        }
+        self.checkpoint_layers();
+        let version = self.stamp();
+        let layer = &mut self.layers[self.active_layer];
+        layer.mask = None;
+        layer.version = version;
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Works the active layer's mask into its pixels: what was hidden is
+    /// erased for good, and the mask goes.
+    pub fn apply_mask(&mut self) -> bool {
+        if self.active().mask.is_none() {
+            return false;
+        }
+        self.checkpoint_layers();
+        let version = self.stamp();
+        let layer = &mut self.layers[self.active_layer];
+        layer.tiles = layer.shown_tiles();
+        layer.mask = None;
+        layer.version = version;
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Swaps what the active layer's mask hides and shows.
+    pub fn invert_mask(&mut self) -> bool {
+        if self.active().mask.is_none() {
+            return false;
+        }
+        self.checkpoint_layers();
+        let version = self.stamp();
+        let layer = &mut self.layers[self.active_layer];
+        layer.version = version;
+        let Some(mask) = layer.mask.as_deref_mut() else { return false };
+        let hidden = Arc::new(Tile(vec![[0, 0, 0, ONE as u16]; TILE * TILE].into_boxed_slice().try_into().unwrap()));
+        for tile in mask.tiles.iter_mut() {
+            *tile = match tile.take() {
+                None => Some(hidden.clone()),
+                Some(old) => {
+                    let mut turned = Tile::empty();
+                    let mut any = false;
+                    for (new, px) in turned.0.iter_mut().zip(old.0.iter()) {
+                        new[3] = (ONE - (px[3] as u32).min(ONE)) as u16;
+                        any |= new[3] != 0;
+                    }
+                    any.then(|| Arc::new(turned))
+                }
+            };
+        }
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Puts the active layer's mask in or out of effect without losing it.
+    pub fn set_mask_enabled(&mut self, enabled: bool) -> bool {
+        if self.active().mask.as_ref().is_none_or(|mask| mask.props.visible == enabled) {
+            return false;
+        }
+        self.checkpoint_layers();
+        let version = self.stamp();
+        let layer = &mut self.layers[self.active_layer];
+        layer.version = version;
+        if let Some(mask) = layer.mask.as_deref_mut() {
+            mask.props.visible = enabled;
+        }
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    // --- Text layers -----------------------------------------------------------
+
+    /// The active layer is text that can still be rewritten, so it cannot be
+    /// painted on.
+    pub fn active_is_text(&self) -> bool {
+        self.active().text.is_some()
+    }
+
+    /// Adds a text layer above the active one and selects it. `rgba` is the
+    /// text as drawn: 8-bit, not premultiplied, `width * height * 4` bytes,
+    /// with its top-left corner at the spec's position.
+    pub fn add_text_layer(&mut self, spec: TextSpec, width: usize, height: usize, rgba: &[u8]) {
+        self.add_image_layer(&spec.layer_name(), width, height, rgba, spec.x, spec.y);
+        self.layers[self.active_layer].text = Some(spec);
+    }
+
+    /// Rewrites a text layer: new words, typeface, size, colour or place, with
+    /// the text drawn afresh in `rgba`. Changes made one after another to the
+    /// same layer are a single undo step. Returns whether `index` is a text layer.
+    pub fn update_text_layer(&mut self, index: usize, spec: TextSpec, width: usize, height: usize, rgba: &[u8]) -> bool {
+        let Some(old) = self.layers.get(index).and_then(|layer| layer.text.clone()) else { return false };
+        assert_eq!(rgba.len(), width * height * 4, "image buffer does not match its size");
+        let id = self.layers[index].id;
+        if self.text_session == Some(id) {
+            self.revision += 1;
+        } else {
+            self.checkpoint_layers();
+            self.text_session = Some(id);
+        }
+        let version = self.stamp();
+        let layer = &mut self.layers[index];
+        // A name that was taken from the text follows it.
+        if layer.props.name == old.layer_name() {
+            layer.props.name = spec.layer_name();
+        }
+        layer.tiles.iter_mut().for_each(|tile| *tile = None);
+        super::tools::put_image(layer, width, height, rgba, spec.x, spec.y);
+        layer.text = Some(spec);
+        layer.version = version;
+        self.mark_dirty(self.bounds());
+        true
+    }
+
+    /// Closes the run of changes to a text layer, so the next one starts a
+    /// new undo step.
+    pub fn end_text_edit(&mut self) {
+        self.text_session = None;
+    }
+
+    /// Turns a text layer into an ordinary one: it keeps its pixels and can be
+    /// painted on, but not rewritten. Returns whether `index` was a text layer.
+    pub fn rasterize_text(&mut self, index: usize) -> bool {
+        if self.layers.get(index).is_none_or(|layer| layer.text.is_none()) {
+            return false;
+        }
+        self.checkpoint_layers();
+        self.layers[index].text = None;
+        true
+    }
+
     // --- Layer groups ---------------------------------------------------------
 
     pub fn groups(&self) -> &[LayerGroup] {
@@ -334,6 +559,66 @@ impl Document {
         true
     }
 
+    /// Moves a layer to a gap in the stack and into a group (zero for none), as
+    /// when it is dragged in the layer list. Gap `g` is the place just under
+    /// the layer now at index `g`; gap `len` is the top. Nothing happens, and
+    /// `false` comes back, if the layer would not move or the move would
+    /// leave a group in two pieces.
+    pub fn place_layer(&mut self, from: usize, gap: usize, group: u64) -> bool {
+        if from >= self.layers.len() || gap > self.layers.len() || (group != 0 && self.group(group).is_none()) {
+            return false;
+        }
+        let to = if gap > from { gap - 1 } else { gap };
+        if to == from && self.layers[from].group == group {
+            return false;
+        }
+        let mut layers = self.layers.clone();
+        let mut layer = layers.remove(from);
+        layer.group = group;
+        layers.insert(to, layer);
+        self.restack(layers)
+    }
+
+    /// Moves a whole group to a gap in the stack (see [`Document::place_layer`]).
+    /// The gap may not be inside another group.
+    pub fn place_group(&mut self, id: u64, gap: usize) -> bool {
+        let Some(first) = self.layers.iter().position(|l| l.group == id) else { return false };
+        let last = self.layers.iter().rposition(|l| l.group == id).unwrap_or(first);
+        if gap > self.layers.len() || (first..=last + 1).contains(&gap) {
+            return false; // it is already there
+        }
+        let mut layers = self.layers.clone();
+        let block: Vec<Layer> = layers.drain(first..=last).collect();
+        let at = if gap > last { gap - block.len() } else { gap };
+        layers.splice(at..at, block);
+        self.restack(layers)
+    }
+
+    /// Takes a new order for the layers as one undoable step, unless it would
+    /// leave some group's layers apart from each other.
+    fn restack(&mut self, layers: Vec<Layer>) -> bool {
+        let mut closed: Vec<u64> = Vec::new();
+        let mut previous = 0;
+        for layer in &layers {
+            if layer.group != previous {
+                if closed.contains(&layer.group) {
+                    return false;
+                }
+                if previous != 0 {
+                    closed.push(previous);
+                }
+                previous = layer.group;
+            }
+        }
+        self.checkpoint_layers();
+        let active = self.layers[self.active_layer].id;
+        self.layers = layers;
+        self.active_layer = self.layers.iter().position(|l| l.id == active).unwrap_or(0);
+        self.prune_groups();
+        self.mark_dirty(self.bounds());
+        true
+    }
+
     /// Replaces a group's name, visibility and opacity as one undoable step.
     /// `coalesce` folds the change into the previous step when that step was
     /// also a group edit, so dragging a slider is undone in one go.
@@ -379,8 +664,16 @@ impl Document {
         let version = self.stamp();
         let below = &mut self.layers[self.active_layer];
         below.version = version;
+        // With something merged into it, text is text no longer.
+        below.text = None;
+        // Masks are worked into the pixels first: the merged layer has none.
+        if below.mask.is_some() {
+            below.tiles = below.shown_tiles();
+            below.mask = None;
+        }
         let (opacity, mode, clipped) = (top.props.opacity15(), top.props.blend, top.props.clip);
-        for (idx, src) in top.tiles.iter().enumerate() {
+        let top_tiles = top.shown_tiles();
+        for (idx, src) in top_tiles.iter().enumerate() {
             let Some(src) = src else { continue };
             if clipped && below.tiles[idx].is_none() {
                 continue; // clipped to nothing here
@@ -420,6 +713,9 @@ impl Document {
     /// Empties the active layer as an undoable step.
     pub fn clear_active_layer(&mut self) {
         self.end_stroke();
+        if self.active_is_text() {
+            return;
+        }
         let li = self.active_layer;
         let tiles: Vec<_> = self.layers[li]
             .tiles
@@ -429,7 +725,7 @@ impl Document {
             .collect();
         if !tiles.is_empty() {
             self.layers[li].version = self.stamp();
-            self.push_undo(HistoryEntry::Tiles { layer: li, tiles });
+            self.push_undo(HistoryEntry::Tiles { layer: li, mask: false, tiles });
             self.mark_dirty(self.bounds());
         }
     }
@@ -578,11 +874,21 @@ impl Document {
             self.end_stroke();
         }
         let li = self.active_layer;
+        let on_mask = self.is_editing_mask();
+        if self.active_is_text() && !on_mask {
+            return;
+        }
         let selection = self.selection.clone();
-        let mirror_x = self.symmetry.then_some(self.width as f32 * 0.5);
-        let (stroke, rect) =
-            ActiveStroke::begin(li, &mut self.layers[li], brush, color, erase, selection, mirror_x, p);
+        let symmetry = self.symmetry;
+        let layer = &mut self.layers[li];
+        let (stroke, rect) = match layer.mask.as_deref_mut().filter(|_| on_mask) {
+            // On the mask, erasing hides and painting brings back: the mask
+            // holds what is hidden, so the two swap, and colour plays no part.
+            Some(mask) => ActiveStroke::begin(li, mask, brush, [0, 0, 0], !erase, selection, symmetry, p),
+            None => ActiveStroke::begin(li, layer, brush, color, erase, selection, symmetry, p),
+        };
         self.stroke = Some(stroke);
+        self.stroke_on_mask = on_mask;
         self.mark_dirty(rect);
     }
 
@@ -591,7 +897,12 @@ impl Document {
             self.smudge_to(p);
         }
         if let Some(stroke) = &mut self.stroke {
-            let rect = stroke.line_to(&mut self.layers[stroke.layer], p);
+            let layer = &mut self.layers[stroke.layer];
+            let target = match layer.mask.as_deref_mut().filter(|_| self.stroke_on_mask) {
+                Some(mask) => mask,
+                None => layer,
+            };
+            let rect = stroke.line_to(target, p);
             self.mark_dirty(rect);
         }
     }
@@ -603,19 +914,36 @@ impl Document {
         self.end_layer_move();
         self.end_transform();
         if let Some(mut stroke) = self.stroke.take() {
-            let rect = stroke.finish(&mut self.layers[stroke.layer]);
+            let on_mask = self.stroke_on_mask && self.layers[stroke.layer].mask.is_some();
+            let index = stroke.layer;
+            let rect = stroke.finish(self.stroke_target(index, on_mask));
             self.mark_dirty(rect);
             let layer = stroke.layer;
             let tiles = stroke.into_saved();
-            self.commit_tiles(layer, tiles);
+            self.commit_tiles_of(layer, on_mask, tiles);
         }
     }
 
     /// Records changed tiles of a layer as one undoable step.
     pub(super) fn commit_tiles(&mut self, layer: usize, tiles: Vec<(usize, Option<Arc<Tile>>)>) {
+        self.commit_tiles_of(layer, false, tiles);
+    }
+
+    /// Records changed tiles of a layer, or of its mask, as one undoable step.
+    fn commit_tiles_of(&mut self, layer: usize, mask: bool, tiles: Vec<(usize, Option<Arc<Tile>>)>) {
         if !tiles.is_empty() {
             self.layers[layer].version = self.stamp();
-            self.push_undo(HistoryEntry::Tiles { layer, tiles });
+            self.push_undo(HistoryEntry::Tiles { layer, mask, tiles });
+        }
+    }
+
+    /// What a stroke paints on: a layer, or that layer's mask.
+    fn stroke_target(&mut self, layer: usize, mask: bool) -> &mut Layer {
+        let layer = &mut self.layers[layer];
+        if mask && layer.mask.is_some() {
+            layer.mask.as_deref_mut().expect("just checked")
+        } else {
+            layer
         }
     }
 
@@ -625,8 +953,8 @@ impl Document {
         self.cancel_layer_move();
         self.cancel_transform();
         if let Some(stroke) = self.stroke.take() {
-            let layer = stroke.layer;
-            let rect = stroke.revert(&mut self.layers[layer]);
+            let index = stroke.layer;
+            let rect = stroke.revert(self.stroke_target(index, self.stroke_on_mask));
             self.mark_dirty(rect);
         }
     }
@@ -643,6 +971,7 @@ impl Document {
 
     pub fn undo(&mut self) -> bool {
         self.end_stroke();
+        self.text_session = None;
         match self.undo.pop() {
             Some(mut entry) => {
                 self.swap_entry(&mut entry);
@@ -655,6 +984,7 @@ impl Document {
 
     pub fn redo(&mut self) -> bool {
         self.end_stroke();
+        self.text_session = None;
         match self.redo.pop() {
             Some(mut entry) => {
                 self.swap_entry(&mut entry);
@@ -711,13 +1041,14 @@ impl Document {
                 let y1 = rect.y1.min(oy + TILE as i32);
                 // Each drawable layer's tile, with the tile and opacity of the
                 // layer it is clipped to, if any.
-                let mut tiles: Vec<(&Tile, &LayerProps, u32, Option<(&Tile, u32)>, Option<Isolated>)> = Vec::new();
-                let mut clip_base: Option<(&Tile, u32)> = None;
+                let mut tiles: Vec<(Source, &LayerProps, u32, Option<(Source, u32)>, Option<Isolated>)> = Vec::new();
+                let mut clip_base: Option<(Source, u32)> = None;
                 for (index, layer) in self.layers.iter().enumerate() {
                     let props = &layer.props;
                     let (shown, opacity) = display[index];
                     let isolated = isolated[index];
-                    let tile = layer.tiles[layer.tile_index(tx, ty)].as_deref();
+                    let place = layer.tile_index(tx, ty);
+                    let tile = layer.tiles[place].as_deref().map(|tile| Source { tile, mask: layer.mask_tile(place) });
                     if props.clip && index > 0 {
                         if let (true, Some(tile), Some(base)) = (shown, tile, clip_base) {
                             tiles.push((tile, props, opacity, Some(base), isolated));
@@ -750,9 +1081,10 @@ impl Document {
                             }
                         };
                         for (tile, props, opacity, base, isolated) in &tiles {
-                            let mut opacity = *opacity;
+                            let mut opacity = tile.shown(*opacity, i);
                             if let Some((base, base_opacity)) = base {
-                                opacity = (opacity * ((base.0[i][3] as u32 * base_opacity) >> 15)) >> 15;
+                                let under = base.shown(*base_opacity, i);
+                                opacity = (opacity * ((base.tile.0[i][3] as u32 * under) >> 15)) >> 15;
                             }
                             if apart.as_ref().map(|(group, _)| group.id) != isolated.map(|group| group.id) {
                                 flush(&mut c, &mut apart);
@@ -760,9 +1092,9 @@ impl Document {
                             match isolated {
                                 Some(group) => {
                                     let (_, gathered) = apart.get_or_insert((*group, [0; 4]));
-                                    blend_over(gathered, tile.0[i], opacity, props.blend);
+                                    blend_over(gathered, tile.tile.0[i], opacity, props.blend);
                                 }
-                                None => blend_over(&mut c, tile.0[i], opacity, props.blend),
+                                None => blend_over(&mut c, tile.tile.0[i], opacity, props.blend),
                             }
                         }
                         flush(&mut c, &mut apart);
@@ -778,8 +1110,29 @@ impl Document {
 
     // --- Internals ------------------------------------------------------------
 
+    /// Replaces the canvas and every layer at once, as one undoable step. The
+    /// selection, which is tied to the old canvas, is dropped.
+    pub(super) fn replace_canvas(&mut self, width: usize, height: usize, layers: Vec<Layer>) {
+        let previous = HistoryEntry::Canvas {
+            width: std::mem::replace(&mut self.width, width),
+            height: std::mem::replace(&mut self.height, height),
+            layers: std::mem::replace(&mut self.layers, layers),
+            groups: self.groups.clone(),
+            active: self.active_layer,
+            selection: self.selection.take(),
+        };
+        self.selection_stamp += 1;
+        self.push_undo(previous);
+        self.dirty = self.bounds();
+    }
+
+    /// A fresh stamp for a layer rebuilt elsewhere in the engine.
+    pub(super) fn next_version(&mut self) -> u64 {
+        self.stamp()
+    }
+
     /// Records the layer stack as it is now, before a structural change.
-    fn checkpoint_layers(&mut self) {
+    pub(super) fn checkpoint_layers(&mut self) {
         self.end_stroke();
         self.push_undo(HistoryEntry::Layers {
             layers: self.layers.clone(),
@@ -789,6 +1142,7 @@ impl Document {
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
+        self.text_session = None;
         self.revision += 1;
         self.undo.push(entry);
         self.redo.clear();
@@ -806,11 +1160,17 @@ impl Document {
         self.revision += 1;
         match entry {
             HistoryEntry::Selection(_) => {}
-            HistoryEntry::Tiles { layer, tiles } => {
+            HistoryEntry::Tiles { layer, mask, tiles } => {
                 self.next_stamp += 1;
                 let layer = &mut self.layers[*layer];
                 layer.version = self.next_stamp;
                 let tiles_x = layer.tiles_x;
+                // The step was on the mask: that is whose tiles go back.
+                let layer = match (*mask, layer.mask.as_deref_mut()) {
+                    (true, Some(mask)) => mask,
+                    (true, None) => return,
+                    (false, _) => layer,
+                };
                 let mut rect = EMPTY;
                 for (idx, saved) in tiles.iter_mut() {
                     std::mem::swap(&mut layer.tiles[*idx], saved);
@@ -823,6 +1183,16 @@ impl Document {
             HistoryEntry::Groups(groups) => {
                 std::mem::swap(&mut self.groups, groups);
                 self.mark_dirty(self.bounds());
+            }
+            HistoryEntry::Canvas { width, height, layers, groups, active, selection } => {
+                std::mem::swap(&mut self.width, width);
+                std::mem::swap(&mut self.height, height);
+                std::mem::swap(&mut self.layers, layers);
+                std::mem::swap(&mut self.groups, groups);
+                std::mem::swap(&mut self.active_layer, active);
+                std::mem::swap(&mut self.selection, selection);
+                self.selection_stamp += 1;
+                self.dirty = self.bounds();
             }
             HistoryEntry::Layers { layers, groups, active } => {
                 std::mem::swap(&mut self.groups, groups);

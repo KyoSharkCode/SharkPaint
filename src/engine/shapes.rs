@@ -69,6 +69,9 @@ impl Document {
         opacity: f32,
     ) -> bool {
         self.end_stroke();
+        if self.active_is_text() {
+            return false;
+        }
         let li = self.active_layer;
         let filled = filled && shape != Shape::Line;
         let width = width.max(1.0);

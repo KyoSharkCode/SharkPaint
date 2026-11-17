@@ -1,6 +1,6 @@
 use sharkpaint::engine::{
-    builtin_papers, builtin_tips, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape, StrokePoint, TextFont,
+    builtin_papers, builtin_tips, font_names, read_abr, read_psd, render_text, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
+    LayerTransform, Reference, SelectMode, Shape, StrokePoint, Symmetry, TextFont, TextSpec,
 };
 
 fn hard_brush(size: f32) -> BrushSettings {
@@ -832,7 +832,7 @@ fn references_are_saved_with_the_project_but_not_drawn() {
 #[test]
 fn symmetry_mirrors_strokes_across_the_centre() {
     let mut doc = Document::new(200, 100);
-    doc.symmetry = true;
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: None };
     line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (20.0, 30.0), (60.0, 70.0));
     for (x, y) in [(20, 30), (40, 50), (60, 70)] {
         assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255]);
@@ -1729,7 +1729,10 @@ fn text_is_drawn_in_the_bundled_font() {
     // Nothing to draw.
     assert!(render_text(&font, "", 40.0, [0, 0, 0]).is_none());
     assert!(render_text(&font, "   \n ", 40.0, [0, 0, 0]).is_none());
-    assert!(TextFont::from_bytes("x", b"not a font".to_vec()).is_none());
+    assert!(TextFont::from_bytes("x", b"not a font".to_vec(), 0).is_none());
+    // The bundled font says what it is called.
+    assert_eq!(font_names(TextFont::builtin_data()), ["Ubuntu Light"]);
+    assert!(font_names(b"not a font").is_empty());
     // It goes onto the canvas as a layer of its own, in one undo step.
     let mut doc = Document::new(300, 120);
     doc.add_image_layer("Hola", width, height, &rgba, 20, 30);
@@ -1737,4 +1740,436 @@ fn text_is_drawn_in_the_bundled_font() {
     assert_ne!(doc.render_rgba8(doc.bounds()), Document::new(300, 120).render_rgba8(IRect::new(0, 0, 300, 120)));
     doc.undo();
     assert_eq!(doc.layers().len(), 1);
+}
+
+#[test]
+fn the_canvas_can_be_resized_cropped_scaled_and_flipped() {
+    // A red block at the left of a 200 x 100 canvas, on two layers with a group.
+    let mut doc = Document::new(200, 100);
+    doc.draw_shape(Shape::Rectangle, (10.0, 20.0), (60.0, 70.0), [255, 0, 0], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (150.0, 80.0), (190.0, 95.0), [0, 0, 255], 1.0, true, 1.0);
+    let id = doc.group_active_layer().unwrap();
+    let original = doc.render_rgba8(doc.bounds());
+
+    // More room on every side: the picture moves with the offset.
+    assert!(doc.resize_canvas(300, 160, 50, 30));
+    assert_eq!((doc.width, doc.height), (300, 160));
+    assert_eq!(pixel(&doc, 60, 50), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 59, 50), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 239, 124), [0, 0, 255, 255]);
+    assert_eq!(doc.layers()[1].group, id, "groups survive");
+    assert!(!doc.resize_canvas(300, 160, 0, 0), "nothing to do");
+    doc.undo();
+    assert_eq!((doc.width, doc.height), (200, 100));
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // Cropping to a selection keeps what is inside its box.
+    doc.select_polygon(&rect_points(10.0, 20.0, 110.0, 70.0));
+    assert!(doc.crop_to_selection());
+    assert_eq!((doc.width, doc.height), (100, 50));
+    assert!(doc.selection().is_none());
+    assert_eq!(pixel(&doc, 0, 0), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 49, 49), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 50, 25), [255, 255, 255, 255]);
+    doc.undo();
+    assert_eq!(doc.selection().unwrap().bounds, IRect::new(10, 20, 110, 70), "undo brings the selection back");
+    doc.deselect();
+    assert!(!doc.crop_to_selection());
+
+    // Half size: everything is half as big and in the same place.
+    assert!(doc.scale_image(100, 50));
+    assert_eq!((doc.width, doc.height), (100, 50));
+    assert_eq!(pixel(&doc, 15, 20), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 3, 20), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 85, 43), [0, 0, 255, 255]);
+    // Back up to full size: solid areas stay solid, edges may soften.
+    assert!(doc.scale_image(200, 100));
+    assert_eq!(pixel(&doc, 35, 45), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 170, 88), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 100, 10), [255, 255, 255, 255]);
+    doc.undo();
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // Turned over left to right, then top to bottom; twice is as before.
+    doc.flip_canvas(true);
+    assert_eq!(pixel(&doc, 189, 20), [255, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 10, 80), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 10, 20), [255, 255, 255, 255]);
+    doc.flip_canvas(false);
+    assert_eq!(pixel(&doc, 189, 79), [255, 0, 0, 255]);
+    doc.flip_canvas(false);
+    doc.flip_canvas(true);
+    assert_eq!(doc.render_rgba8(doc.bounds()), original);
+
+    // A project saved after a resize reads back at the new size.
+    doc.resize_canvas(120, 90, -5, -5);
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!((loaded.width, loaded.height), (120, 90));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+}
+
+#[test]
+fn symmetry_lines_can_stand_anywhere_and_cross() {
+    // An upright line off-centre.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: Some(60.0), horizontal: None };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (20.0, 30.0), (40.0, 50.0));
+    assert_eq!(pixel(&doc, 20, 30), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 99, 30), [0, 0, 0, 255], "mirrored across x = 60");
+    assert_eq!(pixel(&doc, 179, 30), [255, 255, 255, 255], "not across the centre of the canvas");
+    assert_eq!(pixel(&doc, 20, 89), [255, 255, 255, 255], "and not top to bottom");
+
+    // A level line.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: None, horizontal: Some(40.0) };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (20.0, 10.0), (60.0, 20.0));
+    assert_eq!(pixel(&doc, 20, 69), [0, 0, 0, 255], "mirrored across y = 40");
+    assert_eq!(pixel(&doc, 60, 59), [0, 0, 0, 255]);
+    assert_eq!(pixel(&doc, 179, 10), [255, 255, 255, 255]);
+
+    // Both: four copies, one undo step.
+    let mut doc = Document::new(200, 120);
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: Some(60.0) };
+    line(&mut doc, &hard_brush(8.0), [0, 0, 0], false, (30.0, 20.0), (50.0, 30.0));
+    for (x, y) in [(30, 20), (169, 20), (30, 99), (169, 99)] {
+        assert_eq!(pixel(&doc, x, y), [0, 0, 0, 255], "copy at ({x}, {y})");
+    }
+    doc.undo();
+    assert!(!doc.can_undo());
+
+    // A shaped tip is mirrored too, not just moved: a slanted flat tip leans
+    // the other way on the far side of each line.
+    let mut doc = Document::new(200, 200);
+    doc.symmetry = Symmetry { vertical: Some(100.0), horizontal: Some(100.0) };
+    let flat = BrushSettings { roundness: 0.15, angle: 45.0, ..hard_brush(40.0) };
+    doc.begin_stroke(&flat, [0, 0, 0], false, StrokePoint::new(50.0, 50.0, 1.0));
+    doc.end_stroke();
+    let dark = |x: i32, y: i32| pixel(&doc, x, y)[0] < 128;
+    // The original leans one way through (50, 50): `rise` is how far up or
+    // down it has gone ten pixels to the right.
+    let rise = if dark(60, 60) { 10 } else { -10 };
+    assert!(dark(60, 50 + rise) && !dark(60, 50 - rise), "the tip is slanted");
+    assert!(dark(140, 50 + rise) && !dark(160, 50 + rise), "left-right copy leans the other way");
+    assert!(dark(60, 150 - rise) && !dark(60, 150 + rise), "top-bottom copy");
+    assert!(dark(140, 150 - rise) && !dark(160, 150 - rise), "copy across both");
+}
+
+#[test]
+fn layers_and_groups_can_be_dropped_anywhere_in_the_stack() {
+    // Bottom to top: Capa 1, Capa 2, Capa 3, then two more.
+    let mut doc = three_layers();
+    doc.add_layer();
+    doc.add_layer();
+    let order = |doc: &Document| -> Vec<String> {
+        doc.layers().iter().map(|l| format!("{}{}", &l.props.name[5..], if l.group != 0 { "g" } else { "" })).collect()
+    };
+    assert_eq!(order(&doc), ["1", "2", "3", "4", "5"]);
+    let before = doc.render_rgba8(doc.bounds());
+
+    // Capa 5 dropped at the bottom; Capa 1 (now second) dropped at the top.
+    assert!(doc.place_layer(4, 0, 0));
+    assert_eq!(order(&doc), ["5", "1", "2", "3", "4"]);
+    assert_eq!(doc.active().props.name, "Capa 5", "the active layer is followed");
+    assert!(doc.place_layer(1, 5, 0));
+    assert_eq!(order(&doc), ["5", "2", "3", "4", "1"]);
+    // Dropping a layer where it already is changes nothing.
+    assert!(!doc.place_layer(2, 2, 0));
+    assert!(!doc.place_layer(2, 3, 0));
+    doc.undo();
+    doc.undo();
+    assert_eq!(order(&doc), ["1", "2", "3", "4", "5"]);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // A group around Capa 2; Capa 5 dropped into it, above Capa 2.
+    doc.set_active_layer(1);
+    let id = doc.group_active_layer().unwrap();
+    assert!(doc.place_layer(4, 2, id));
+    assert_eq!(order(&doc), ["1", "2g", "5g", "3", "4"]);
+    // Capa 4 dropped between the two, taking the group too.
+    assert!(doc.place_layer(4, 2, id));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5g", "3"]);
+    // Loose in the middle of the group would split it: refused.
+    assert!(!doc.place_layer(4, 2, 0));
+    // Into the group from far away is refused too: not next to its layers.
+    assert!(!doc.place_layer(2, 0, id));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5g", "3"]);
+    // Out of the group in place, by dropping it at the group's edge with no group.
+    assert!(doc.place_layer(3, 4, 0));
+    assert_eq!(order(&doc), ["1", "2g", "4g", "5", "3"]);
+    // A group that does not exist is refused.
+    assert!(!doc.place_layer(0, 5, 999_999));
+
+    // The whole group dropped at the top, then at the bottom.
+    assert!(doc.place_group(id, 5));
+    assert_eq!(order(&doc), ["1", "5", "3", "2g", "4g"]);
+    assert!(doc.place_group(id, 0));
+    assert_eq!(order(&doc), ["2g", "4g", "1", "5", "3"]);
+    assert!(!doc.place_group(id, 1), "inside itself is no move");
+    assert!(!doc.place_group(id, 2), "just above itself is no move");
+    // A second group; the first may not land inside it.
+    doc.set_active_layer(3);
+    let other = doc.group_active_layer().unwrap();
+    assert!(doc.place_layer(4, 4, other));
+    assert_eq!(order(&doc), ["2g", "4g", "1", "5g", "3g"]);
+    assert!(!doc.place_group(id, 4));
+    assert!(doc.place_group(id, 5));
+    assert_eq!(order(&doc), ["1", "5g", "3g", "2g", "4g"]);
+    // Dropping a group's last layer elsewhere removes the group.
+    assert!(doc.place_layer(1, 0, 0));
+    assert!(doc.place_layer(2, 0, 0));
+    assert!(doc.group(other).is_none());
+    assert_eq!(doc.groups().len(), 1);
+}
+
+/// A text layer the way the application makes one: drawn in the bundled font.
+fn written(content: &str, size: f32, x: i32, y: i32) -> (TextSpec, usize, usize, Vec<u8>) {
+    let spec = TextSpec { content: content.into(), font: "Ubuntu Light".into(), size, color: [0, 0, 0], x, y };
+    let (w, h, rgba) = render_text(&TextFont::builtin(), content, size, spec.color).unwrap_or((0, 0, Vec::new()));
+    (spec, w, h, rgba)
+}
+
+#[test]
+fn text_layers_stay_text_until_turned_into_pictures() {
+    let mut doc = Document::new(400, 200);
+    let ink = |doc: &Document| doc.render_rgba8(doc.bounds()).chunks(4).filter(|px| px[0] < 128).count();
+    let (spec, w, h, rgba) = written("Hola", 40.0, 20, 30);
+    doc.add_text_layer(spec.clone(), w, h, &rgba);
+    assert_eq!(doc.layers().len(), 2);
+    assert!(doc.active_is_text());
+    assert_eq!(doc.active().props.name, "Hola");
+    assert_eq!(doc.active().text.as_ref(), Some(&spec));
+    let small = ink(&doc);
+    assert!(small > 100);
+
+    // It cannot be painted on, filled, erased, cleared or turned over.
+    let before = doc.render_rgba8(doc.bounds());
+    line(&mut doc, &hard_brush(30.0), [255, 0, 0], false, (10.0, 10.0), (390.0, 190.0));
+    line(&mut doc, &hard_brush(30.0), [0, 0, 0], true, (10.0, 50.0), (390.0, 50.0));
+    assert!(!doc.flood_fill(300, 150, [0, 0, 255], 0.1, true));
+    assert!(!doc.draw_shape(Shape::Rectangle, (10.0, 10.0), (90.0, 90.0), [0, 255, 0], 2.0, true, 1.0));
+    doc.clear_active_layer();
+    doc.flip(true);
+    assert!(doc.begin_transform().is_none());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.layers().len(), 2);
+
+    // Rewriting it, bigger and elsewhere: several changes, one undo step.
+    for (content, size) in [("Hola K", 40.0), ("Hola Ky", 60.0), ("Hola Kyo", 80.0)] {
+        let (spec, w, h, rgba) = written(content, size, 60, 90);
+        assert!(doc.update_text_layer(1, spec, w, h, &rgba));
+    }
+    assert_eq!(doc.active().props.name, "Hola Kyo", "a name taken from the text follows it");
+    assert!(ink(&doc) > small * 3);
+    assert_eq!(pixel(&doc, 25, 35)[3], 255);
+    assert_eq!(doc.layers()[1].pixel(40, 50)[3], 0, "nothing is left where it used to be");
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.active().text.as_ref(), Some(&spec));
+    doc.redo();
+    assert_eq!(doc.active().text.as_ref().unwrap().content, "Hola Kyo");
+    // Closing the run of changes makes the next one a step of its own.
+    doc.end_text_edit();
+    let (bigger, w, h, rgba) = written("Hola Kyo", 90.0, 60, 90);
+    doc.update_text_layer(1, bigger, w, h, &rgba);
+    doc.undo();
+    assert_eq!(doc.active().text.as_ref().unwrap().size, 80.0);
+
+    // Moved as a layer, it remembers where it went; undo brings both back.
+    doc.begin_layer_move();
+    doc.move_layer_to(15, -20);
+    doc.end_stroke();
+    let moved = doc.active().text.clone().unwrap();
+    assert_eq!((moved.x, moved.y), (75, 70));
+    doc.undo();
+    assert_eq!((doc.active().text.as_ref().unwrap().x, doc.active().text.as_ref().unwrap().y), (60, 90));
+    doc.redo();
+
+    // Saved and read back, it is still text.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(loaded.layers()[1].text.as_ref(), Some(&moved));
+    assert!(loaded.layers()[0].text.is_none());
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), doc.render_rgba8(doc.bounds()));
+    for cut in file.len() - 40..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+    // More room around the canvas moves it along; turning the canvas over
+    // makes it a picture.
+    doc.resize_canvas(500, 300, 50, 40);
+    assert_eq!(doc.active().text.as_ref().unwrap().x, 125);
+    doc.flip_canvas(true);
+    assert!(!doc.active_is_text());
+    doc.undo();
+    assert!(doc.active_is_text());
+
+    // Turned into a picture it can be painted on, and that can be undone.
+    assert!(doc.rasterize_text(1));
+    assert!(!doc.active_is_text());
+    assert!(!doc.rasterize_text(1));
+    let before = ink(&doc);
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 10.0), (200.0, 10.0));
+    assert!(ink(&doc) > before);
+    doc.undo();
+    doc.undo();
+    assert!(doc.active_is_text());
+
+    // Merging onto text makes a picture of it.
+    doc.add_layer();
+    line(&mut doc, &hard_brush(10.0), [0, 0, 0], false, (10.0, 10.0), (200.0, 10.0));
+    assert!(doc.merge_down());
+    assert!(!doc.active_is_text());
+}
+
+#[test]
+fn a_layer_mask_hides_without_erasing() {
+    // A red block; under it, on another layer, a blue one.
+    let mut doc = Document::new(200, 100);
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (200.0, 100.0), [0, 0, 255], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (20.0, 20.0), (180.0, 80.0), [255, 0, 0], 1.0, true, 1.0);
+    let whole = doc.render_rgba8(doc.bounds());
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+
+    // A fresh mask hides nothing; without it, strokes go to the pixels.
+    assert!(doc.add_mask());
+    assert!(!doc.add_mask(), "one mask per layer");
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    assert!(!doc.is_editing_mask());
+    doc.edit_mask = true;
+    assert!(doc.is_editing_mask());
+
+    // On the mask the eraser hides: the layer beneath shows through.
+    line(&mut doc, &hard_brush(20.0), [0, 0, 0], true, (60.0, 50.0), (140.0, 50.0));
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 25), red);
+    assert_eq!(doc.layers()[1].pixel(100, 50), doc.layers()[1].pixel(100, 25), "the pixels themselves are untouched");
+    // And the brush brings it back, whatever its colour.
+    line(&mut doc, &hard_brush(10.0), [0, 255, 0], false, (90.0, 50.0), (110.0, 50.0));
+    assert_eq!(pixel(&doc, 100, 50), red);
+    assert_eq!(pixel(&doc, 70, 50), blue);
+    // Each stroke is an undo step of its own.
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    doc.redo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+
+    // Switched off, everything shows; switched on again, it hides again.
+    assert!(doc.set_mask_enabled(false));
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    assert!(doc.set_mask_enabled(true));
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    // Turned inside out, only what was hidden shows.
+    assert!(doc.invert_mask());
+    assert_eq!(pixel(&doc, 100, 50), red);
+    assert_eq!(pixel(&doc, 100, 25), blue);
+    assert!(doc.invert_mask());
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 25), red);
+
+    // With the mask not chosen, strokes paint the layer; the mask still hides.
+    doc.edit_mask = false;
+    line(&mut doc, &hard_brush(10.0), [0, 255, 0], false, (30.0, 30.0), (170.0, 70.0));
+    assert_eq!(pixel(&doc, 30, 30), [0, 255, 0, 255]);
+    assert_eq!(pixel(&doc, 100, 50), blue, "painted, but hidden");
+    doc.undo();
+
+    // It moves with its layer, as one undo step.
+    doc.begin_layer_move();
+    doc.move_layer_to(0, 20);
+    doc.end_stroke();
+    assert_eq!(pixel(&doc, 100, 70), blue, "the hidden band went down with the layer");
+    assert_eq!(pixel(&doc, 100, 50), red);
+    doc.undo();
+    assert_eq!(pixel(&doc, 100, 50), blue);
+    assert_eq!(pixel(&doc, 100, 70), red);
+    // A masked layer is not reshaped or turned over, which would leave the mask behind.
+    assert!(doc.begin_transform().is_none());
+    let before = doc.render_rgba8(doc.bounds());
+    doc.flip(true);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+
+    // Saved and read back, the mask is still a mask.
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert!(loaded.layers()[1].mask.is_some() && loaded.layers()[0].mask.is_none());
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), before);
+    for cut in file.len() - 60..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+    // A Photoshop file carries the layer as it shows.
+    let mut psd = Vec::new();
+    doc.write_psd(&mut psd).unwrap();
+    let from_psd = read_psd(&psd).unwrap();
+    assert_eq!(from_psd.render_rgba8(from_psd.bounds()), before);
+    // The canvas resized and turned over takes the mask along.
+    doc.resize_canvas(240, 120, 20, 10);
+    assert_eq!(pixel(&doc, 120, 60), blue);
+    assert_eq!(pixel(&doc, 120, 35), red);
+    doc.flip_canvas(false);
+    assert_eq!(pixel(&doc, 120, 59), blue);
+    doc.undo();
+    doc.undo();
+
+    // Applied, the hidden part is erased for good and the mask goes.
+    assert!(doc.apply_mask());
+    assert!(doc.active().mask.is_none());
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+    assert_eq!(doc.layers()[1].pixel(100, 50)[3], 0);
+    assert!(!doc.apply_mask() && !doc.invert_mask() && !doc.remove_mask());
+    doc.undo();
+    // Removed, everything shows again.
+    assert!(doc.remove_mask());
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+    doc.undo();
+    // Merged down, the mask is worked in.
+    assert!(doc.merge_down());
+    assert_eq!(doc.layers().len(), 1);
+    assert_eq!(doc.render_rgba8(doc.bounds()), before);
+}
+
+#[test]
+fn a_mask_can_start_from_the_selection() {
+    let mut doc = Document::new(300, 200);
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (300.0, 200.0), [255, 0, 0], 1.0, true, 1.0);
+    let circle: Vec<(f32, f32)> = (0..64)
+        .map(|i| {
+            let a = i as f32 / 64.0 * std::f32::consts::TAU;
+            (150.0 + 60.0 * a.cos(), 100.0 + 60.0 * a.sin())
+        })
+        .collect();
+    doc.select_polygon(&circle);
+    assert!(doc.add_mask());
+    doc.deselect();
+    assert_eq!(pixel(&doc, 150, 100), [255, 0, 0, 255], "inside the selection shows");
+    assert_eq!(pixel(&doc, 20, 20), [255, 255, 255, 255], "outside is hidden");
+    assert_eq!(pixel(&doc, 280, 190), [255, 255, 255, 255]);
+    // Somewhere along the rim a pixel is partly shown: the edge is smooth.
+    let rim: Vec<u8> = (190..215).map(|x| pixel(&doc, x, 130)[1]).collect();
+    assert!(rim.iter().any(|&green| green > 20 && green < 235), "{rim:?}");
+    // Clipped layers follow what the mask leaves showing.
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (300.0, 200.0), [0, 0, 255], 1.0, true, 1.0);
+    let mut props = doc.active().props.clone();
+    props.clip = true;
+    doc.set_layer_props(1, props, false);
+    assert_eq!(pixel(&doc, 150, 100), [0, 0, 255, 255]);
+    assert_eq!(pixel(&doc, 20, 20), [255, 255, 255, 255]);
+    // Text layers can be masked too, though not painted on.
+    let (spec, w, h, rgba) = written("Hola", 60.0, 100, 70);
+    doc.add_text_layer(spec, w, h, &rgba);
+    assert!(doc.add_mask());
+    doc.edit_mask = true;
+    let before = doc.render_rgba8(doc.bounds());
+    line(&mut doc, &hard_brush(80.0), [0, 0, 0], true, (90.0, 100.0), (260.0, 100.0));
+    assert_ne!(doc.render_rgba8(doc.bounds()), before, "the eraser hid the text");
+    assert!(doc.active_is_text());
 }

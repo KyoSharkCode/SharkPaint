@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, TextFont, PROJECT_EXTENSION,
-    read_psd, render_text,
+    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
+    PROJECT_EXTENSION,
+    font_names, read_psd, render_text,
 };
 
 use crate::brushes::{Brush, BrushLibrary, OWN_CATEGORY};
@@ -63,11 +64,12 @@ enum Tool {
     Seleccion,
     Forma,
     Texto,
+    Simetria,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 11] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -78,6 +80,7 @@ impl Tool {
         (Tool::Seleccion, "seleccion", "Selección", "S"),
         (Tool::Forma, "forma", "Formas", "U"),
         (Tool::Texto, "texto", "Texto", "A"),
+        (Tool::Simetria, "simetria", "Simetría", "Y"),
     ];
 
     fn name(self) -> &'static str {
@@ -157,18 +160,109 @@ fn shape_ends(shape: Figure, from: Pos2, to: Pos2, regular: bool) -> (Pos2, Pos2
     }
 }
 
+/// What is being dragged in the layer list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dragged {
+    /// A layer, by its id.
+    Layer(u64),
+    /// A whole group, by its id.
+    Group(u64),
+}
+
+/// A row of the layer list: a layer, by its place in the stack, or the
+/// heading of a group.
+#[derive(Clone, Copy)]
+enum ListRow {
+    Layer(usize),
+    Heading(u64),
+}
+
+/// Where something dragged in the layer list would land.
+struct ListDrop {
+    /// Gap in the stack: just under the layer now at this index.
+    gap: usize,
+    /// Group it would join; zero for none.
+    group: u64,
+    /// Where to draw the line that shows it.
+    line_y: f32,
+}
+
+/// Works out where a drag over the layer list would drop. `rows` are the
+/// rows on screen, top first; `list_left` is the list's left edge.
+fn list_drop(dragged: Dragged, pointer: Pos2, rows: &[(Rect, ListRow)], doc: &Document, list_left: f32) -> Option<ListDrop> {
+    let layers = doc.layers();
+    // The row under the pointer, or the nearest end of the list.
+    let (first, last) = (rows.first()?, rows.last()?);
+    let &(rect, row) = rows
+        .iter()
+        .find(|(rect, _)| (rect.top() - 1.0..=rect.bottom() + 1.0).contains(&pointer.y))
+        .unwrap_or(if pointer.y < first.0.top() { first } else { last });
+    let upper = pointer.y < rect.center().y;
+    let bottom_of = |id: u64| layers.iter().position(|l| l.group == id);
+    let top_of = |id: u64| layers.iter().rposition(|l| l.group == id);
+    match (dragged, row) {
+        // A layer dropped on a heading goes to the top of that group.
+        (Dragged::Layer(_), ListRow::Heading(id)) => Some(ListDrop { gap: top_of(id)? + 1, group: id, line_y: rect.bottom() }),
+        (Dragged::Layer(_), ListRow::Layer(i)) => {
+            let own = layers[i].group;
+            let lowest = own != 0 && (i == 0 || layers[i - 1].group != own);
+            // Under a group's last layer it may stay in or come out: towards
+            // the left edge of the list it comes out.
+            let leaves = !upper && lowest && pointer.x < list_left + 44.0;
+            Some(ListDrop {
+                gap: if upper { i + 1 } else { i },
+                group: if leaves { 0 } else { own },
+                line_y: if upper { rect.top() } else { rect.bottom() },
+            })
+        }
+        (Dragged::Group(id), row) => {
+            let over = match row {
+                ListRow::Heading(other) => other,
+                ListRow::Layer(i) => layers[i].group,
+            };
+            if over == id {
+                return None;
+            }
+            if over == 0 {
+                let ListRow::Layer(i) = row else { return None };
+                return Some(ListDrop { gap: if upper { i + 1 } else { i }, group: 0, line_y: if upper { rect.top() } else { rect.bottom() } });
+            }
+            // Over another group: above all of it, or below all of it.
+            if matches!(row, ListRow::Heading(_)) && upper {
+                return Some(ListDrop { gap: top_of(over)? + 1, group: 0, line_y: rect.top() });
+            }
+            let lowest = bottom_of(over)?;
+            let line_y = rows
+                .iter()
+                .find(|(_, r)| matches!(r, ListRow::Layer(i) if *i == lowest))
+                .map_or(rect.bottom(), |(rect, _)| rect.bottom());
+            Some(ListDrop { gap: lowest, group: 0, line_y })
+        }
+    }
+}
+
 /// Text rendered for placing on the canvas.
 struct TextPreview {
     /// Content, size, typeface and colour it was drawn from.
-    key: (String, u32, usize, [u8; 3]),
+    key: (String, u32, String, [u8; 3]),
     width: usize,
     height: usize,
     rgba: Vec<u8>,
     texture: TextureHandle,
 }
 
-/// Font files installed on this computer, by name, sorted.
-fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
+/// A typeface on offer: its name, and where its font file is (the bundled
+/// one has none) and which face of that file it is.
+#[derive(Clone)]
+struct FontEntry {
+    name: String,
+    path: Option<PathBuf>,
+    index: u32,
+}
+
+/// The typefaces installed on this computer, by their real names, sorted.
+/// Reads every font file, so it is run away from the window's thread.
+fn installed_fonts() -> Vec<FontEntry> {
     let mut folders: Vec<PathBuf> = Vec::new();
     let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
     if cfg!(windows) {
@@ -180,7 +274,7 @@ fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
         folders.extend(var("HOME").map(|dir| dir.join(".local/share/fonts")));
         folders.extend(var("HOME").map(|dir| dir.join("Library/Fonts")));
     }
-    let mut found: Vec<(String, Option<PathBuf>)> = Vec::new();
+    let mut found: Vec<FontEntry> = Vec::new();
     // Folders nest a few levels deep on some systems.
     let mut pending: Vec<(PathBuf, u32)> = folders.into_iter().map(|dir| (dir, 0)).collect();
     while let Some((dir, depth)) = pending.pop() {
@@ -193,13 +287,22 @@ fn installed_fonts() -> Vec<(String, Option<PathBuf>)> {
                 continue;
             }
             let is_font = path.extension().is_some_and(|e| ["ttf", "otf", "ttc"].iter().any(|kind| e.eq_ignore_ascii_case(kind)));
-            if let (true, Some(name)) = (is_font, path.file_stem()) {
-                found.push((name.to_string_lossy().into_owned(), Some(path)));
+            // Very large files are skipped: reading them all would take too long.
+            let small = entry.metadata().is_ok_and(|meta| meta.len() <= 64 << 20);
+            if !is_font || !small {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            for (index, name) in font_names(&data).into_iter().enumerate() {
+                // A face that does not say its name goes by its file's.
+                let name = if name.is_empty() { format!("{stem} {}", index + 1) } else { name };
+                found.push(FontEntry { name, path: Some(path.clone()), index: index as u32 });
             }
         }
     }
-    found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    found.dedup_by(|a, b| a.0 == b.0);
+    found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    found.dedup_by(|a, b| a.name == b.name);
     found
 }
 
@@ -321,6 +424,16 @@ enum Command {
     LayerMove(bool),
     LayerMerge,
     LayerGroup,
+    RasterizeText,
+    MaskAdd,
+    MaskRemove,
+    MaskApply,
+    MaskInvert,
+    MaskToggle,
+    CanvasSize(bool),
+    CropToSelection,
+    FlipCanvas(bool),
+    FlipViewVertical,
     Fit,
     ActualSize,
     Zoom(f32),
@@ -354,6 +467,20 @@ enum Discarding {
 struct NewCanvasDialog {
     width: usize,
     height: usize,
+}
+
+/// The window for changing the canvas size.
+struct CanvasDialog {
+    /// Rescale the picture to the new size, rather than keep it as it is and
+    /// add or cut room around it.
+    scale: bool,
+    width: usize,
+    height: usize,
+    /// Keep the canvas's proportions while rescaling.
+    keep_ratio: bool,
+    /// Where the picture stays put when room is added or cut: 0, 1 or 2
+    /// across (left, middle, right) and down (top, middle, bottom).
+    anchor: (u8, u8),
 }
 
 pub struct SharkPaintApp {
@@ -396,10 +523,24 @@ pub struct SharkPaintApp {
     text_content: String,
     text_size: f32,
     /// Typefaces on offer: the bundled one first, then those installed.
-    text_fonts: Option<Vec<(String, Option<PathBuf>)>>,
-    text_font_index: usize,
-    /// The typeface in use, with its place in the list.
-    text_font: Option<(usize, TextFont)>,
+    text_fonts: Vec<FontEntry>,
+    /// The search for installed typefaces, while it runs; `text_fonts_asked`
+    /// tells whether it was ever started.
+    text_font_scan: Option<std::thread::JoinHandle<Vec<FontEntry>>>,
+    text_fonts_asked: bool,
+    /// Name of the typeface chosen.
+    text_font_name: String,
+    /// The typeface in hand, under the name it was asked for.
+    text_font: Option<(String, TextFont)>,
+    /// A new text is being started even though the active layer is text.
+    text_new: bool,
+    /// What the text layer being rewritten said when the panel last matched it.
+    text_applied: Option<TextSpec>,
+    /// From the text's corner to where the pointer took hold of it.
+    text_grab: Vec2,
+    /// What the last change to the text layer was (words, typeface, size,
+    /// colour or place), to tell where one undo step ends.
+    text_change: Option<u8>,
     /// Where on the canvas the text's top-left corner goes, once chosen.
     text_anchor: Option<Pos2>,
     /// The pointer is moving the text about.
@@ -462,6 +603,7 @@ pub struct SharkPaintApp {
     pen_seen: bool,
     fit_pending: bool,
     new_dialog: Option<NewCanvasDialog>,
+    canvas_dialog: Option<CanvasDialog>,
     status: String,
     /// Project file the document was opened from or last saved to.
     path: Option<PathBuf>,
@@ -480,6 +622,10 @@ pub struct SharkPaintApp {
     refs_open: bool,
     /// The group chosen in the layer list, when a group rather than a layer is.
     active_group: Option<u64>,
+    /// The layer or group being dragged in the layer list.
+    layer_drag: Option<Dragged>,
+    /// The brush and the eraser work on the active layer's mask, not on its pixels.
+    mask_editing: bool,
     /// The side panel shows the navigator (a small view of the whole canvas)
     /// in place of the colour picker.
     nav_open: bool,
@@ -503,6 +649,14 @@ pub struct SharkPaintApp {
     prefs_open: bool,
     /// Strokes are mirrored across the canvas's vertical centre line.
     symmetry: bool,
+    /// Which lines mirror the strokes: upright (left to right) and level (top
+    /// to bottom).
+    symmetry_vertical: bool,
+    symmetry_horizontal: bool,
+    /// Where the lines cross on the canvas; the middle of it until moved.
+    symmetry_center: Option<Pos2>,
+    /// The pointer is moving the symmetry lines.
+    symmetry_dragging: bool,
     /// When and at which document revision the recovery file was last written.
     autosave_time: f64,
     autosave_revision: u64,
@@ -552,9 +706,15 @@ impl SharkPaintApp {
             shape_opacity: 1.0,
             text_content: String::new(),
             text_size: 96.0,
-            text_fonts: None,
-            text_font_index: 0,
+            text_fonts: vec![FontEntry { name: BUILTIN_FONT.to_owned(), path: None, index: 0 }],
+            text_font_scan: None,
+            text_fonts_asked: false,
+            text_font_name: BUILTIN_FONT.to_owned(),
             text_font: None,
+            text_new: false,
+            text_applied: None,
+            text_grab: Vec2::ZERO,
+            text_change: None,
             text_anchor: None,
             text_dragging: false,
             text_preview: None,
@@ -587,6 +747,7 @@ impl SharkPaintApp {
             pen_seen: false,
             fit_pending: true,
             new_dialog: None,
+            canvas_dialog: None,
             status: String::new(),
             path: None,
             saved_revision: 0,
@@ -597,6 +758,8 @@ impl SharkPaintApp {
             brush_window_open: true,
             refs_open: false,
             active_group: None,
+            layer_drag: None,
+            mask_editing: false,
             nav_open: false,
             ref_index: 0,
             ref_view: (Vec2::ZERO, 1.0),
@@ -609,6 +772,10 @@ impl SharkPaintApp {
             saved_settings: Settings::default(),
             prefs_open: false,
             symmetry: false,
+            symmetry_vertical: true,
+            symmetry_horizontal: false,
+            symmetry_center: None,
+            symmetry_dragging: false,
             autosave_time: 0.0,
             autosave_revision: 0,
             autosave_thread: None,
@@ -826,6 +993,7 @@ impl SharkPaintApp {
         self.ref_index = 0;
         self.ref_view = (Vec2::ZERO, 1.0);
         self.refs_open = !self.doc.references().is_empty();
+        self.symmetry_center = None;
     }
 
     fn load_project(&mut self, path: PathBuf) {
@@ -1154,6 +1322,25 @@ impl SharkPaintApp {
                     commands.push(Command::PasteImage);
                 }
             });
+            ui.menu_button("Lienzo", |ui| {
+                if ui.button("Tamaño del lienzo…").on_hover_text("Añade o quita espacio alrededor del dibujo").clicked() {
+                    commands.push(Command::CanvasSize(false));
+                }
+                if ui.button("Redimensionar imagen…").on_hover_text("Agranda o reduce el dibujo entero").clicked() {
+                    commands.push(Command::CanvasSize(true));
+                }
+                let crop = egui::Button::new("Recortar a la selección");
+                if ui.add_enabled(self.doc.selection().is_some(), crop).clicked() {
+                    commands.push(Command::CropToSelection);
+                }
+                ui.separator();
+                if ui.button("Voltear lienzo horizontalmente").on_hover_text("Todas las capas a la vez").clicked() {
+                    commands.push(Command::FlipCanvas(true));
+                }
+                if ui.button("Voltear lienzo verticalmente").on_hover_text("Todas las capas a la vez").clicked() {
+                    commands.push(Command::FlipCanvas(false));
+                }
+            });
             ui.menu_button("Capa", |ui| {
                 let many = self.doc.layers().len() > 1;
                 let active = self.doc.active_layer();
@@ -1166,6 +1353,42 @@ impl SharkPaintApp {
                 if ui.add_enabled(active > 0, egui::Button::new("Fusionar con la inferior")).clicked() {
                     commands.push(Command::LayerMerge);
                 }
+                let rasterize = egui::Button::new("Convertir texto en imagen");
+                if ui
+                    .add_enabled(self.doc.active_is_text(), rasterize)
+                    .on_hover_text("La capa de texto pasa a ser una capa normal")
+                    .clicked()
+                {
+                    commands.push(Command::RasterizeText);
+                }
+                ui.menu_button("Máscara", |ui| {
+                    let mask = self.doc.active().mask.as_ref().map(|mask| mask.props.visible);
+                    let add = if self.doc.selection().is_some() { "Añadir desde la selección" } else { "Añadir" };
+                    if ui.add_enabled(mask.is_none(), egui::Button::new(add)).clicked() {
+                        commands.push(Command::MaskAdd);
+                    }
+                    let toggle = if mask == Some(false) { "Activar" } else { "Desactivar" };
+                    if ui.add_enabled(mask.is_some(), egui::Button::new(toggle)).clicked() {
+                        commands.push(Command::MaskToggle);
+                    }
+                    if ui.add_enabled(mask.is_some(), egui::Button::new("Invertir")).clicked() {
+                        commands.push(Command::MaskInvert);
+                    }
+                    if ui
+                        .add_enabled(mask.is_some(), egui::Button::new("Aplicar"))
+                        .on_hover_text("Borra de la capa lo que la máscara oculta y quita la máscara")
+                        .clicked()
+                    {
+                        commands.push(Command::MaskApply);
+                    }
+                    if ui
+                        .add_enabled(mask.is_some(), egui::Button::new("Eliminar"))
+                        .on_hover_text("Quita la máscara; la capa vuelve a verse entera")
+                        .clicked()
+                    {
+                        commands.push(Command::MaskRemove);
+                    }
+                });
                 ui.separator();
                 if ui.add_enabled(active + 1 < self.doc.layers().len(), egui::Button::new("Subir")).clicked() {
                     commands.push(Command::LayerMove(true));
@@ -1240,6 +1463,9 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Voltear horizontalmente", "F") {
                     commands.push(Command::Flip);
+                }
+                if ui.button("Voltear verticalmente").on_hover_text("Solo la vista; el dibujo no cambia").clicked() {
+                    commands.push(Command::FlipViewVertical);
                 }
                 ui.separator();
                 if item(ui, "Ajustes del pincel", "F5") {
@@ -2004,23 +2230,47 @@ impl SharkPaintApp {
         ui.label("Con poca presión el trazo solo toca los relieves del papel; con más, lo cubre.");
     }
 
-    /// Loads the chosen typeface if it is not the one in hand. A file that
-    /// cannot be used falls back to the bundled typeface.
+    /// Loads the chosen typeface if it is not the one in hand. One that is not
+    /// installed, or cannot be read, is stood in for by the bundled typeface.
     fn text_font(&mut self) -> &TextFont {
-        let index = self.text_font_index;
-        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != index) {
-            let entry = self.text_fonts.as_ref().and_then(|fonts| fonts.get(index)).cloned();
+        let name = self.text_font_name.clone();
+        if self.text_font.as_ref().is_none_or(|(loaded, _)| *loaded != name) {
+            let entry = self.text_fonts.iter().find(|font| font.name == name).cloned();
             let font = entry
-                .and_then(|(name, path)| TextFont::from_bytes(name, std::fs::read(path?).ok()?))
+                .and_then(|entry| TextFont::from_bytes(entry.name, std::fs::read(entry.path?).ok()?, entry.index))
                 .unwrap_or_else(TextFont::builtin);
-            self.text_font = Some((index, font));
+            self.text_font = Some((name, font));
         }
         &self.text_font.as_ref().expect("just loaded").1
     }
 
-    /// Redraws the text waiting to be placed when what it shows has changed.
+    /// Starts looking for the installed typefaces the first time they are
+    /// wanted, and takes the list in once it is ready.
+    fn poll_fonts(&mut self, ctx: &egui::Context) {
+        if !self.text_fonts_asked {
+            self.text_fonts_asked = true;
+            self.text_font_scan = std::thread::Builder::new().name("fuentes".into()).spawn(installed_fonts).ok();
+        }
+        if self.text_font_scan.as_ref().is_some_and(|scan| scan.is_finished()) {
+            if let Some(Ok(found)) = self.text_font_scan.take().map(|scan| scan.join()) {
+                self.text_fonts.extend(found);
+                // A typeface stood in for until now may have turned up.
+                self.text_font = None;
+                self.text_preview = None;
+            }
+        } else if self.text_font_scan.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// The text layer the text tool is rewriting, if it is.
+    fn editing_text(&self) -> Option<usize> {
+        (self.tool == Tool::Texto && !self.text_new && self.doc.active_is_text()).then(|| self.doc.active_layer())
+    }
+
+    /// Redraws the text in the panel when what it shows has changed.
     fn sync_text_preview(&mut self, ctx: &egui::Context) {
-        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_index, self.color);
+        let key = (self.text_content.clone(), self.text_size.to_bits(), self.text_font_name.clone(), self.color);
         if self.text_preview.as_ref().is_some_and(|preview| preview.key == key) {
             return;
         }
@@ -2035,42 +2285,123 @@ impl SharkPaintApp {
         }
     }
 
-    /// Puts the text on the canvas as a layer of its own.
+    /// Keeps the text tool and the canvas in step: with a text layer active,
+    /// the panel shows that layer's text and every change to it is written
+    /// back; otherwise the panel holds a new text waiting to be placed.
+    fn sync_text(&mut self, ctx: &egui::Context) {
+        self.poll_fonts(ctx);
+        let Some(index) = self.editing_text() else {
+            if self.text_applied.take().is_some() {
+                // The layer being rewritten is no longer the one in hand.
+                self.text_anchor = None;
+            }
+            self.sync_text_preview(ctx);
+            return;
+        };
+        let Some(spec) = self.doc.layers()[index].text.clone() else { return };
+        if self.text_applied.as_ref() != Some(&spec) {
+            // A different layer, or this one changed behind the panel's back
+            // (undo, a move): the panel takes what the layer says.
+            self.text_content = spec.content.clone();
+            self.text_size = spec.size;
+            self.text_font_name = spec.font.clone();
+            self.color = spec.color;
+            self.text_anchor = Some(Pos2::new(spec.x as f32, spec.y as f32));
+            self.text_applied = Some(spec.clone());
+        }
+        self.sync_text_preview(ctx);
+        let anchor = self.text_anchor.unwrap_or(Pos2::new(spec.x as f32, spec.y as f32));
+        let wanted = TextSpec {
+            content: self.text_content.clone(),
+            font: self.text_font_name.clone(),
+            size: self.text_size,
+            color: self.color,
+            x: anchor.x.round() as i32,
+            y: anchor.y.round() as i32,
+        };
+        if wanted != spec {
+            // Typing is one undo step, a change of typeface another, a move
+            // another: a different kind of change starts a new step.
+            let kind = if wanted.content != spec.content {
+                0
+            } else if wanted.font != spec.font {
+                1
+            } else if wanted.size != spec.size {
+                2
+            } else if wanted.color != spec.color {
+                3
+            } else {
+                4
+            };
+            if self.text_change != Some(kind) {
+                self.doc.end_text_edit();
+                self.text_change = Some(kind);
+            }
+            let (width, height, rgba) = match &self.text_preview {
+                Some(preview) => (preview.width, preview.height, preview.rgba.as_slice()),
+                None => (0, 0, &[][..]),
+            };
+            self.doc.update_text_layer(index, wanted.clone(), width, height, rgba);
+            self.text_applied = Some(wanted);
+        }
+    }
+
+    /// Puts the new text on the canvas as a text layer of its own.
     fn place_text(&mut self, ctx: &egui::Context) {
         self.sync_text_preview(ctx);
         let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) else { return };
-        let name: String = self.text_content.lines().next().unwrap_or("Texto").chars().take(24).collect();
-        self.doc.add_image_layer(name.trim(), preview.width, preview.height, &preview.rgba, anchor.x as i32, anchor.y as i32);
+        let spec = TextSpec {
+            content: self.text_content.clone(),
+            font: self.text_font_name.clone(),
+            size: self.text_size,
+            color: self.color,
+            x: anchor.x.round() as i32,
+            y: anchor.y.round() as i32,
+        };
+        self.doc.add_text_layer(spec.clone(), preview.width, preview.height, &preview.rgba);
         self.note_color();
-        self.text_anchor = None;
-        self.status = "Texto colocado en una capa nueva. Muévelo o transfórmalo como cualquier capa.".into();
+        // The new layer is the active one, so the panel goes on to rewrite it.
+        self.text_new = false;
+        self.text_applied = Some(spec);
+        self.active_group = None;
+        self.status = "Texto colocado en una capa de texto: puedes seguir cambiándolo con esta herramienta.".into();
     }
 
     /// What to write, in which typeface and how tall.
     fn text_panel(&mut self, ui: &mut egui::Ui) {
         ui.set_width(248.0);
-        let fonts = self.text_fonts.get_or_insert_with(|| {
-            let mut fonts = vec![("Ubuntu Light (incluida)".to_owned(), None)];
-            fonts.extend(installed_fonts());
-            fonts
+        let editing = self.editing_text();
+        ui.horizontal(|ui| {
+            if editing.is_some() {
+                ui.strong("Editando la capa de texto");
+                if ui.small_button("Nuevo texto").on_hover_text("Deja esta capa como está y empieza otro texto").clicked() {
+                    self.text_new = true;
+                    self.text_content.clear();
+                    self.text_anchor = None;
+                }
+            } else {
+                ui.strong("Texto nuevo");
+                if self.doc.active_is_text() && ui.small_button("Editar la capa").on_hover_text("Vuelve al texto de la capa activa").clicked() {
+                    self.text_new = false;
+                }
+            }
         });
-        self.text_font_index = self.text_font_index.min(fonts.len() - 1);
         ui.add(
             egui::TextEdit::multiline(&mut self.text_content)
                 .hint_text("Escribe aquí el texto")
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
+        let installed = self.text_fonts.iter().any(|font| font.name == self.text_font_name);
         egui::Grid::new("texto").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Fuente");
-            let fonts = self.text_fonts.as_ref().expect("filled above");
             egui::ComboBox::from_id_salt("fuente_texto")
-                .selected_text(fonts[self.text_font_index].0.as_str())
+                .selected_text(self.text_font_name.as_str())
                 .width(170.0)
                 .height(320.0)
                 .show_ui(ui, |ui| {
-                    for (i, (name, _)) in fonts.iter().enumerate() {
-                        ui.selectable_value(&mut self.text_font_index, i, name);
+                    for font in &self.text_fonts {
+                        ui.selectable_value(&mut self.text_font_name, font.name.clone(), font.name.as_str());
                     }
                 });
             ui.end_row();
@@ -2078,29 +2409,47 @@ impl SharkPaintApp {
             ui.add(egui::Slider::new(&mut self.text_size, 8.0..=1000.0).logarithmic(true).fixed_decimals(0).suffix(" px"));
             ui.end_row();
         });
-        let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+        if self.text_font_scan.is_some() {
+            ui.weak("Buscando las fuentes instaladas…");
+        } else if !installed {
+            ui.weak("Esa fuente no está instalada en este equipo: al cambiar el texto se dibujará con la fuente incluida.");
+        }
+        if let Some(index) = editing {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Convertir en imagen")
+                    .on_hover_text("La capa deja de ser texto: se podrá pintar sobre ella y transformarla,\npero ya no reescribirla")
+                    .clicked()
+                {
+                    self.doc.rasterize_text(index);
+                    self.text_anchor = None;
+                    self.status = "La capa de texto es ahora una imagen.".into();
+                }
+            });
+            ui.label("Cambia el texto, la fuente, el tamaño o el color y la capa se actualiza. Arrastra sobre el lienzo para moverla.");
+        } else {
+            let ready = self.text_anchor.is_some() && !self.text_content.trim().is_empty();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(ready, egui::Button::new("Colocar texto")).on_hover_text("Ctrl+Intro").clicked() {
+                    self.place_text(ui.ctx());
+                }
+                if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+                    self.text_anchor = None;
+                }
+            });
+            ui.label(if self.text_anchor.is_some() {
+                "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
+            } else {
+                "Haz clic en el lienzo donde quieras el texto."
+            });
+            ui.label("Queda en una capa de texto, que podrás reescribir cuando quieras.");
+            // Shortcuts work while typing too.
+            let (place, cancel) = ui.input(|i| (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+            if place && ready {
                 self.place_text(ui.ctx());
-            }
-            if ui.add_enabled(self.text_anchor.is_some(), egui::Button::new("Cancelar")).on_hover_text("Esc").clicked() {
+            } else if cancel {
                 self.text_anchor = None;
             }
-        });
-        ui.label(if self.text_anchor.is_some() {
-            "Arrastra sobre el lienzo para moverlo. Se escribe con el color elegido."
-        } else {
-            "Haz clic en el lienzo donde quieras el texto."
-        });
-        ui.label("Al colocarlo queda en una capa nueva, como imagen: después no se puede reescribir.");
-        // Shortcuts work while typing too.
-        let (place, cancel) = ui.input(|i| {
-            (i.modifiers.command && i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
-        });
-        if place && ready {
-            self.place_text(ui.ctx());
-        } else if cancel {
-            self.text_anchor = None;
         }
     }
 
@@ -2181,6 +2530,52 @@ impl SharkPaintApp {
             }
             Tool::Texto => {
                 self.text_panel(ui);
+                return;
+            }
+            Tool::Simetria => {
+                ui.set_width(248.0);
+                ui.checkbox(&mut self.symmetry, "Simetría activa")
+                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo");
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    let both = (self.symmetry_vertical, self.symmetry_horizontal);
+                    for (axes, name, tip) in [
+                        ((true, false), "Vertical", "Espejo de izquierda a derecha"),
+                        ((false, true), "Horizontal", "Espejo de arriba abajo"),
+                        ((true, true), "Las dos", "Cuatro copias de cada trazo"),
+                    ] {
+                        if ui.selectable_label(both == axes, name).on_hover_text(tip).clicked() {
+                            (self.symmetry_vertical, self.symmetry_horizontal) = axes;
+                            self.symmetry = true;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                let mut center = self.symmetry_point();
+                let before = center;
+                let (width, height) = (self.doc.width as f32, self.doc.height as f32);
+                egui::Grid::new("simetria").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Eje vertical en");
+                    ui.add_enabled(
+                        self.symmetry_vertical,
+                        egui::DragValue::new(&mut center.x).range(0.0..=width).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                    ui.label("Eje horizontal en");
+                    ui.add_enabled(
+                        self.symmetry_horizontal,
+                        egui::DragValue::new(&mut center.y).range(0.0..=height).fixed_decimals(0).suffix(" px"),
+                    );
+                    ui.end_row();
+                });
+                if center != before {
+                    self.symmetry_center = Some(center);
+                }
+                if ui.button("Centrar en el lienzo").clicked() {
+                    self.symmetry_center = None;
+                }
+                ui.label("Haz clic o arrastra sobre el lienzo para colocar los ejes donde quieras.");
+                ui.label("Después vuelve al pincel: la simetría sigue activa hasta que la apagues.");
                 return;
             }
             Tool::Seleccion => {
@@ -2306,7 +2701,7 @@ impl SharkPaintApp {
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.symmetry, "Simetría")
-                    .on_hover_text("Repite cada trazo en espejo al otro lado del centro del lienzo");
+                    .on_hover_text("Repite cada trazo en espejo. Los ejes se colocan con la herramienta Simetría.");
             }
             egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
                 let b = self.active_brush();
@@ -2420,6 +2815,37 @@ impl SharkPaintApp {
             }
         });
 
+        // Flipping, close at hand: the selection if there is one, else the layer.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let what = if self.doc.selection().is_some() { "la selección" } else { "la capa" };
+            for (name, horizontal, way) in [("voltearH", true, "horizontalmente"), ("voltearV", false, "verticalmente")] {
+                let button = egui::Button::image(icon(name, 18.0, text)).min_size(Vec2::splat(28.0));
+                if ui.add(button).on_hover_text(format!("Voltear {what} {way}")).clicked() {
+                    commands.push(Command::FlipContents(horizontal));
+                }
+            }
+            ui.weak("Voltear");
+            ui.add_space(8.0);
+            let has_mask = self.doc.active().mask.is_some();
+            let tip = if has_mask {
+                "Máscara de capa: trabajar en la máscara o en la capa"
+            } else if self.doc.selection().is_some() {
+                "Añadir máscara desde la selección: oculta lo de fuera sin borrarlo"
+            } else {
+                "Añadir máscara: oculta partes de la capa sin borrarlas"
+            };
+            let button = egui::Button::image(icon("mascara", 18.0, text)).selected(self.mask_editing).min_size(Vec2::splat(28.0));
+            if ui.add_enabled(chosen_group.is_none(), button).on_hover_text(tip).clicked() {
+                if has_mask {
+                    self.mask_editing = !self.mask_editing;
+                } else {
+                    commands.push(Command::MaskAdd);
+                }
+            }
+            ui.weak("Máscara");
+        });
+
         // Properties of the chosen group, or of the active layer.
         let percent = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0} %", v * 100.0);
         if let Some(before) = chosen_group.and_then(|id| self.doc.group(id).cloned()) {
@@ -2496,6 +2922,33 @@ impl SharkPaintApp {
         } else if !continuous {
             self.prop_edit_active = false;
         }
+        // The layer's mask, when it has one.
+        if let Some(enabled) = self.doc.active().mask.as_ref().map(|mask| mask.props.visible) {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label("Máscara:");
+                ui.selectable_value(&mut self.mask_editing, false, "Capa").on_hover_text("El pincel y el borrador pintan la capa");
+                ui.selectable_value(&mut self.mask_editing, true, "Máscara")
+                    .on_hover_text("El borrador oculta y el pincel vuelve a mostrar, sin borrar nada");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let mut on = enabled;
+                if ui.checkbox(&mut on, "Activa").on_hover_text("Desmarcada, la capa se ve entera sin perder la máscara").changed() {
+                    self.doc.set_mask_enabled(on);
+                }
+                if ui.small_button("Invertir").clicked() {
+                    self.doc.invert_mask();
+                }
+                if ui.small_button("Aplicar").on_hover_text("Borra de la capa lo oculto y quita la máscara").clicked() {
+                    self.doc.apply_mask();
+                }
+                if ui.small_button("Eliminar").on_hover_text("Quita la máscara; la capa vuelve a verse entera").clicked() {
+                    self.doc.remove_mask();
+                }
+            });
+        }
     }
 
     /// The stack, top layer first: visibility, preview, name. A group shows as
@@ -2504,13 +2957,19 @@ impl SharkPaintApp {
         let chosen_group = self.active_group;
         ui.add_space(4.0);
         let mut select = None;
+        let mut select_mask = None;
         let mut toggle = None;
         let mut select_group = None;
         let mut toggle_group = None;
         let mut fold_group = None;
+        // Dragging a row to another place in the list.
+        let dragging = self.layer_drag;
+        let mut started = None;
+        let mut drop: Option<ListDrop> = None;
         egui::ScrollArea::vertical().id_salt("lista_capas").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let layers = self.doc.layers();
+            let mut rows: Vec<(Rect, ListRow)> = Vec::new();
             for (i, layer) in layers.iter().enumerate().rev() {
                 let group = self.doc.group(layer.group);
                 // The heading goes above the group's topmost layer.
@@ -2523,7 +2982,12 @@ impl SharkPaintApp {
                         if ui.add(button).on_hover_text(tip).clicked() {
                             toggle_group = Some(group.id);
                         }
-                        let (row, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                        let (row, response) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click_and_drag());
+                        rows.push((row, ListRow::Heading(group.id)));
+                        if response.drag_started() {
+                            started = Some(Dragged::Group(group.id));
+                        }
                         let painter = ui.painter().with_clip_rect(row);
                         let selected = chosen_group == Some(group.id);
                         if selected {
@@ -2596,7 +3060,11 @@ impl SharkPaintApp {
                     }
 
                     let size = Vec2::new(ui.available_width(), ROW_HEIGHT);
-                    let (row, response) = ui.allocate_exact_size(size, Sense::click());
+                    let (row, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                    rows.push((row, ListRow::Layer(i)));
+                    if response.drag_started() {
+                        started = Some(Dragged::Layer(layer.id));
+                    }
                     let painter = ui.painter().with_clip_rect(row);
                     let selected = i == active && chosen_group.is_none();
                     if selected {
@@ -2630,8 +3098,23 @@ impl SharkPaintApp {
                         painter.rect_stroke(thumb, 1.0, Stroke::new(1.0, border), egui::StrokeKind::Outside);
                     }
 
+                    // A layer with a mask shows it as a chip beside the preview;
+                    // a click on the chip chooses the mask to work on.
+                    let chip = layer.mask.as_ref().map(|mask| {
+                        let chip = Rect::from_min_size(slot.right_top() + Vec2::new(5.0, 0.0), Vec2::new(26.0, slot.height()));
+                        let working = selected && self.mask_editing;
+                        painter.rect_filled(chip, 3.0, Color32::from_gray(if mask.props.visible { 235 } else { 120 }));
+                        icon("mascara", 16.0, Color32::from_gray(40)).paint_at(ui, Rect::from_center_size(chip.center(), Vec2::splat(16.0)));
+                        if !mask.props.visible {
+                            // Struck through while it is switched off.
+                            painter.line_segment([chip.left_bottom(), chip.right_top()], Stroke::new(2.0, Color32::from_rgb(220, 70, 70)));
+                        }
+                        let border = if working { Color32::from_rgb(111, 227, 240) } else { Color32::from_gray(90) };
+                        painter.rect_stroke(chip, 3.0, Stroke::new(if working { 2.0 } else { 1.0 }, border), egui::StrokeKind::Outside);
+                        chip
+                    });
                     let ink = if selected { ui.visuals().selection.stroke.color } else { ink };
-                    let left = slot.right() + 8.0;
+                    let left = chip.map_or(slot.right(), |chip| chip.right()) + 8.0;
                     let detail = (props.blend != BlendMode::Normal || props.opacity < 1.0)
                         .then(|| format!("{} · {:.0} %", props.blend.name(), props.opacity * 100.0));
                     let name_y = if detail.is_some() { row.center().y - 8.0 } else { row.center().y };
@@ -2658,12 +3141,63 @@ impl SharkPaintApp {
                         );
                         icon("candado", 14.0, ink).paint_at(ui, at);
                     }
+                    if layer.text.is_some() {
+                        // A text layer wears the text tool's mark.
+                        let x = row.right() - if props.alpha_lock { 32.0 } else { 14.0 };
+                        let at = Rect::from_center_size(Pos2::new(x, row.center().y), Vec2::splat(14.0));
+                        icon("texto", 14.0, ink).paint_at(ui, at);
+                    }
                     if response.clicked() {
                         select = Some(i);
+                        let on_chip = chip.zip(response.interact_pointer_pos()).is_some_and(|(chip, pos)| chip.expand(2.0).contains(pos));
+                        select_mask = Some(on_chip);
+                    }
+                    // What is being dragged is marked, with its whole group.
+                    let carried = match dragging {
+                        Some(Dragged::Layer(id)) => id == layer.id,
+                        Some(Dragged::Group(id)) => id == layer.group,
+                        None => false,
+                    };
+                    if carried {
+                        painter.rect_filled(row, 4.0, Color32::from_black_alpha(110));
                     }
                 });
             }
+            // A line shows where the dragged row would land.
+            if let Some(dragged) = dragging {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                let list = ui.clip_rect();
+                let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.x_range().contains(pos.x));
+                drop = pointer.and_then(|pos| list_drop(dragged, pos, &rows, &self.doc, list.left()));
+                if let Some(target) = &drop {
+                    let from = list.left() + if target.group != 0 { 40.0 } else { 28.0 };
+                    ui.painter().line_segment(
+                        [Pos2::new(from, target.line_y), Pos2::new(list.right() - 2.0, target.line_y)],
+                        Stroke::new(2.0, Color32::from_rgb(111, 227, 240)),
+                    );
+                }
+            }
         });
+        if started.is_some() {
+            self.layer_drag = started;
+        }
+        if let Some(dragged) = self.layer_drag {
+            let (released, down) = ui.input(|i| (i.pointer.any_released(), i.pointer.any_down()));
+            if released || !down {
+                self.layer_drag = None;
+                match (dragged, drop) {
+                    (Dragged::Layer(id), Some(target)) => {
+                        if let Some(from) = self.doc.layers().iter().position(|l| l.id == id) {
+                            self.doc.place_layer(from, target.gap, target.group);
+                        }
+                    }
+                    (Dragged::Group(id), Some(target)) => {
+                        self.doc.place_group(id, target.gap);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(i) = toggle {
             let mut props = self.doc.layers()[i].props.clone();
             props.visible = !props.visible;
@@ -2672,6 +3206,8 @@ impl SharkPaintApp {
         if let Some(i) = select {
             self.doc.set_active_layer(i);
             self.active_group = None;
+            // A click on the row works on the layer; on its chip, on the mask.
+            self.mask_editing = select_mask == Some(true);
         }
         if let Some(id) = select_group {
             self.active_group = Some(id);
@@ -2697,6 +3233,10 @@ impl SharkPaintApp {
                 ui.label(format!("Presión {:.0} %", self.last_pressure * 100.0));
             } else {
                 ui.label("Lápiz: sin detectar (usando ratón)");
+            }
+            if self.doc.is_editing_mask() {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(111, 227, 240), "Máscara: el borrador oculta, el pincel muestra");
             }
             if !self.status.is_empty() {
                 ui.separator();
@@ -3018,7 +3558,10 @@ impl SharkPaintApp {
             }
         }
 
-        self.doc.symmetry = self.symmetry;
+        self.doc.symmetry = self.symmetry_lines();
+        // The mask can only be worked on while the active layer has one.
+        self.mask_editing &= self.doc.active().mask.is_some();
+        self.doc.edit_mask = self.mask_editing;
         self.sync_transform();
         let free = ctx.input(|i| i.modifiers.shift);
         let mut transform_changed = false;
@@ -3088,9 +3631,41 @@ impl SharkPaintApp {
                     }
                     let c = to_canvas(*pos);
                     if self.tool == Tool::Texto && !alt {
-                        // Press to put the text there; keep holding to move it.
-                        self.text_anchor = Some(c.round());
+                        // A new text goes where the press is; one being rewritten
+                        // is taken hold of and moved. Keep holding to move either.
+                        match (self.editing_text(), self.text_anchor) {
+                            (Some(_), Some(anchor)) => {
+                                self.text_grab = c - anchor;
+                                // Each drag is a move of its own.
+                                self.text_change = None;
+                            }
+                            _ => {
+                                self.text_grab = Vec2::ZERO;
+                                self.text_anchor = Some(c.round());
+                            }
+                        }
                         self.text_dragging = true;
+                        continue;
+                    }
+                    let paints = matches!(
+                        self.tool,
+                        Tool::Pincel | Tool::Borrador | Tool::Difuminar | Tool::Relleno | Tool::Forma | Tool::Transformar
+                    );
+                    if !alt && self.doc.is_editing_mask() && paints && !matches!(self.tool, Tool::Pincel | Tool::Borrador) {
+                        self.status =
+                            "Está elegida la máscara: en ella solo trabajan el borrador (oculta) y el pincel (muestra). Elige la capa para usar otra herramienta."
+                                .into();
+                        continue;
+                    }
+                    if !alt && self.tool == Tool::Transformar && self.doc.active().mask.is_some() {
+                        self.status =
+                            "La capa tiene una máscara: aplícala o elimínala (menú Capa → Máscara) antes de transformarla.".into();
+                        continue;
+                    }
+                    if paints && !alt && self.doc.active_is_text() && !self.doc.is_editing_mask() {
+                        self.status =
+                            "Es una capa de texto: cámbiala con la herramienta Texto, o conviértela en imagen (menú Capa) para pintar en ella."
+                                .into();
                         continue;
                     }
                     if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
@@ -3103,6 +3678,13 @@ impl SharkPaintApp {
                             self.select_contiguous,
                             self.select_mode,
                         );
+                        continue;
+                    }
+                    if self.tool == Tool::Simetria && !alt {
+                        // Press to put the lines there; keep holding to move them.
+                        self.symmetry = true;
+                        self.symmetry_center = Some(c.round());
+                        self.symmetry_dragging = true;
                         continue;
                     }
                     if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
@@ -3167,7 +3749,10 @@ impl SharkPaintApp {
                     }
                 }
                 Event::PointerMoved(_) if self.tool == Tool::Transformar => {}
-                Event::PointerMoved(pos) if self.text_dragging => self.text_anchor = Some(to_canvas(*pos).round()),
+                Event::PointerMoved(pos) if self.text_dragging => {
+                    self.text_anchor = Some((to_canvas(*pos) - self.text_grab).round());
+                }
+                Event::PointerMoved(pos) if self.symmetry_dragging => self.symmetry_center = Some(to_canvas(*pos).round()),
                 Event::PointerMoved(pos) if self.select_drag.is_some() => {
                     if let Some(drag) = &mut self.select_drag {
                         drag.to = to_canvas(*pos);
@@ -3201,8 +3786,9 @@ impl SharkPaintApp {
                 }
                 Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }
                 | Event::PointerGone => {
-                    if self.text_dragging {
+                    if self.text_dragging || self.symmetry_dragging {
                         self.text_dragging = false;
+                        self.symmetry_dragging = false;
                         continue;
                     }
                     if self.tool == Tool::Transformar {
@@ -3314,12 +3900,27 @@ impl SharkPaintApp {
         }
         painter.add(Shape::closed_line(corners.to_vec(), Stroke::new(1.0, Color32::from_gray(15))));
 
-        // The symmetry axis, as a guide.
-        if self.symmetry {
-            let top = self.view.to_screen(Pos2::new(doc_size.x * 0.5, 0.0), viewport, doc_size);
-            let bottom = self.view.to_screen(Pos2::new(doc_size.x * 0.5, doc_size.y), viewport, doc_size);
-            let guide = Stroke::new(1.0, Color32::from_rgb(111, 227, 240));
-            painter.extend(Shape::dashed_line(&[top, bottom], guide, 8.0, 6.0));
+        // The symmetry lines, as guides, with a handle where they meet while
+        // the symmetry tool is in hand.
+        let lines = self.symmetry_lines();
+        let guide = Stroke::new(1.0, Color32::from_rgb(111, 227, 240));
+        let screen = |x: f32, y: f32| self.view.to_screen(Pos2::new(x, y), viewport, doc_size);
+        // Dark under light, so the line shows on any colour.
+        let draw_guide = |from: Pos2, to: Pos2| {
+            painter.line_segment([from, to], Stroke::new(1.0, Color32::from_black_alpha(110)));
+            painter.extend(Shape::dashed_line(&[from, to], guide, 8.0, 6.0));
+        };
+        if let Some(x) = lines.vertical {
+            draw_guide(screen(x, 0.0), screen(x, doc_size.y));
+        }
+        if let Some(y) = lines.horizontal {
+            draw_guide(screen(0.0, y), screen(doc_size.x, y));
+        }
+        if self.symmetry && self.tool == Tool::Simetria {
+            let center = self.symmetry_point();
+            let at = screen(center.x, center.y);
+            painter.circle_filled(at, 5.0, Color32::from_rgb(111, 227, 240));
+            painter.circle_stroke(at, 5.0, Stroke::new(1.0, Color32::from_gray(15)));
         }
 
         // The selection, and the one being dragged out, as a dashed outline.
@@ -3382,19 +3983,26 @@ impl SharkPaintApp {
             }
         }
 
-        // Text waiting to be placed, shown where it will go.
+        // Text: a new one waiting to be placed is shown where it will go; one
+        // being rewritten is already on its layer and only gets a frame.
+        if self.tool != Tool::Texto {
+            self.text_applied = None;
+        }
         if self.tool == Tool::Texto {
-            self.sync_text_preview(&ctx);
+            self.sync_text(&ctx);
+            let rewriting = self.editing_text().is_some();
             if let (Some(anchor), Some(preview)) = (self.text_anchor, &self.text_preview) {
                 let size = Vec2::new(preview.width as f32, preview.height as f32);
                 let corners = [Vec2::ZERO, Vec2::new(size.x, 0.0), size, Vec2::new(0.0, size.y)]
                     .map(|offset| self.view.to_screen(anchor + offset, viewport, doc_size));
-                let mut mesh = Mesh::with_texture(preview.texture.id());
-                for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
-                    mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                if !rewriting {
+                    let mut mesh = Mesh::with_texture(preview.texture.id());
+                    for (corner, uv) in corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]) {
+                        mesh.vertices.push(egui::epaint::Vertex { pos: *corner, uv: Pos2::new(uv.0, uv.1), color: Color32::WHITE });
+                    }
+                    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+                    painter.add(Shape::mesh(mesh));
                 }
-                mesh.indices.extend([0, 1, 2, 0, 2, 3]);
-                painter.add(Shape::mesh(mesh));
                 let mut outline = corners.to_vec();
                 outline.push(corners[0]);
                 painter.extend(Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_rgb(111, 227, 240)), 5.0, 5.0));
@@ -3422,7 +4030,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
+            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto | Tool::Simetria) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -3439,6 +4047,118 @@ impl SharkPaintApp {
                     ctx.set_cursor_icon(CursorIcon::Crosshair);
                 }
             }
+        }
+    }
+
+    /// Where the symmetry lines cross, kept on the canvas.
+    fn symmetry_point(&self) -> Pos2 {
+        let size = self.doc_size();
+        let center = self.symmetry_center.unwrap_or((size * 0.5).to_pos2());
+        Pos2::new(center.x.clamp(0.0, size.x), center.y.clamp(0.0, size.y))
+    }
+
+    /// The lines strokes are mirrored across right now.
+    fn symmetry_lines(&self) -> Symmetry {
+        if !self.symmetry {
+            return Symmetry::OFF;
+        }
+        let center = self.symmetry_point();
+        Symmetry {
+            vertical: self.symmetry_vertical.then_some(center.x),
+            horizontal: self.symmetry_horizontal.then_some(center.y),
+        }
+    }
+
+    /// What every change of canvas size leaves to do: show all of it again.
+    fn after_canvas_change(&mut self, status: &str) {
+        self.symmetry_center = None;
+        self.fit_pending = true;
+        self.xform = None;
+        self.xform_empty = None;
+        self.text_anchor = None;
+        self.status = format!("{status} Ahora mide {} × {} px.", self.doc.width, self.doc.height);
+    }
+
+    /// The window for the canvas size: with or without rescaling the picture.
+    fn canvas_size_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.canvas_dialog else { return };
+        let max_side = ctx.input(|i| i.max_texture_side).max(256);
+        let (old_w, old_h) = (self.doc.width, self.doc.height);
+        let mut apply = false;
+        let mut cancel = false;
+        let title = if dialog.scale { "Redimensionar imagen" } else { "Tamaño del lienzo" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Tamaño actual: {old_w} × {old_h} px"));
+                let before = (dialog.width, dialog.height);
+                egui::Grid::new("lienzo").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Ancho");
+                    ui.add(egui::DragValue::new(&mut dialog.width).range(1..=max_side).suffix(" px"));
+                    ui.end_row();
+                    ui.label("Alto");
+                    ui.add(egui::DragValue::new(&mut dialog.height).range(1..=max_side).suffix(" px"));
+                    ui.end_row();
+                });
+                if dialog.scale {
+                    ui.checkbox(&mut dialog.keep_ratio, "Mantener proporción");
+                    if dialog.keep_ratio {
+                        // The side that was not touched follows the one that was.
+                        let ratio = old_w as f32 / old_h as f32;
+                        if dialog.width != before.0 {
+                            dialog.height = ((dialog.width as f32 / ratio).round() as usize).clamp(1, max_side);
+                        } else if dialog.height != before.1 {
+                            dialog.width = ((dialog.height as f32 * ratio).round() as usize).clamp(1, max_side);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        for (name, factor) in [("50 %", 0.5), ("200 %", 2.0)] {
+                            if ui.small_button(name).clicked() {
+                                dialog.width = ((old_w as f32 * factor).round() as usize).clamp(1, max_side);
+                                dialog.height = ((old_h as f32 * factor).round() as usize).clamp(1, max_side);
+                            }
+                        }
+                    });
+                    ui.label("El dibujo entero se agranda o se reduce.");
+                } else {
+                    ui.label("El dibujo se queda en:");
+                    egui::Grid::new("ancla").spacing([2.0, 2.0]).show(ui, |ui| {
+                        for row in 0..3u8 {
+                            for column in 0..3u8 {
+                                let chosen = dialog.anchor == (column, row);
+                                let mark = if chosen { "●" } else { "·" };
+                                if ui.add(egui::Button::new(mark).selected(chosen).min_size(Vec2::splat(24.0))).clicked() {
+                                    dialog.anchor = (column, row);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.label("El dibujo conserva su tamaño; se añade o se quita espacio.");
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    apply = ui.button("Aplicar").clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+        if apply {
+            let (scale, width, height, anchor) = (dialog.scale, dialog.width, dialog.height, dialog.anchor);
+            let changed = if scale {
+                self.doc.scale_image(width, height)
+            } else {
+                // Shift so the chosen edge or the middle stays where it was.
+                let shift = |new: usize, old: usize, place: u8| (new as i32 - old as i32) * place as i32 / 2;
+                self.doc.resize_canvas(width, height, shift(width, old_w, anchor.0), shift(height, old_h, anchor.1))
+            };
+            if changed {
+                self.after_canvas_change(if scale { "Imagen redimensionada." } else { "Tamaño del lienzo cambiado." });
+            }
+        }
+        if apply || cancel {
+            self.canvas_dialog = None;
         }
     }
 
@@ -3591,6 +4311,31 @@ impl SharkPaintApp {
                 self.view.rotate_about(viewport.center(), -self.view.rotation, viewport, doc_size)
             }
             Command::Flip => self.view.flip = !self.view.flip,
+            Command::FlipViewVertical => {
+                // Top to bottom is left to right plus half a turn.
+                self.view.flip = !self.view.flip;
+                self.view.rotate_about(viewport.center(), std::f32::consts::PI, viewport, doc_size);
+            }
+            Command::CanvasSize(scale) => {
+                self.canvas_dialog = Some(CanvasDialog {
+                    scale,
+                    width: self.doc.width,
+                    height: self.doc.height,
+                    keep_ratio: true,
+                    anchor: (1, 1),
+                });
+            }
+            Command::CropToSelection => {
+                if self.doc.crop_to_selection() {
+                    self.after_canvas_change("Lienzo recortado a la selección.");
+                } else {
+                    self.status = "Selecciona primero la zona que quieres conservar.".into();
+                }
+            }
+            Command::FlipCanvas(horizontal) => {
+                self.doc.flip_canvas(horizontal);
+                self.status = "Lienzo volteado.".into();
+            }
             Command::ToggleBrushWindow => self.brush_window_open = !self.brush_window_open,
             Command::ToggleReferences => self.refs_open = !self.refs_open,
             Command::ToggleNavigator => self.nav_open = !self.nav_open,
@@ -3601,7 +4346,50 @@ impl SharkPaintApp {
             Command::Deselect => self.doc.deselect(),
             Command::InvertSelection => self.doc.invert_selection(),
             Command::DeleteSelected => self.doc.clear_selection_contents(),
-            Command::FlipContents(horizontal) => self.doc.flip(horizontal),
+            Command::FlipContents(horizontal) => {
+                if self.doc.active_is_text() {
+                    self.status = "Es una capa de texto: conviértela en imagen (menú Capa) para voltearla.".into();
+                } else if self.doc.active().mask.is_some() {
+                    self.status = "La capa tiene una máscara: aplícala o elimínala (menú Capa → Máscara) antes de voltearla.".into();
+                } else {
+                    self.doc.flip(horizontal);
+                }
+            }
+            Command::MaskAdd => {
+                let selected = self.doc.selection().is_some();
+                if self.doc.add_mask() {
+                    self.mask_editing = true;
+                    self.active_group = None;
+                    self.status = if selected {
+                        "Máscara creada desde la selección: lo de fuera queda oculto. El borrador oculta más y el pincel vuelve a mostrar.".into()
+                    } else {
+                        "Máscara añadida. Con ella elegida, el borrador oculta y el pincel vuelve a mostrar, sin borrar nada.".into()
+                    };
+                }
+            }
+            Command::MaskRemove => {
+                if self.doc.remove_mask() {
+                    self.status = "Máscara eliminada: la capa se ve entera otra vez.".into();
+                }
+            }
+            Command::MaskApply => {
+                if self.doc.apply_mask() {
+                    self.status = "Máscara aplicada: lo que ocultaba se ha borrado de la capa.".into();
+                }
+            }
+            Command::MaskInvert => {
+                self.doc.invert_mask();
+            }
+            Command::MaskToggle => {
+                let enabled = self.doc.active().mask.as_ref().is_some_and(|mask| mask.props.visible);
+                self.doc.set_mask_enabled(!enabled);
+            }
+            Command::RasterizeText => {
+                if self.doc.rasterize_text(self.doc.active_layer()) {
+                    self.text_anchor = None;
+                    self.status = "La capa de texto es ahora una imagen.".into();
+                }
+            }
             Command::Fullscreen => {
                 let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
@@ -3682,6 +4470,7 @@ impl eframe::App for SharkPaintApp {
             self.store_settings();
         }
         self.new_canvas_window(&ctx);
+        self.canvas_size_window(&ctx);
         self.confirm_window(&ctx);
         self.update_window_title(&ctx);
         for command in commands {

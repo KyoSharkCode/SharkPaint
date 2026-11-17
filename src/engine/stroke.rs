@@ -45,8 +45,8 @@ pub(crate) struct ActiveStroke {
     opacity: u32,
     /// Painting is confined to this selection, if there is one.
     selection: Option<Arc<Selection>>,
-    /// Every dab is repeated mirrored across the vertical line at this x.
-    mirror_x: Option<f32>,
+    /// Every dab is repeated mirrored across these lines.
+    mirror: Symmetry,
     tiles: Vec<Option<StrokeTile>>,
     /// Last point actually drawn to (after smoothing).
     pen: StrokePoint,
@@ -63,6 +63,20 @@ pub(crate) struct ActiveStroke {
     /// Colour the brush is carrying (premultiplied RGBA, 0..=1), once it has
     /// touched the canvas.
     carried: Option<[f32; 4]>,
+}
+
+/// Mirroring of brush strokes across one or two lines on the canvas.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Symmetry {
+    /// Where an upright line stands (its x): strokes repeat left to right.
+    pub vertical: Option<f32>,
+    /// Where a level line lies (its y): strokes repeat top to bottom.
+    pub horizontal: Option<f32>,
+}
+
+impl Symmetry {
+    /// No mirroring.
+    pub const OFF: Symmetry = Symmetry { vertical: None, horizontal: None };
 }
 
 /// The outline of one dab, in the frame of the canvas.
@@ -134,7 +148,7 @@ impl ActiveStroke {
         color: [u8; 3],
         erase: bool,
         selection: Option<Arc<Selection>>,
-        mirror_x: Option<f32>,
+        mirror: Symmetry,
         p: StrokePoint,
     ) -> (Self, IRect) {
         let to15 = |v: u8| (v as u32 * ONE + 127) / 255;
@@ -146,7 +160,7 @@ impl ActiveStroke {
             alpha_lock: layer.props.alpha_lock,
             opacity: (brush.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
             selection,
-            mirror_x,
+            mirror,
             tiles: (0..layer.tiles.len()).map(|_| None).collect(),
             pen: p,
             raw: p,
@@ -246,7 +260,7 @@ impl ActiveStroke {
         (self.random >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Stamps the tip at `p` and, with symmetry on, at its mirror image. Each
+    /// Stamps the tip at `p` and, with symmetry on, at its mirror images. Each
     /// dab gets its own scatter, rotation and size variation.
     fn dab(&mut self, layer: &mut Layer, p: StrokePoint) -> IRect {
         let diameter = self.brush.diameter_at(p.pressure);
@@ -271,14 +285,25 @@ impl ActiveStroke {
         if self.wet {
             self.pick_up(layer, at);
         }
-        let rect = self.place(layer, at, angle, scale, false);
-        match self.mirror_x {
-            Some(axis) => {
-                let mirrored = StrokePoint { x: 2.0 * axis - at.x, ..at };
-                rect.union(&self.place(layer, mirrored, angle, scale, true))
-            }
-            None => rect,
+        let mut rect = self.place(layer, at, angle, scale, false);
+        let Symmetry { vertical, horizontal } = self.mirror;
+        let across = |axis: f32, value: f32| 2.0 * axis - value;
+        let half_turn = std::f32::consts::PI;
+        if let Some(axis) = vertical {
+            let mirrored = StrokePoint { x: across(axis, at.x), ..at };
+            rect = rect.union(&self.place(layer, mirrored, angle, scale, true));
         }
+        if let Some(axis) = horizontal {
+            // Top to bottom is left to right plus half a turn.
+            let mirrored = StrokePoint { y: across(axis, at.y), ..at };
+            rect = rect.union(&self.place(layer, mirrored, angle + half_turn, scale, true));
+        }
+        if let (Some(upright), Some(level)) = (vertical, horizontal) {
+            // Across both lines: half a turn about where they cross.
+            let mirrored = StrokePoint { x: across(upright, at.x), y: across(level, at.y), ..at };
+            rect = rect.union(&self.place(layer, mirrored, angle + half_turn, scale, false));
+        }
+        rect
     }
 
     fn place(&mut self, layer: &mut Layer, p: StrokePoint, angle: f32, scale: f32, flip: bool) -> IRect {

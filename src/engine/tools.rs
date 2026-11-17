@@ -119,6 +119,9 @@ impl Document {
     /// anything was filled.
     pub fn flood_fill(&mut self, x: i32, y: i32, color: [u8; 3], tolerance: f32, all_layers: bool) -> bool {
         self.end_stroke();
+        if self.active_is_text() {
+            return false;
+        }
         let (w, h) = (self.width, self.height);
         if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
             return false;
@@ -243,6 +246,9 @@ impl Document {
     /// hardness shape the tip; its flow is the smudge strength.
     pub fn begin_smudge(&mut self, brush: &BrushSettings, p: StrokePoint) {
         self.end_stroke();
+        if self.active_is_text() {
+            return;
+        }
         self.smudge = Some(SmudgeStroke {
             layer: self.active_layer,
             brush: brush.clone(),
@@ -384,6 +390,8 @@ fn smudge_step(
 pub(super) struct MoveSession {
     layer: usize,
     original: Vec<Option<Arc<Tile>>>,
+    /// The layer's mask as it was, which moves along with the layer.
+    original_mask: Option<Vec<Option<Arc<Tile>>>>,
     offset: (i32, i32),
 }
 
@@ -392,7 +400,12 @@ impl Document {
     pub fn begin_layer_move(&mut self) {
         self.end_stroke();
         let layer = self.active_layer;
-        self.moving = Some(MoveSession { layer, original: self.layers[layer].tiles.clone(), offset: (0, 0) });
+        self.moving = Some(MoveSession {
+            layer,
+            original: self.layers[layer].tiles.clone(),
+            original_mask: self.layers[layer].mask.as_ref().map(|mask| mask.tiles.clone()),
+            offset: (0, 0),
+        });
     }
 
     /// Places the layer `dx`, `dy` pixels from where the move began. Pixels
@@ -406,12 +419,40 @@ impl Document {
         session.offset = (dx, dy);
         let layer = &mut self.layers[session.layer];
         layer.tiles = shifted(layer, &session.original, dx, dy);
+        if let (Some(mask), Some(original)) = (layer.mask.as_deref_mut(), &session.original_mask) {
+            mask.tiles = shifted(mask, original, dx, dy);
+        }
         self.mark_dirty(self.bounds());
     }
 
     pub(super) fn end_layer_move(&mut self) {
         if let Some(session) = self.moving.take() {
             if session.offset == (0, 0) {
+                return;
+            }
+            if self.layers[session.layer].text.is_some() || session.original_mask.is_some() {
+                // Text remembers where it is, and a mask moves with its layer,
+                // so the move is recorded with the layer as a whole rather
+                // than as changed pixels.
+                let layer = &mut self.layers[session.layer];
+                let moved = std::mem::replace(&mut layer.tiles, session.original);
+                let moved_mask = match (layer.mask.as_deref_mut(), session.original_mask) {
+                    (Some(mask), Some(original)) => Some(std::mem::replace(&mut mask.tiles, original)),
+                    _ => None,
+                };
+                self.checkpoint_layers();
+                let version = self.next_version();
+                let layer = &mut self.layers[session.layer];
+                layer.tiles = moved;
+                if let (Some(mask), Some(moved)) = (layer.mask.as_deref_mut(), moved_mask) {
+                    mask.tiles = moved;
+                }
+                layer.version = version;
+                if let Some(text) = &mut layer.text {
+                    text.x += session.offset.0;
+                    text.y += session.offset.1;
+                }
+                self.mark_dirty(self.bounds());
                 return;
             }
             let now = &self.layers[session.layer].tiles;
@@ -427,7 +468,11 @@ impl Document {
 
     pub(super) fn cancel_layer_move(&mut self) {
         if let Some(session) = self.moving.take() {
-            self.layers[session.layer].tiles = session.original;
+            let layer = &mut self.layers[session.layer];
+            layer.tiles = session.original;
+            if let (Some(mask), Some(original)) = (layer.mask.as_deref_mut(), session.original_mask) {
+                mask.tiles = original;
+            }
             self.mark_dirty(self.bounds());
         }
     }
@@ -515,28 +560,34 @@ impl Document {
         let li = self.active_layer;
         let layer = &mut self.layers[li];
         layer.props.name = name.to_owned();
-        let area = IRect::new(x, y, x + width as i32, y + height as i32).intersect(&layer.bounds());
-        for cy in area.y0..area.y1 {
-            for cx in area.x0..area.x1 {
-                let i = ((cy - y) as usize * width + (cx - x) as usize) * 4;
-                let alpha = rgba[i + 3] as u32;
-                if alpha == 0 {
-                    continue;
-                }
-                let a15 = (alpha * ONE + 127) / 255;
-                let px: Px = [
-                    (((rgba[i] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
-                    (((rgba[i + 1] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
-                    (((rgba[i + 2] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
-                    a15 as u16,
-                ];
-                let (ux, uy) = (cx as usize, cy as usize);
-                let idx = layer.tile_index(ux / TILE, uy / TILE);
-                let tile = Arc::make_mut(layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())));
-                tile.0[(uy % TILE) * TILE + ux % TILE] = px;
-            }
-        }
+        put_image(layer, width, height, rgba, x, y);
         self.mark_dirty(self.bounds());
+    }
+}
+
+/// Writes an image into a layer with its top-left corner at (`x`, `y`);
+/// parts outside the canvas are dropped. `rgba` is 8-bit, not premultiplied.
+pub(super) fn put_image(layer: &mut Layer, width: usize, height: usize, rgba: &[u8], x: i32, y: i32) {
+    let area = IRect::new(x, y, x + width as i32, y + height as i32).intersect(&layer.bounds());
+    for cy in area.y0..area.y1 {
+        for cx in area.x0..area.x1 {
+            let i = ((cy - y) as usize * width + (cx - x) as usize) * 4;
+            let alpha = rgba[i + 3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let a15 = (alpha * ONE + 127) / 255;
+            let px: Px = [
+                (((rgba[i] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                (((rgba[i + 1] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                (((rgba[i + 2] as u32 * ONE + 127) / 255 * a15 + ONE / 2) >> 15) as u16,
+                a15 as u16,
+            ];
+            let (ux, uy) = (cx as usize, cy as usize);
+            let idx = layer.tile_index(ux / TILE, uy / TILE);
+            let tile = Arc::make_mut(layer.tiles[idx].get_or_insert_with(|| Arc::new(Tile::empty())));
+            tile.0[(uy % TILE) * TILE + ux % TILE] = px;
+        }
     }
 }
 
@@ -579,6 +630,10 @@ impl Document {
     /// move, or `None` (and starts nothing) if there are none.
     pub fn begin_transform(&mut self) -> Option<IRect> {
         self.end_stroke();
+        // Text cannot be reshaped, and a mask would be left behind.
+        if self.active_is_text() || self.active().mask.is_some() {
+            return None;
+        }
         let li = self.active_layer;
         let layer = &self.layers[li];
         let (floating, base) = match &self.selection {
@@ -862,6 +917,9 @@ impl Document {
     /// selection's bounding box.
     pub fn flip(&mut self, horizontal: bool) {
         self.end_stroke();
+        if self.active_is_text() || self.active().mask.is_some() {
+            return;
+        }
         let li = self.active_layer;
         let selection = self.selection.clone();
         let rect = selection.as_ref().map_or(self.bounds(), |s| s.bounds);
@@ -907,6 +965,9 @@ impl Document {
     /// selection.
     pub fn clear_selection_contents(&mut self) {
         self.end_stroke();
+        if self.active_is_text() {
+            return;
+        }
         let Some(selection) = self.selection.clone() else { return };
         let li = self.active_layer;
         let rect = selection.bounds;

@@ -5,6 +5,41 @@ use ab_glyph::{point, Font, FontVec, Glyph, PxScale, ScaleFont};
 /// Largest side of a rendered block of text, in pixels.
 const MAX_SIDE: usize = 8192;
 
+/// Name of the typeface that comes with the program.
+pub const BUILTIN_FONT: &str = "Ubuntu Light";
+
+/// The names of the typefaces in a font file, as their makers call them
+/// ("Arial Bold"), one per face in file order. A face that does not say gets
+/// an empty name; data that is not a font gives an empty list.
+pub fn font_names(data: &[u8]) -> Vec<String> {
+    let faces = ttf_parser::fonts_in_collection(data).unwrap_or(1);
+    (0..faces)
+        .filter_map(|index| ttf_parser::Face::parse(data, index).ok())
+        .map(|face| {
+            // The full name if there is one, in English for choice; else the
+            // family and style put together.
+            let find = |id: u16| {
+                let named = || face.names().into_iter().filter(move |name| name.name_id == id && name.is_unicode());
+                named()
+                    .find(|name| name.language() == ttf_parser::Language::English_UnitedStates)
+                    .or_else(|| named().next())
+                    .and_then(|name| name.to_string())
+                    .map(|name| name.trim().to_owned())
+                    .filter(|name| !name.is_empty())
+            };
+            find(ttf_parser::name_id::FULL_NAME)
+                .or_else(|| {
+                    let family = find(ttf_parser::name_id::FAMILY)?;
+                    Some(match find(ttf_parser::name_id::SUBFAMILY) {
+                        Some(style) if style != "Regular" => format!("{family} {style}"),
+                        _ => family,
+                    })
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// A typeface text can be drawn in.
 pub struct TextFont {
     pub name: String,
@@ -12,16 +47,22 @@ pub struct TextFont {
 }
 
 impl TextFont {
-    /// A typeface from the contents of a font file (TrueType or OpenType; the
-    /// first face of a collection). `None` if the data is not a usable font.
-    pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> Option<TextFont> {
-        let font = FontVec::try_from_vec_and_index(data, 0).ok()?;
+    /// A typeface from the contents of a font file (TrueType or OpenType);
+    /// `index` picks the face in a file that holds several. `None` if the
+    /// data is not a usable font.
+    pub fn from_bytes(name: impl Into<String>, data: Vec<u8>, index: u32) -> Option<TextFont> {
+        let font = FontVec::try_from_vec_and_index(data, index).ok()?;
         Some(TextFont { name: name.into(), font })
+    }
+
+    /// The font file of the typeface that comes with the program.
+    pub fn builtin_data() -> &'static [u8] {
+        epaint_default_fonts::UBUNTU_LIGHT
     }
 
     /// The typeface that comes with the program.
     pub fn builtin() -> TextFont {
-        TextFont::from_bytes("Ubuntu Light", epaint_default_fonts::UBUNTU_LIGHT.to_vec()).expect("the bundled font is valid")
+        TextFont::from_bytes(BUILTIN_FONT, epaint_default_fonts::UBUNTU_LIGHT.to_vec(), 0).expect("the bundled font is valid")
     }
 }
 

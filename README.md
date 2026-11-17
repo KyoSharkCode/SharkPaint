@@ -25,6 +25,9 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Pinceles de Photoshop: importa archivos `.abr`, tanto los pinceles con imagen como
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
+- Capas y grupos se reordenan arrastrándolos en la lista.
+- Máscaras de capa: ocultan partes de una capa sin borrarlas; el borrador oculta y
+  el pincel vuelve a mostrar. Se crean vacías o desde la selección.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
   con modo de fusión propio.
 - Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
@@ -41,15 +44,19 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   puede sumar, restar, intersecar e invertir: pintar, borrar, rellenar, transformar y
   voltear afectan solo a lo seleccionado. Los cambios de selección se deshacen.
 - Voltear la capa o la selección, en horizontal y en vertical.
+- Lienzo: cambiar su tamaño, redimensionar la imagen, recortar a la selección y
+  voltear todas las capas a la vez.
 - Formas: líneas, rectángulos y elipses, rellenas o de contorno.
-- Texto con la fuente incluida o las instaladas en el equipo; se coloca como capa.
+- Texto con la fuente incluida o las instaladas en el equipo, en capas de texto que
+  se pueden reescribir hasta que se convierten en imagen.
 - Navegador (`F7`, pestaña junto al color): miniatura del lienzo completo que marca la zona visible;
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
-- Simetría: los trazos se repiten en espejo respecto al centro del lienzo.
+- Simetría (`Y`): los trazos se repiten en espejo respecto a un eje vertical, uno
+  horizontal o los dos, colocados donde haga falta.
 - Paleta de colores guardados e historial de colores recientes.
 - Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
 - Atajos de herramientas configurables (Editar → Preferencias).
@@ -61,6 +68,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
+- Abrir y guardar `.ora` y `.kra`.
+- Importar papeles propios para la textura de los pinceles.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
   visual de SharkCut (versión 0.2.0).
 
@@ -73,7 +82,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `T` | Transformar la capa o la selección (`Intro` aplica, `Esc` cancela) |
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
-| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela) |
+| `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela); con una capa de texto activa, la reescribe |
+| `Y` | Simetría: clic o arrastre para colocar los ejes |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |

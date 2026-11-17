@@ -2,6 +2,7 @@
 
 mod abr;
 mod brush;
+mod canvas;
 mod document;
 mod export;
 mod layer;
@@ -23,9 +24,9 @@ pub use document::{Document, ProjectSnapshot, Reference};
 pub use export::write_png;
 pub use project::PROJECT_EXTENSION;
 pub use psd::read_psd;
-pub use layer::{BlendMode, IRect, Layer, LayerGroup, LayerProps, Px, Tile, ONE, TILE};
+pub use layer::{BlendMode, IRect, Layer, LayerGroup, LayerProps, TextSpec, Px, Tile, ONE, TILE};
 pub use selection::{SelectMode, Selection};
 pub use shapes::Shape;
-pub use stroke::StrokePoint;
-pub use text::{render_text, TextFont};
+pub use stroke::{StrokePoint, Symmetry};
+pub use text::{font_names, render_text, TextFont, BUILTIN_FONT};
 pub use tools::{brush_preview, LayerTransform};

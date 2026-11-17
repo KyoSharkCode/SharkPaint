@@ -208,6 +208,29 @@ pub struct LayerGroup {
     pub collapsed: bool,
 }
 
+/// What a text layer says and how: enough to draw it again. The layer's
+/// pixels are that drawing, made by whoever has the fonts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextSpec {
+    pub content: String,
+    /// Name of the typeface, as the font list shows it.
+    pub font: String,
+    /// Height of the text in pixels.
+    pub size: f32,
+    pub color: [u8; 3],
+    /// Top-left corner of the drawn text on the canvas.
+    pub x: i32,
+    pub y: i32,
+}
+
+impl TextSpec {
+    /// A name for the layer, taken from the start of the text.
+    pub fn layer_name(&self) -> String {
+        let name: String = self.content.lines().next().unwrap_or("").trim().chars().take(24).collect();
+        if name.is_empty() { "Texto".to_owned() } else { name }
+    }
+}
+
 #[derive(Clone)]
 pub struct Layer {
     /// Identifies the layer across reordering and undo; unique within a document.
@@ -217,6 +240,14 @@ pub struct Layer {
     pub group: u64,
     /// Changes whenever the layer's pixels change (used to refresh previews).
     pub version: u64,
+    /// Set while the layer is text that can still be rewritten. Such a layer
+    /// is not painted on: its pixels always are what `text` says.
+    pub text: Option<TextSpec>,
+    /// Hides parts of the layer without erasing them. It is a layer of its
+    /// own whose opacity at each pixel says how much of this layer is hidden
+    /// there; where it is empty, everything shows. Its `props.visible` says
+    /// whether the mask is in effect.
+    pub mask: Option<Box<Layer>>,
     pub props: LayerProps,
     pub width: usize,
     pub height: usize,
@@ -232,6 +263,8 @@ impl Layer {
         Layer {
             id: 0,
             group: 0,
+            text: None,
+            mask: None,
             version: 0,
             props: LayerProps::named(name),
             width,
@@ -300,6 +333,41 @@ impl Layer {
             out.push(255);
         }
         (tw, th, out)
+    }
+
+    /// The mask's tile at a place in the tile grid, if the layer has a mask
+    /// that is in effect and hides anything there.
+    pub fn mask_tile(&self, index: usize) -> Option<&Tile> {
+        let mask = self.mask.as_deref().filter(|mask| mask.props.visible)?;
+        mask.tiles[index].as_deref()
+    }
+
+    /// One pixel as it shows: what the mask hides is taken away.
+    pub fn shown_pixel(&self, x: i32, y: i32) -> Px {
+        let px = self.pixel(x, y);
+        let hidden = match self.mask.as_deref().filter(|mask| mask.props.visible) {
+            Some(mask) => mask.pixel(x, y)[3] as u32,
+            None => 0,
+        };
+        if hidden == 0 {
+            return px;
+        }
+        let keep = ONE - hidden.min(ONE);
+        px.map(|c| ((c as u32 * keep + ONE / 2) >> 15) as u16)
+    }
+
+    /// The layer's tiles as they show, with the mask worked into the pixels.
+    pub fn shown_tiles(&self) -> Vec<Option<Arc<Tile>>> {
+        let mut tiles = self.tiles.clone();
+        for (index, tile) in tiles.iter_mut().enumerate() {
+            let (Some(pixels), Some(mask)) = (tile.as_mut(), self.mask_tile(index)) else { continue };
+            let pixels = Arc::make_mut(pixels);
+            for (px, hidden) in pixels.0.iter_mut().zip(mask.0.iter()) {
+                let keep = ONE - (hidden[3] as u32).min(ONE);
+                *px = px.map(|c| ((c as u32 * keep + ONE / 2) >> 15) as u16);
+            }
+        }
+        tiles
     }
 
     /// Reads one pixel; out-of-bounds and unallocated areas are transparent.
