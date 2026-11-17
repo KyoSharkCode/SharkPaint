@@ -72,9 +72,9 @@ Para la 0.1.5:
 
 - Autoguardado del proyecto: además de la copia de recuperación, guardar solo cada
   cierto tiempo en el propio archivo, con el intervalo a elegir.
-- Capas de referencia: marcar una capa (por ejemplo, el lineart) como referencia para
-  que el relleno y la varita mágica se guíen solo por ella, y no por todas las capas
-  visibles.
+- Capas de referencia: elegir qué capa sirve de referencia (por ejemplo, el lineart)
+  para que el relleno y la varita mágica se guíen solo por ella. El relleno podrá
+  mirar la capa actual, la capa de referencia o todas las capas.
 
 Más adelante:
 
