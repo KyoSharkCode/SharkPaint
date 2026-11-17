@@ -68,6 +68,16 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 ## Pendiente
 
+Para la 0.1.5:
+
+- Autoguardado del proyecto: además de la copia de recuperación, guardar solo cada
+  cierto tiempo en el propio archivo, con el intervalo a elegir.
+- Capas de referencia: marcar una capa (por ejemplo, el lineart) como referencia para
+  que el relleno y la varita mágica se guíen solo por ella, y no por todas las capas
+  visibles.
+
+Más adelante:
+
 - Abrir y guardar `.ora` y `.kra`.
 - Importar papeles propios para la textura de los pinceles.
 - Rediseño del icono (el pincel actual es provisional), junto con la actualización
