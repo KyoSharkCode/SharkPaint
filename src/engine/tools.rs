@@ -9,6 +9,17 @@ use super::layer::{IRect, Layer, Px, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
 use super::stroke::StrokePoint;
 
+/// Which layers a fill or a colour selection goes by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillSource {
+    /// The layer being worked on.
+    Layer,
+    /// The layers marked as references (the line art, say).
+    Reference,
+    /// Every visible layer.
+    All,
+}
+
 /// Remembers the original contents of every tile an edit touches.
 #[derive(Default)]
 pub(super) struct TileEdit {
@@ -37,11 +48,16 @@ impl TileEdit {
 
 impl Document {
     /// What fills and colour selections look at: 8-bit premultiplied RGBA per
-    /// pixel, of the whole picture or of the active layer alone.
-    fn fill_reference(&self, all_layers: bool) -> Vec<[u8; 4]> {
+    /// pixel, of the active layer alone, of the reference layers or of the
+    /// whole picture. With no layer marked as a reference, asking for them
+    /// gives the whole picture.
+    fn fill_reference(&self, source: FillSource) -> Vec<[u8; 4]> {
         let (w, h) = (self.width, self.height);
-        if all_layers {
-            return self.render_rgba8(self.bounds()).chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        let flat = |rgba: Vec<u8>| rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        match source {
+            FillSource::Reference if self.has_reference_layers() => return flat(self.render_reference_rgba8(self.bounds())),
+            FillSource::Reference | FillSource::All => return flat(self.render_rgba8(self.bounds())),
+            FillSource::Layer => {}
         }
         let layer = &self.layers[self.active_layer];
         let mut pixels = vec![[0u8; 4]; w * h];
@@ -64,12 +80,26 @@ impl Document {
     /// result combines with the current selection as `mode` says. Returns
     /// whether the point was on the canvas.
     pub fn select_similar(&mut self, x: i32, y: i32, tolerance: f32, all_layers: bool, contiguous: bool, mode: SelectMode) -> bool {
+        let source = if all_layers { FillSource::All } else { FillSource::Layer };
+        self.select_similar_from(x, y, tolerance, source, contiguous, mode)
+    }
+
+    /// As [`Document::select_similar`], saying which layers to go by.
+    pub fn select_similar_from(
+        &mut self,
+        x: i32,
+        y: i32,
+        tolerance: f32,
+        source: FillSource,
+        contiguous: bool,
+        mode: SelectMode,
+    ) -> bool {
         self.end_stroke();
         let (w, h) = (self.width, self.height);
         if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
             return false;
         }
-        let reference = self.fill_reference(all_layers);
+        let reference = self.fill_reference(source);
         let seed = reference[y as usize * w + x as usize];
         let limit = (tolerance.clamp(0.0, 1.0) * 255.0).round() as i32;
         let matches = |p: [u8; 4]| (0..4).all(|c| (p[c] as i32 - seed[c] as i32).abs() <= limit);
@@ -118,6 +148,14 @@ impl Document {
     /// no light fringe is left along anti-aliased line art. Returns whether
     /// anything was filled.
     pub fn flood_fill(&mut self, x: i32, y: i32, color: [u8; 3], tolerance: f32, all_layers: bool) -> bool {
+        let source = if all_layers { FillSource::All } else { FillSource::Layer };
+        self.flood_fill_from(x, y, color, tolerance, source)
+    }
+
+    /// As [`Document::flood_fill`], saying which layers bound the area: with
+    /// [`FillSource::Reference`] the fill goes by the reference layers alone,
+    /// whatever is on the layer being filled or on any other.
+    pub fn flood_fill_from(&mut self, x: i32, y: i32, color: [u8; 3], tolerance: f32, source: FillSource) -> bool {
         self.end_stroke();
         if self.active_is_text() {
             return false;
@@ -131,7 +169,7 @@ impl Document {
             return false;
         }
 
-        let reference = self.fill_reference(all_layers);
+        let reference = self.fill_reference(source);
         let seed = reference[y as usize * w + x as usize];
         let limit = (tolerance.clamp(0.0, 1.0) * 255.0).round() as i32;
         let selection = self.selection.clone();

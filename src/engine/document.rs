@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use super::brush::BrushSettings;
+use super::groups::Isolated;
 use super::layer::{blend_over, BlendMode, IRect, Layer, LayerGroup, LayerProps, TextSpec, Tile, ONE, TILE};
 use super::selection::{SelectMode, Selection};
 use super::stroke::{ActiveStroke, StrokePoint, Symmetry};
@@ -37,6 +38,13 @@ enum HistoryEntry {
     },
 }
 
+/// How many groups that blend as one can be open inside each other; deeper
+/// ones blend their layers one by one.
+const MAX_ISOLATED: usize = 8;
+
+/// A placeholder for a slot that holds no group.
+const NO_GROUP: Isolated = Isolated { id: 0, opacity: 0, blend: BlendMode::Normal };
+
 /// A layer's tile with the tile of its mask, if the mask hides anything there.
 #[derive(Clone, Copy)]
 struct Source<'a> {
@@ -52,14 +60,6 @@ impl Source<'_> {
             None => opacity,
         }
     }
-}
-
-/// A group whose layers are combined apart and blended in as one.
-#[derive(Clone, Copy)]
-struct Isolated {
-    id: u64,
-    opacity: u32,
-    blend: BlendMode,
 }
 
 /// A reference image kept alongside the drawing: shown in its own panel,
@@ -237,39 +237,6 @@ impl Document {
         self.layers.remove(self.active_layer);
         self.active_layer = self.active_layer.saturating_sub(1);
         self.prune_groups();
-        self.mark_dirty(self.bounds());
-        true
-    }
-
-    /// Moves the active layer one step up (`true`) or down the stack. At the
-    /// edge of its group the step takes it out of the group; next to another
-    /// group the step takes it in.
-    pub fn move_layer(&mut self, up: bool) -> bool {
-        let from = self.active_layer;
-        let to = if up { from + 1 } else { from.wrapping_sub(1) };
-        let own = self.layers[from].group;
-        if to >= self.layers.len() {
-            // Nothing beyond, but the layer can still step out of its group.
-            if own == 0 {
-                return false;
-            }
-            self.checkpoint_layers();
-            self.layers[from].group = 0;
-            self.prune_groups();
-            self.mark_dirty(self.bounds());
-            return true;
-        }
-        self.checkpoint_layers();
-        let next = self.layers[to].group;
-        if own == next {
-            self.layers.swap(from, to);
-            self.active_layer = to;
-        } else if own != 0 {
-            self.layers[from].group = 0;
-            self.prune_groups();
-        } else {
-            self.layers[from].group = next;
-        }
         self.mark_dirty(self.bounds());
         true
     }
@@ -464,161 +431,6 @@ impl Document {
 
     // --- Layer groups ---------------------------------------------------------
 
-    pub fn groups(&self) -> &[LayerGroup] {
-        &self.groups
-    }
-
-    pub fn group(&self, id: u64) -> Option<&LayerGroup> {
-        self.groups.iter().find(|g| g.id == id)
-    }
-
-    /// Whether a layer is on show, and its opacity (0..=32768), once its
-    /// group's visibility and opacity are counted in.
-    pub fn layer_display(&self, layer: &Layer) -> (bool, u32) {
-        let opacity = layer.props.opacity15();
-        match self.group(layer.group) {
-            // A group blended as one applies its opacity to the combined result.
-            Some(group) if group.blend != BlendMode::Normal => {
-                (layer.props.visible && group.visible && opacity > 0 && group.opacity > 0.0, opacity)
-            }
-            Some(group) => {
-                let faded = (opacity as f32 * group.opacity.clamp(0.0, 1.0)).round() as u32;
-                (layer.props.visible && group.visible && faded > 0, faded)
-            }
-            None => (layer.props.visible && opacity > 0, opacity),
-        }
-    }
-
-    /// Puts the active layer in a new group of its own and returns the
-    /// group's id. A layer already in a group is taken out of it first, which
-    /// is only possible at that group's edge; elsewhere this does nothing.
-    pub fn group_active_layer(&mut self) -> Option<u64> {
-        let index = self.active_layer;
-        let old = self.layers[index].group;
-        if old != 0 {
-            let inside = |i: usize| self.layers.get(i).is_some_and(|l| l.group == old);
-            if index > 0 && inside(index - 1) && inside(index + 1) {
-                return None; // it would split the group in two
-            }
-        }
-        self.checkpoint_layers();
-        let id = self.stamp();
-        let number = self.groups.len() + 1;
-        self.groups.push(LayerGroup { id, name: format!("Grupo {number}"), visible: true, opacity: 1.0, blend: BlendMode::Normal, collapsed: false });
-        self.layers[index].group = id;
-        self.prune_groups();
-        self.mark_dirty(self.bounds());
-        Some(id)
-    }
-
-    /// Dissolves a group; its layers stay where they are.
-    pub fn ungroup(&mut self, id: u64) -> bool {
-        if self.group(id).is_none() {
-            return false;
-        }
-        self.checkpoint_layers();
-        for layer in self.layers.iter_mut().filter(|l| l.group == id) {
-            layer.group = 0;
-        }
-        self.prune_groups();
-        self.mark_dirty(self.bounds());
-        true
-    }
-
-    /// Moves a whole group one step up (`true`) or down the stack, past the
-    /// layer or the group next to it.
-    pub fn move_group(&mut self, id: u64, up: bool) -> bool {
-        let Some(first) = self.layers.iter().position(|l| l.group == id) else { return false };
-        let last = self.layers.iter().rposition(|l| l.group == id).unwrap_or(first);
-        // The neighbouring block: one loose layer, or all of another group.
-        let (from, to) = if up {
-            if last + 1 >= self.layers.len() {
-                return false;
-            }
-            let other = self.layers[last + 1].group;
-            let end = if other == 0 { last + 1 } else { self.layers.iter().rposition(|l| l.group == other).unwrap_or(last + 1) };
-            (first, end)
-        } else {
-            if first == 0 {
-                return false;
-            }
-            let other = self.layers[first - 1].group;
-            let start = if other == 0 { first - 1 } else { self.layers.iter().position(|l| l.group == other).unwrap_or(first - 1) };
-            (start, last)
-        };
-        self.checkpoint_layers();
-        let active = self.layers[self.active_layer].id;
-        let members = last - first + 1;
-        if up {
-            self.layers[from..=to].rotate_left(members);
-        } else {
-            self.layers[from..=to].rotate_right(members);
-        }
-        self.active_layer = self.layers.iter().position(|l| l.id == active).unwrap_or(0);
-        self.mark_dirty(self.bounds());
-        true
-    }
-
-    /// Moves a layer to a gap in the stack and into a group (zero for none), as
-    /// when it is dragged in the layer list. Gap `g` is the place just under
-    /// the layer now at index `g`; gap `len` is the top. Nothing happens, and
-    /// `false` comes back, if the layer would not move or the move would
-    /// leave a group in two pieces.
-    pub fn place_layer(&mut self, from: usize, gap: usize, group: u64) -> bool {
-        if from >= self.layers.len() || gap > self.layers.len() || (group != 0 && self.group(group).is_none()) {
-            return false;
-        }
-        let to = if gap > from { gap - 1 } else { gap };
-        if to == from && self.layers[from].group == group {
-            return false;
-        }
-        let mut layers = self.layers.clone();
-        let mut layer = layers.remove(from);
-        layer.group = group;
-        layers.insert(to, layer);
-        self.restack(layers)
-    }
-
-    /// Moves a whole group to a gap in the stack (see [`Document::place_layer`]).
-    /// The gap may not be inside another group.
-    pub fn place_group(&mut self, id: u64, gap: usize) -> bool {
-        let Some(first) = self.layers.iter().position(|l| l.group == id) else { return false };
-        let last = self.layers.iter().rposition(|l| l.group == id).unwrap_or(first);
-        if gap > self.layers.len() || (first..=last + 1).contains(&gap) {
-            return false; // it is already there
-        }
-        let mut layers = self.layers.clone();
-        let block: Vec<Layer> = layers.drain(first..=last).collect();
-        let at = if gap > last { gap - block.len() } else { gap };
-        layers.splice(at..at, block);
-        self.restack(layers)
-    }
-
-    /// Takes a new order for the layers as one undoable step, unless it would
-    /// leave some group's layers apart from each other.
-    fn restack(&mut self, layers: Vec<Layer>) -> bool {
-        let mut closed: Vec<u64> = Vec::new();
-        let mut previous = 0;
-        for layer in &layers {
-            if layer.group != previous {
-                if closed.contains(&layer.group) {
-                    return false;
-                }
-                if previous != 0 {
-                    closed.push(previous);
-                }
-                previous = layer.group;
-            }
-        }
-        self.checkpoint_layers();
-        let active = self.layers[self.active_layer].id;
-        self.layers = layers;
-        self.active_layer = self.layers.iter().position(|l| l.id == active).unwrap_or(0);
-        self.prune_groups();
-        self.mark_dirty(self.bounds());
-        true
-    }
-
     /// Replaces a group's name, visibility and opacity as one undoable step.
     /// `coalesce` folds the change into the previous step when that step was
     /// also a group edit, so dragging a slider is undone in one go.
@@ -636,19 +448,6 @@ impl Document {
             self.push_undo(HistoryEntry::Groups(before));
         }
         self.mark_dirty(self.bounds());
-    }
-
-    /// Folds or unfolds a group in the layer list. Not an undo step.
-    pub fn set_group_collapsed(&mut self, id: u64, collapsed: bool) {
-        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-            group.collapsed = collapsed;
-        }
-    }
-
-    /// Drops groups that no layer belongs to any more.
-    fn prune_groups(&mut self) {
-        let layers = &self.layers;
-        self.groups.retain(|g| layers.iter().any(|l| l.group == g.id));
     }
 
     /// Flattens the active layer into the one beneath it, baking in the active
@@ -766,30 +565,7 @@ impl Document {
     /// Builds a document from loaded contents, with a clean history.
     pub fn from_snapshot(snapshot: ProjectSnapshot) -> Self {
         let mut doc = Document::from_layers(snapshot.width, snapshot.height, snapshot.layers, snapshot.active_layer);
-        // Groups get fresh ids that cannot clash with anything made later.
-        for mut group in snapshot.groups {
-            let id = doc.stamp();
-            for layer in doc.layers.iter_mut().filter(|l| l.group == group.id) {
-                layer.group = id;
-            }
-            group.id = id;
-            doc.groups.push(group);
-        }
-        // A layer naming a group that is not there, or a group split by other
-        // layers, would break the list: such layers go loose.
-        let known: Vec<u64> = doc.groups.iter().map(|g| g.id).collect();
-        let mut closed: Vec<u64> = Vec::new();
-        let mut previous = 0;
-        for layer in &mut doc.layers {
-            if layer.group != 0 && (!known.contains(&layer.group) || (layer.group != previous && closed.contains(&layer.group))) {
-                layer.group = 0;
-            }
-            if previous != 0 && layer.group != previous {
-                closed.push(previous);
-            }
-            previous = layer.group;
-        }
-        doc.prune_groups();
+        doc.adopt_groups(snapshot.groups);
         doc.paper = snapshot.paper;
         doc.references = snapshot.references;
         doc
@@ -1006,6 +782,20 @@ impl Document {
     /// Flattens `rect` (clipped to the canvas) over the paper into opaque 8-bit
     /// RGBA, row-major, `rect.width() * rect.height() * 4` bytes.
     pub fn render_rgba8(&self, rect: IRect) -> Vec<u8> {
+        self.render_some(rect, false)
+    }
+
+    /// As [`Document::render_rgba8`], but showing only the reference layers.
+    pub fn render_reference_rgba8(&self, rect: IRect) -> Vec<u8> {
+        self.render_some(rect, true)
+    }
+
+    /// Whether any layer is marked as a reference for fills.
+    pub fn has_reference_layers(&self) -> bool {
+        self.layers.iter().any(|layer| layer.props.reference)
+    }
+
+    fn render_some(&self, rect: IRect, only_reference: bool) -> Vec<u8> {
         let rect = rect.intersect(&self.bounds());
         let (w, h) = (rect.width(), rect.height());
         let mut out = vec![255u8; w * h * 4];
@@ -1017,17 +807,22 @@ impl Document {
         let paper8 = [to8(paper[0]), to8(paper[1]), to8(paper[2])];
 
         // Whether each layer shows and how strongly, groups counted in.
-        let display: Vec<(bool, u32)> = self.layers.iter().map(|layer| self.layer_display(layer)).collect();
-        // The group each layer is gathered into, if its group blends as one.
-        let isolated: Vec<Option<Isolated>> = self
+        let display: Vec<(bool, u32)> = self
             .layers
             .iter()
             .map(|layer| {
-                self.group(layer.group).filter(|g| g.blend != BlendMode::Normal).map(|g| Isolated {
-                    id: g.id,
-                    opacity: (g.opacity.clamp(0.0, 1.0) * ONE as f32).round() as u32,
-                    blend: g.blend,
-                })
+                let (shown, opacity) = self.layer_display(layer);
+                (shown && (!only_reference || layer.props.reference), opacity)
+            })
+            .collect();
+        // The groups each layer is gathered into before reaching the picture.
+        let isolated: Vec<Vec<Isolated>> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let mut groups = self.isolation(layer);
+                groups.truncate(MAX_ISOLATED);
+                groups
             })
             .collect();
         let (tx0, tx1) = (rect.x0 as usize / TILE, (rect.x1 as usize - 1) / TILE);
@@ -1041,12 +836,12 @@ impl Document {
                 let y1 = rect.y1.min(oy + TILE as i32);
                 // Each drawable layer's tile, with the tile and opacity of the
                 // layer it is clipped to, if any.
-                let mut tiles: Vec<(Source, &LayerProps, u32, Option<(Source, u32)>, Option<Isolated>)> = Vec::new();
+                let mut tiles: Vec<(Source, &LayerProps, u32, Option<(Source, u32)>, &[Isolated])> = Vec::new();
                 let mut clip_base: Option<(Source, u32)> = None;
                 for (index, layer) in self.layers.iter().enumerate() {
                     let props = &layer.props;
                     let (shown, opacity) = display[index];
-                    let isolated = isolated[index];
+                    let isolated = isolated[index].as_slice();
                     let place = layer.tile_index(tx, ty);
                     let tile = layer.tiles[place].as_deref().map(|tile| Source { tile, mask: layer.mask_tile(place) });
                     if props.clip && index > 0 {
@@ -1072,32 +867,41 @@ impl Document {
                         }
                         let i = row + (x - ox) as usize;
                         let mut c = [paper[0], paper[1], paper[2], ONE];
-                        // A group blended as one gathers its layers apart, then
-                        // goes over the picture when the next thing comes up.
-                        let mut apart: Option<(Isolated, [u32; 4])> = None;
-                        let flush = |c: &mut [u32; 4], apart: &mut Option<(Isolated, [u32; 4])>| {
-                            if let Some((group, gathered)) = apart.take() {
-                                blend_over(c, gathered.map(|v| v as u16), group.opacity, group.blend);
-                            }
-                        };
-                        for (tile, props, opacity, base, isolated) in &tiles {
+                        // Groups that blend as one gather their layers apart, one
+                        // inside another, and go over what is beneath them when
+                        // the next thing that is not theirs comes up.
+                        let mut open = [(NO_GROUP, [0u32; 4]); MAX_ISOLATED];
+                        let mut depth = 0;
+                        for (tile, props, opacity, base, groups) in &tiles {
                             let mut opacity = tile.shown(*opacity, i);
                             if let Some((base, base_opacity)) = base {
                                 let under = base.shown(*base_opacity, i);
                                 opacity = (opacity * ((base.tile.0[i][3] as u32 * under) >> 15)) >> 15;
                             }
-                            if apart.as_ref().map(|(group, _)| group.id) != isolated.map(|group| group.id) {
-                                flush(&mut c, &mut apart);
+                            // Close the groups this layer is not in; open the ones it is.
+                            let mut shared = 0;
+                            while shared < depth && shared < groups.len() && open[shared].0.id == groups[shared].id {
+                                shared += 1;
                             }
-                            match isolated {
-                                Some(group) => {
-                                    let (_, gathered) = apart.get_or_insert((*group, [0; 4]));
-                                    blend_over(gathered, tile.tile.0[i], opacity, props.blend);
-                                }
-                                None => blend_over(&mut c, tile.tile.0[i], opacity, props.blend),
+                            while depth > shared {
+                                depth -= 1;
+                                let (group, gathered) = open[depth];
+                                let under = if depth == 0 { &mut c } else { &mut open[depth - 1].1 };
+                                blend_over(under, gathered.map(|v| v as u16), group.opacity, group.blend);
                             }
+                            for group in &groups[shared..] {
+                                open[depth] = (*group, [0; 4]);
+                                depth += 1;
+                            }
+                            let onto = if depth == 0 { &mut c } else { &mut open[depth - 1].1 };
+                            blend_over(onto, tile.tile.0[i], opacity, props.blend);
                         }
-                        flush(&mut c, &mut apart);
+                        while depth > 0 {
+                            depth -= 1;
+                            let (group, gathered) = open[depth];
+                            let under = if depth == 0 { &mut c } else { &mut open[depth - 1].1 };
+                            blend_over(under, gathered.map(|v| v as u16), group.opacity, group.blend);
+                        }
                         out[o] = to8(c[0]);
                         out[o + 1] = to8(c[1]);
                         out[o + 2] = to8(c[2]);

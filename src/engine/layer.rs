@@ -172,6 +172,9 @@ pub struct LayerProps {
     /// Clipping mask: the layer shows only where the nearest unclipped layer
     /// beneath it has pixels.
     pub clip: bool,
+    /// The layer is one the fill and the magic wand can be told to go by,
+    /// typically the line art, whatever layer is being painted on.
+    pub reference: bool,
 }
 
 impl LayerProps {
@@ -183,6 +186,7 @@ impl LayerProps {
             blend: BlendMode::Normal,
             alpha_lock: false,
             clip: false,
+            reference: false,
         }
     }
 
@@ -199,6 +203,8 @@ impl LayerProps {
 pub struct LayerGroup {
     /// Unique within a document; never zero.
     pub id: u64,
+    /// The group this one is inside, or zero for none.
+    pub parent: u64,
     pub name: String,
     pub visible: bool,
     /// 0..=1, on top of each layer's own opacity.

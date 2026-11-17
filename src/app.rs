@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use sharkpaint::engine::{
     brush_preview, write_png, BlendMode, BrushPreset, BrushSettings, BrushTip, Document, IRect,
-    LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
+    FillSource, LayerTransform, Reference, SelectMode, Shape as Figure, StrokePoint, Symmetry, TextFont, TextSpec, BUILTIN_FONT,
     PROJECT_EXTENSION,
     font_names, read_psd, render_text,
 };
@@ -64,12 +64,11 @@ enum Tool {
     Seleccion,
     Forma,
     Texto,
-    Simetria,
 }
 
 impl Tool {
     /// (tool, icon, name, shortcut letter) in tool bar order.
-    const ALL: [(Tool, &'static str, &'static str, &'static str); 11] = [
+    const ALL: [(Tool, &'static str, &'static str, &'static str); 10] = [
         (Tool::Pincel, "pincel", "Pincel", "B"),
         (Tool::Borrador, "borrador", "Borrador", "E"),
         (Tool::Difuminar, "difuminar", "Difuminar", "D"),
@@ -80,7 +79,6 @@ impl Tool {
         (Tool::Seleccion, "seleccion", "Selección", "S"),
         (Tool::Forma, "forma", "Formas", "U"),
         (Tool::Texto, "texto", "Texto", "A"),
-        (Tool::Simetria, "simetria", "Simetría", "Y"),
     ];
 
     fn name(self) -> &'static str {
@@ -198,47 +196,41 @@ fn list_drop(dragged: Dragged, pointer: Pos2, rows: &[(Rect, ListRow)], doc: &Do
         .find(|(rect, _)| (rect.top() - 1.0..=rect.bottom() + 1.0).contains(&pointer.y))
         .unwrap_or(if pointer.y < first.0.top() { first } else { last });
     let upper = pointer.y < rect.center().y;
-    let bottom_of = |id: u64| layers.iter().position(|l| l.group == id);
-    let top_of = |id: u64| layers.iter().rposition(|l| l.group == id);
-    match (dragged, row) {
-        // A layer dropped on a heading goes to the top of that group.
-        (Dragged::Layer(_), ListRow::Heading(id)) => Some(ListDrop { gap: top_of(id)? + 1, group: id, line_y: rect.bottom() }),
-        (Dragged::Layer(_), ListRow::Layer(i)) => {
-            let own = layers[i].group;
-            let lowest = own != 0 && (i == 0 || layers[i - 1].group != own);
-            // Under a group's last layer it may stay in or come out: towards
-            // the left edge of the list it comes out.
-            let leaves = !upper && lowest && pointer.x < list_left + 44.0;
-            Some(ListDrop {
-                gap: if upper { i + 1 } else { i },
-                group: if leaves { 0 } else { own },
-                line_y: if upper { rect.top() } else { rect.bottom() },
-            })
+    let parent = |group: u64| doc.group(group).map_or(0, |g| g.parent);
+    let target = match row {
+        ListRow::Heading(id) => {
+            let (_, top) = doc.group_range(id)?;
+            if upper && matches!(dragged, Dragged::Group(_)) {
+                // A group over the top half of a heading goes beside that group, above it.
+                ListDrop { gap: top + 1, group: parent(id), line_y: rect.top() }
+            } else {
+                // Anything else dropped on a heading goes into the group, at its top.
+                ListDrop { gap: top + 1, group: id, line_y: rect.bottom() }
+            }
         }
-        (Dragged::Group(id), row) => {
-            let over = match row {
-                ListRow::Heading(other) => other,
-                ListRow::Layer(i) => layers[i].group,
-            };
-            if over == id {
-                return None;
+        ListRow::Layer(i) if upper => ListDrop { gap: i + 1, group: layers[i].group, line_y: rect.top() },
+        ListRow::Layer(i) => {
+            // Under the last layer of one or more groups, the drop can stay in
+            // them or come out: the further left the pointer, the further out.
+            let depth = ((pointer.x - (list_left + 28.0)) / 12.0).floor().max(0.0) as usize;
+            let mut group = layers[i].group;
+            while group != 0 && doc.group_depth(group) > depth && doc.group_range(group).is_some_and(|(lowest, _)| lowest == i) {
+                group = parent(group);
             }
-            if over == 0 {
-                let ListRow::Layer(i) = row else { return None };
-                return Some(ListDrop { gap: if upper { i + 1 } else { i }, group: 0, line_y: if upper { rect.top() } else { rect.bottom() } });
-            }
-            // Over another group: above all of it, or below all of it.
-            if matches!(row, ListRow::Heading(_)) && upper {
-                return Some(ListDrop { gap: top_of(over)? + 1, group: 0, line_y: rect.top() });
-            }
-            let lowest = bottom_of(over)?;
-            let line_y = rows
-                .iter()
-                .find(|(_, r)| matches!(r, ListRow::Layer(i) if *i == lowest))
-                .map_or(rect.bottom(), |(rect, _)| rect.bottom());
-            Some(ListDrop { gap: lowest, group: 0, line_y })
+            ListDrop { gap: i, group, line_y: rect.bottom() }
+        }
+    };
+    if let Dragged::Group(id) = dragged {
+        // A group cannot be dropped inside itself.
+        let over = match row {
+            ListRow::Heading(other) => other,
+            ListRow::Layer(i) => layers[i].group,
+        };
+        if doc.group_within(over, id) || doc.group_within(target.group, id) {
+            return None;
         }
     }
+    Some(target)
 }
 
 /// Text rendered for placing on the canvas.
@@ -502,7 +494,8 @@ pub struct SharkPaintApp {
     /// How different a pixel may be and still be filled (0..=1).
     fill_tolerance: f32,
     /// The fill looks at the whole picture rather than only the active layer.
-    fill_all_layers: bool,
+    /// Which layers the fill goes by.
+    fill_source: FillSource,
     /// Canvas position where a layer move began.
     move_origin: Option<Pos2>,
     /// The eyedropper is being dragged.
@@ -554,7 +547,7 @@ pub struct SharkPaintApp {
     /// The magic wand stops at the edges of the area clicked.
     select_contiguous: bool,
     /// The magic wand looks at the whole picture rather than the active layer.
-    select_all_layers: bool,
+    select_source: FillSource,
     /// What Copy or Cut last took: where it was on the canvas and its pixels.
     clip: Option<(IRect, Vec<u8>)>,
     /// The brushes on offer and the tip shapes they use.
@@ -657,10 +650,18 @@ pub struct SharkPaintApp {
     symmetry_center: Option<Pos2>,
     /// The pointer is moving the symmetry lines.
     symmetry_dragging: bool,
+    /// The next press on the canvas places the symmetry lines, whatever tool is in hand.
+    symmetry_placing: bool,
     /// When and at which document revision the recovery file was last written.
     autosave_time: f64,
     autosave_revision: u64,
     autosave_thread: Option<std::thread::JoinHandle<()>>,
+    /// Minutes between automatic saves of the project to its own file; zero for none.
+    autosave_minutes: u32,
+    /// When the project was last saved or opened, to time the next automatic save.
+    last_save: std::time::Instant,
+    /// An automatic save of the project under way, with the revision it holds.
+    project_save: Option<(std::thread::JoinHandle<std::io::Result<()>>, u64)>,
     /// A recovery file from an earlier session, waiting for the user's answer.
     recovery_prompt: Option<PathBuf>,
 }
@@ -693,7 +694,7 @@ impl SharkPaintApp {
                 ..BrushSettings::round(60.0)
             },
             fill_tolerance: 0.15,
-            fill_all_layers: true,
+            fill_source: FillSource::Reference,
             move_origin: None,
             picking: false,
             xform: None,
@@ -721,7 +722,7 @@ impl SharkPaintApp {
             select_mode: SelectMode::Replace,
             select_tolerance: 0.15,
             select_contiguous: true,
-            select_all_layers: true,
+            select_source: FillSource::Reference,
             clip: None,
             library: BrushLibrary { brushes: Vec::new(), tips: Vec::new(), papers: Vec::new() },
             brush_index: Some(1),
@@ -776,9 +777,13 @@ impl SharkPaintApp {
             symmetry_horizontal: false,
             symmetry_center: None,
             symmetry_dragging: false,
+            symmetry_placing: false,
             autosave_time: 0.0,
             autosave_revision: 0,
             autosave_thread: None,
+            autosave_minutes: settings::DEFAULT_AUTOSAVE_MINUTES,
+            last_save: std::time::Instant::now(),
+            project_save: None,
             recovery_prompt: None,
         };
         app.library = BrushLibrary::load();
@@ -786,6 +791,7 @@ impl SharkPaintApp {
         app.brush_index = app.library.brushes.iter().position(|b| b.settings == app.brush);
         app.brush_source = app.brush_index;
         let stored = Settings::load();
+        app.autosave_minutes = stored.autosave_minutes;
         app.palette = stored.palette.clone();
         app.recent = stored.recent.clone();
         for (tool, key) in &stored.tool_keys {
@@ -817,6 +823,7 @@ impl SharkPaintApp {
 
     fn current_settings(&self) -> Settings {
         Settings {
+            autosave_minutes: self.autosave_minutes,
             palette: self.palette.clone(),
             recent: self.recent.clone(),
             tool_keys: Tool::ALL
@@ -869,6 +876,49 @@ impl SharkPaintApp {
         self.autosave_thread = Some(std::thread::spawn(move || {
             let _ = snapshot.save(&path);
         }));
+    }
+
+    /// Saves the project to its own file every so often, on another thread,
+    /// when it has a file and the user has not switched this off.
+    fn autosave_project(&mut self, ctx: &egui::Context) {
+        if let Some((thread, _)) = &self.project_save {
+            if thread.is_finished() {
+                self.finish_project_save();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            return;
+        }
+        let Some(path) = self.path.clone().filter(|_| self.autosave_minutes > 0) else { return };
+        if !self.modified() || self.doc.is_stroking() {
+            return;
+        }
+        let every = std::time::Duration::from_secs(self.autosave_minutes as u64 * 60);
+        let waited = self.last_save.elapsed();
+        if waited < every {
+            ctx.request_repaint_after((every - waited).min(std::time::Duration::from_secs(30)));
+            return;
+        }
+        let snapshot = self.doc.snapshot();
+        let revision = self.doc.revision();
+        self.last_save = std::time::Instant::now();
+        self.project_save = Some((std::thread::spawn(move || snapshot.save(&path)), revision));
+    }
+
+    /// Waits for an automatic save under way and takes note of how it went.
+    fn finish_project_save(&mut self) {
+        let Some((thread, revision)) = self.project_save.take() else { return };
+        match thread.join() {
+            Ok(Ok(())) => {
+                self.saved_revision = revision;
+                if self.doc.revision() == revision {
+                    self.drop_recovery();
+                }
+                self.status = "Proyecto guardado automáticamente.".into();
+            }
+            Ok(Err(e)) => self.status = format!("No se pudo guardar automáticamente: {e}"),
+            Err(_) => self.status = "No se pudo guardar automáticamente.".into(),
+        }
     }
 
     /// Removes the recovery file: the drawing is safely saved or was let go.
@@ -933,6 +983,25 @@ impl SharkPaintApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                ui.strong("Autoguardado");
+                ui.horizontal(|ui| {
+                    ui.label("Guardar el proyecto");
+                    let shown = match self.autosave_minutes {
+                        0 => "nunca (solo a mano)".to_owned(),
+                        1 => "cada minuto".to_owned(),
+                        n => format!("cada {n} minutos"),
+                    };
+                    egui::ComboBox::from_id_salt("autoguardado").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.autosave_minutes, 0, "nunca (solo a mano)");
+                        ui.selectable_value(&mut self.autosave_minutes, 1, "cada minuto");
+                        for minutes in [2, 5, 10, 15, 30] {
+                            ui.selectable_value(&mut self.autosave_minutes, minutes, format!("cada {minutes} minutos"));
+                        }
+                    });
+                });
+                ui.label("Se guarda en el propio archivo del proyecto, si ya lo tiene y hay cambios.");
+                ui.label("Un dibujo que aún no has guardado sigue protegido por la copia de recuperación.");
+                ui.add_space(8.0);
                 ui.strong("Atajos de las herramientas");
                 ui.label("Si eliges una tecla que ya usa otra herramienta, se intercambian.");
                 ui.add_space(4.0);
@@ -977,6 +1046,8 @@ impl SharkPaintApp {
     }
 
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
+        self.finish_project_save();
+        self.last_save = std::time::Instant::now();
         self.saved_revision = doc.revision();
         self.doc = doc;
         self.path = path;
@@ -1022,6 +1093,8 @@ impl SharkPaintApp {
     /// Returns whether the document is now saved.
     fn save_project(&mut self, ask_path: bool) -> bool {
         self.doc.end_stroke();
+        // Two saves must not write the same file at once.
+        self.finish_project_save();
         let path = match (&self.path, ask_path) {
             (Some(path), false) => path.clone(),
             _ => {
@@ -1049,6 +1122,7 @@ impl SharkPaintApp {
             Ok(()) => {
                 self.status = format!("Guardado: {}", path.display());
                 self.saved_revision = self.doc.revision();
+                self.last_save = std::time::Instant::now();
                 self.path = Some(path);
                 self.drop_recovery();
                 true
@@ -1471,9 +1545,6 @@ impl SharkPaintApp {
                 if item(ui, "Ajustes del pincel", "F5") {
                     commands.push(Command::ToggleBrushWindow);
                 }
-                if ui.add(egui::Button::new("Simetría").selected(self.symmetry)).clicked() {
-                    commands.push(Command::ToggleSymmetry);
-                }
                 if item(ui, "Referencias", "F6") {
                     commands.push(Command::ToggleReferences);
                 }
@@ -1482,6 +1553,41 @@ impl SharkPaintApp {
                 }
                 if item(ui, "Pantalla completa", "F11") {
                     commands.push(Command::Fullscreen);
+                }
+            });
+            ui.menu_button("Simetría", |ui| {
+                if ui
+                    .add(egui::Button::new("Activa").selected(self.symmetry))
+                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo")
+                    .clicked()
+                {
+                    commands.push(Command::ToggleSymmetry);
+                }
+                ui.separator();
+                let both = (self.symmetry_vertical, self.symmetry_horizontal);
+                for (axes, name, tip) in [
+                    ((true, false), "Eje vertical", "Espejo de izquierda a derecha"),
+                    ((false, true), "Eje horizontal", "Espejo de arriba abajo"),
+                    ((true, true), "Los dos ejes", "Cuatro copias de cada trazo"),
+                ] {
+                    if ui.add(egui::Button::new(name).selected(self.symmetry && both == axes)).on_hover_text(tip).clicked() {
+                        (self.symmetry_vertical, self.symmetry_horizontal) = axes;
+                        self.symmetry = true;
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button("Colocar ejes")
+                    .on_hover_text("Después, haz clic o arrastra sobre el lienzo para ponerlos donde quieras")
+                    .clicked()
+                {
+                    self.symmetry = true;
+                    self.symmetry_placing = true;
+                    self.status = "Simetría: haz clic o arrastra sobre el lienzo para colocar los ejes.".into();
+                }
+                if ui.button("Centrar en el lienzo").clicked() {
+                    self.symmetry_center = None;
+                    self.symmetry_placing = false;
                 }
             });
             ui.menu_button("Ayuda", |ui| {
@@ -1732,6 +1838,26 @@ impl SharkPaintApp {
                     let image = ColorImage::from_rgba_unmultiplied([reference.width, reference.height], &reference.rgba);
                     self.ref_texture = Some((key, ui.ctx().load_texture("referencia", image, TextureOptions::LINEAR)));
                 }
+                // Zoom within reach of a pen, which has no wheel.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let zoom_by = |factor: f32, view: &mut (Vec2, f32)| {
+                        let old = view.1;
+                        view.1 = (old * factor).clamp(0.2, 40.0);
+                        // What is in the middle of the window stays there.
+                        view.0 *= view.1 / old;
+                    };
+                    if ui.button("−").on_hover_text("Alejar").clicked() {
+                        zoom_by(1.0 / 1.25, &mut self.ref_view);
+                    }
+                    if ui.button("+").on_hover_text("Acercar").clicked() {
+                        zoom_by(1.25, &mut self.ref_view);
+                    }
+                    if ui.button("Ajustar").on_hover_text("Ver la imagen entera (también con doble clic)").clicked() {
+                        self.ref_view = (Vec2::ZERO, 1.0);
+                    }
+                    ui.weak(format!("{:.0} %", self.ref_view.1 * 100.0));
+                });
                 let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
                 let area = response.rect;
                 painter.rect_filled(area, 2.0, Color32::from_gray(24));
@@ -2483,8 +2609,8 @@ impl SharkPaintApp {
                     ui.label("Tolerancia");
                     ui.add(egui::Slider::new(&mut self.fill_tolerance, 0.0..=1.0).custom_formatter(percent));
                 });
-                ui.checkbox(&mut self.fill_all_layers, "Tener en cuenta todas las capas")
-                    .on_hover_text("El relleno se detiene en las líneas de cualquier capa visible,\nno solo en las de la capa activa");
+                ui.set_width(248.0);
+                self.fill_source = self.source_picker(ui, self.fill_source);
                 ui.label("Rellena la capa activa con el color elegido.");
                 return;
             }
@@ -2532,52 +2658,6 @@ impl SharkPaintApp {
                 self.text_panel(ui);
                 return;
             }
-            Tool::Simetria => {
-                ui.set_width(248.0);
-                ui.checkbox(&mut self.symmetry, "Simetría activa")
-                    .on_hover_text("Los trazos del pincel y del borrador se repiten en espejo");
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    let both = (self.symmetry_vertical, self.symmetry_horizontal);
-                    for (axes, name, tip) in [
-                        ((true, false), "Vertical", "Espejo de izquierda a derecha"),
-                        ((false, true), "Horizontal", "Espejo de arriba abajo"),
-                        ((true, true), "Las dos", "Cuatro copias de cada trazo"),
-                    ] {
-                        if ui.selectable_label(both == axes, name).on_hover_text(tip).clicked() {
-                            (self.symmetry_vertical, self.symmetry_horizontal) = axes;
-                            self.symmetry = true;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                let mut center = self.symmetry_point();
-                let before = center;
-                let (width, height) = (self.doc.width as f32, self.doc.height as f32);
-                egui::Grid::new("simetria").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("Eje vertical en");
-                    ui.add_enabled(
-                        self.symmetry_vertical,
-                        egui::DragValue::new(&mut center.x).range(0.0..=width).fixed_decimals(0).suffix(" px"),
-                    );
-                    ui.end_row();
-                    ui.label("Eje horizontal en");
-                    ui.add_enabled(
-                        self.symmetry_horizontal,
-                        egui::DragValue::new(&mut center.y).range(0.0..=height).fixed_decimals(0).suffix(" px"),
-                    );
-                    ui.end_row();
-                });
-                if center != before {
-                    self.symmetry_center = Some(center);
-                }
-                if ui.button("Centrar en el lienzo").clicked() {
-                    self.symmetry_center = None;
-                }
-                ui.label("Haz clic o arrastra sobre el lienzo para colocar los ejes donde quieras.");
-                ui.label("Después vuelve al pincel: la simetría sigue activa hasta que la apagues.");
-                return;
-            }
             Tool::Seleccion => {
                 ui.horizontal_wrapped(|ui| {
                     for (shape, name) in SelectShape::ALL {
@@ -2603,7 +2683,7 @@ impl SharkPaintApp {
                     });
                     ui.checkbox(&mut self.select_contiguous, "Solo la zona tocada")
                         .on_hover_text("Desmarcado, toma ese color en todo el lienzo");
-                    ui.checkbox(&mut self.select_all_layers, "Tener en cuenta todas las capas");
+                    self.select_source = self.source_picker(ui, self.select_source);
                     ui.label("Haz clic sobre un color para seleccionar su zona.");
                 } else {
                     ui.label("Arrastra sobre el lienzo para seleccionar. Mayús: cuadrado o círculo.");
@@ -2701,7 +2781,7 @@ impl SharkPaintApp {
                     ui.end_row();
                 });
                 ui.checkbox(&mut self.symmetry, "Simetría")
-                    .on_hover_text("Repite cada trazo en espejo. Los ejes se colocan con la herramienta Simetría.");
+                    .on_hover_text("Repite cada trazo en espejo. Los ejes se eligen y se colocan desde el menú Simetría.");
             }
             egui::CollapsingHeader::new("Presión del lápiz").default_open(true).show(ui, |ui| {
                 let b = self.active_brush();
@@ -2778,19 +2858,24 @@ impl SharkPaintApp {
             if tool(ui, "duplicar", true, "Duplicar capa (Ctrl+J)") {
                 commands.push(Command::LayerDuplicate);
             }
-            if tool(ui, "carpeta", chosen_group.is_none(), "Agrupar: pone la capa en un grupo nuevo") {
+            let tip = if chosen_group.is_some() {
+                "Agrupar: mete este grupo dentro de un grupo nuevo"
+            } else {
+                "Agrupar: pone la capa en un grupo nuevo"
+            };
+            if tool(ui, "carpeta", true, tip) {
                 commands.push(Command::LayerGroup);
             }
             match chosen_group {
                 // A group is chosen: the arrows move all of it.
                 Some(id) => {
-                    if tool(ui, "subir", true, "Subir el grupo") {
+                    if tool(ui, "subir", true, "Subir el grupo (en el borde del grupo que lo contiene, sale de él)") {
                         self.doc.move_group(id, true);
                     }
-                    if tool(ui, "bajar", true, "Bajar el grupo") {
+                    if tool(ui, "bajar", true, "Bajar el grupo (en el borde del grupo que lo contiene, sale de él)") {
                         self.doc.move_group(id, false);
                     }
-                    if tool(ui, "quitar", true, "Desagrupar: las capas se quedan") {
+                    if tool(ui, "quitar", true, "Desagrupar: las capas y los grupos de dentro se quedan") {
                         self.doc.ungroup(id);
                         self.active_group = None;
                     }
@@ -2912,6 +2997,8 @@ impl SharkPaintApp {
         });
         ui.checkbox(&mut props.alpha_lock, "Bloquear transparencia")
             .on_hover_text("Pinta solo sobre lo que ya está dibujado en la capa");
+        ui.checkbox(&mut props.reference, "Capa de referencia")
+            .on_hover_text("El relleno y la varita mágica pueden guiarse solo por las capas de referencia.\nMarca aquí tu lineart y pinta en otra capa.");
         ui.add_enabled_ui(active > 0, |ui| {
             ui.checkbox(&mut props.clip, "Recortar a la capa inferior")
                 .on_hover_text("La capa solo se ve donde la capa de debajo tiene dibujo.\nÚtil para sombras y luces sin salirse del color base.");
@@ -2970,13 +3057,29 @@ impl SharkPaintApp {
             ui.spacing_mut().item_spacing.y = 2.0;
             let layers = self.doc.layers();
             let mut rows: Vec<(Rect, ListRow)> = Vec::new();
+            // Each layer's groups, the outermost first.
+            let chain_of = |layer: &sharkpaint::engine::Layer| {
+                let mut chain = self.doc.group_chain(layer.group);
+                chain.reverse();
+                chain
+            };
             for (i, layer) in layers.iter().enumerate().rev() {
-                let group = self.doc.group(layer.group);
-                // The heading goes above the group's topmost layer.
-                if let Some(group) = group.filter(|g| layers.get(i + 1).is_none_or(|above| above.group != g.id)) {
-                    let ink = if group.visible { text } else { faint };
+                let chain = chain_of(layer);
+                let above = layers.get(i + 1).map(chain_of).unwrap_or_default();
+                let shared = chain.iter().zip(&above).take_while(|(a, b)| a == b).count();
+                let folded = |id: &u64| self.doc.group(*id).is_some_and(|g| g.collapsed);
+                let hidden = |id: &u64| self.doc.group(*id).is_some_and(|g| !g.visible);
+                // A heading goes above the topmost layer of each group that
+                // starts here, unless a group around it is folded.
+                for (depth, id) in chain.iter().enumerate().skip(shared) {
+                    if chain[..depth].iter().any(folded) {
+                        break;
+                    }
+                    let Some(group) = self.doc.group(*id) else { continue };
+                    let ink = if group.visible && !chain[..depth].iter().any(hidden) { text } else { faint };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.add_space(12.0 * depth as f32);
                         let (eye, tip) = if group.visible { ("ojo", "Ocultar grupo") } else { ("ojoCerrado", "Mostrar grupo") };
                         let button = egui::Button::image(icon(eye, 16.0, ink)).frame(false).min_size(Vec2::new(26.0, 26.0));
                         if ui.add(button).on_hover_text(tip).clicked() {
@@ -3007,7 +3110,7 @@ impl SharkPaintApp {
                         );
                         let folder = Rect::from_center_size(Pos2::new(row.left() + 30.0, row.center().y), Vec2::splat(16.0));
                         icon("carpeta", 16.0, ink).paint_at(ui, folder);
-                        let members = layers.iter().filter(|l| l.group == group.id).count();
+                        let members = self.doc.group_range(group.id).map_or(0, |(first, last)| last - first + 1);
                         let mut label = group.name.clone();
                         if group.collapsed {
                             label.push_str(&format!(" ({members})"));
@@ -3035,18 +3138,16 @@ impl SharkPaintApp {
                         }
                     });
                 }
-                if group.is_some_and(|g| g.collapsed) {
+                if chain.iter().any(folded) {
                     continue;
                 }
                 let props = &layer.props;
-                let in_group = group.is_some();
-                let shown = props.visible && group.is_none_or(|g| g.visible);
+                let shown = props.visible && !chain.iter().any(hidden);
                 let ink = if shown { text } else { faint };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if in_group {
-                        ui.add_space(12.0);
-                    }
+                    // Set in once for every group the layer is in.
+                    ui.add_space(12.0 * chain.len() as f32);
                     let (eye, tip) = if props.visible {
                         ("ojo", "Ocultar capa")
                     } else {
@@ -3141,6 +3242,14 @@ impl SharkPaintApp {
                         );
                         icon("candado", 14.0, ink).paint_at(ui, at);
                     }
+                    if props.reference {
+                        let taken = props.alpha_lock as u8 + layer.text.is_some() as u8;
+                        let at = Rect::from_center_size(
+                            Pos2::new(row.right() - 14.0 - 18.0 * taken as f32, row.center().y),
+                            Vec2::splat(14.0),
+                        );
+                        icon("referencia", 14.0, ink).paint_at(ui, at);
+                    }
                     if layer.text.is_some() {
                         // A text layer wears the text tool's mark.
                         let x = row.right() - if props.alpha_lock { 32.0 } else { 14.0 };
@@ -3155,7 +3264,7 @@ impl SharkPaintApp {
                     // What is being dragged is marked, with its whole group.
                     let carried = match dragging {
                         Some(Dragged::Layer(id)) => id == layer.id,
-                        Some(Dragged::Group(id)) => id == layer.group,
+                        Some(Dragged::Group(id)) => chain.contains(&id),
                         None => false,
                     };
                     if carried {
@@ -3170,7 +3279,7 @@ impl SharkPaintApp {
                 let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.x_range().contains(pos.x));
                 drop = pointer.and_then(|pos| list_drop(dragged, pos, &rows, &self.doc, list.left()));
                 if let Some(target) = &drop {
-                    let from = list.left() + if target.group != 0 { 40.0 } else { 28.0 };
+                    let from = list.left() + 28.0 + 12.0 * self.doc.group_depth(target.group) as f32;
                     ui.painter().line_segment(
                         [Pos2::new(from, target.line_y), Pos2::new(list.right() - 2.0, target.line_y)],
                         Stroke::new(2.0, Color32::from_rgb(111, 227, 240)),
@@ -3192,7 +3301,7 @@ impl SharkPaintApp {
                         }
                     }
                     (Dragged::Group(id), Some(target)) => {
-                        self.doc.place_group(id, target.gap);
+                        self.doc.place_group(id, target.gap, target.group);
                     }
                     _ => {}
                 }
@@ -3630,6 +3739,13 @@ impl SharkPaintApp {
                         continue;
                     }
                     let c = to_canvas(*pos);
+                    if self.symmetry_placing && !alt {
+                        // Press to put the lines there; keep holding to move them.
+                        self.symmetry = true;
+                        self.symmetry_center = Some(c.round());
+                        self.symmetry_dragging = true;
+                        continue;
+                    }
                     if self.tool == Tool::Texto && !alt {
                         // A new text goes where the press is; one being rewritten
                         // is taken hold of and moved. Keep holding to move either.
@@ -3670,21 +3786,14 @@ impl SharkPaintApp {
                     }
                     if self.tool == Tool::Seleccion && !alt && self.select_shape == SelectShape::Varita {
                         let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
-                        self.doc.select_similar(
+                        self.doc.select_similar_from(
                             x,
                             y,
                             self.select_tolerance,
-                            self.select_all_layers,
+                            self.select_source,
                             self.select_contiguous,
                             self.select_mode,
                         );
-                        continue;
-                    }
-                    if self.tool == Tool::Simetria && !alt {
-                        // Press to put the lines there; keep holding to move them.
-                        self.symmetry = true;
-                        self.symmetry_center = Some(c.round());
-                        self.symmetry_dragging = true;
                         continue;
                     }
                     if matches!(self.tool, Tool::Seleccion | Tool::Forma) && !alt {
@@ -3704,7 +3813,7 @@ impl SharkPaintApp {
                         Tool::Relleno => {
                             let (x, y) = (c.x.floor() as i32, c.y.floor() as i32);
                             self.note_color();
-                            self.doc.flood_fill(x, y, self.color, self.fill_tolerance, self.fill_all_layers);
+                            self.doc.flood_fill_from(x, y, self.color, self.fill_tolerance, self.fill_source);
                             continue;
                         }
                         Tool::Mover => {
@@ -3788,6 +3897,10 @@ impl SharkPaintApp {
                 | Event::PointerGone => {
                     if self.text_dragging || self.symmetry_dragging {
                         self.text_dragging = false;
+                        // The lines are placed: back to whatever tool is in hand.
+                        if self.symmetry_dragging {
+                            self.symmetry_placing = false;
+                        }
                         self.symmetry_dragging = false;
                         continue;
                     }
@@ -3916,7 +4029,7 @@ impl SharkPaintApp {
         if let Some(y) = lines.horizontal {
             draw_guide(screen(0.0, y), screen(doc_size.x, y));
         }
-        if self.symmetry && self.tool == Tool::Simetria {
+        if self.symmetry && self.symmetry_placing {
             let center = self.symmetry_point();
             let at = screen(center.x, center.y);
             painter.circle_filled(at, 5.0, Color32::from_rgb(111, 227, 240));
@@ -4030,7 +4143,7 @@ impl SharkPaintApp {
         if let Some(pos) = hover.filter(|p| over_canvas(*p)) {
             if navigating {
                 ctx.set_cursor_icon(if rotating { CursorIcon::Alias } else { CursorIcon::Grab });
-            } else if alt || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto | Tool::Simetria) {
+            } else if alt || self.symmetry_placing || matches!(self.tool, Tool::Cuentagotas | Tool::Relleno | Tool::Seleccion | Tool::Forma | Tool::Texto) {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.tool == Tool::Mover {
                 ctx.set_cursor_icon(CursorIcon::Move);
@@ -4067,6 +4180,22 @@ impl SharkPaintApp {
             vertical: self.symmetry_vertical.then_some(center.x),
             horizontal: self.symmetry_horizontal.then_some(center.y),
         }
+    }
+
+    /// The choice of which layers a fill or the magic wand goes by.
+    fn source_picker(&self, ui: &mut egui::Ui, current: FillSource) -> FillSource {
+        let mut chosen = current;
+        ui.label("Guiarse por:");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut chosen, FillSource::Layer, "Capa actual").on_hover_text("Solo cuenta lo que hay en la capa en la que trabajas");
+            ui.selectable_value(&mut chosen, FillSource::Reference, "Capas de referencia")
+                .on_hover_text("Solo cuentan las capas marcadas como referencia (por ejemplo, el lineart),\nsin importar el color que haya en las demás");
+            ui.selectable_value(&mut chosen, FillSource::All, "Todas las capas").on_hover_text("Cuentan las líneas y el color de cualquier capa visible");
+        });
+        if chosen == FillSource::Reference && !self.doc.has_reference_layers() {
+            ui.weak("Aún no hay ninguna capa de referencia: márcala en el panel de capas. Mientras tanto se guía por todas.");
+        }
+        chosen
     }
 
     /// What every change of canvas size leaves to do: show all of it again.
@@ -4294,10 +4423,17 @@ impl SharkPaintApp {
             Command::LayerMerge => {
                 self.doc.merge_down();
             }
-            Command::LayerGroup => match self.doc.group_active_layer() {
-                Some(id) => self.active_group = Some(id),
-                None => self.status = "Lleva la capa al borde de su grupo para sacarla a un grupo nuevo.".into(),
-            },
+            Command::LayerGroup => {
+                // With a group chosen, the new group goes around it; otherwise
+                // around the active layer.
+                let made = match self.active_group.filter(|id| self.doc.group(*id).is_some()) {
+                    Some(id) => self.doc.group_group(id),
+                    None => self.doc.group_active_layer(),
+                };
+                if let Some(id) = made {
+                    self.active_group = Some(id);
+                }
+            }
             Command::Fit => self.fit_pending = true,
             Command::ActualSize => {
                 self.view.zoom = 1.0;
@@ -4466,6 +4602,7 @@ impl eframe::App for SharkPaintApp {
         }
         self.recovery_window(&ctx);
         self.autosave(&ctx);
+        self.autosave_project(&ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             self.store_settings();
         }

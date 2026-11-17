@@ -26,10 +26,12 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   los redondos (nombre, tamaño, dureza, espaciado, ángulo, redondez y si la presión
   controla el tamaño o el flujo). El resto de dinámicas de Photoshop no se trasladan.
 - Capas y grupos se reordenan arrastrándolos en la lista.
+- Capas de referencia: el relleno y la varita mágica pueden guiarse solo por las capas
+  marcadas como referencia (el lineart), por la capa actual o por todas.
 - Máscaras de capa: ocultan partes de una capa sin borrarlas; el borrador oculta y
   el pincel vuelve a mostrar. Se crean vacías o desde la selección.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
-  con modo de fusión propio.
+  con modo de fusión propio. Un grupo puede guardar otros grupos, en varios niveles.
 - Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
   sobre lo que ya hay en la capa.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
@@ -53,10 +55,12 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
+- Autoguardado: el proyecto se guarda solo en su archivo cada cierto tiempo (a elegir
+  en Preferencias), además de la copia de recuperación ante cierres inesperados.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
-- Simetría (`Y`): los trazos se repiten en espejo respecto a un eje vertical, uno
-  horizontal o los dos, colocados donde haga falta.
+- Simetría (menú Simetría): los trazos se repiten en espejo respecto a un eje vertical,
+  uno horizontal o los dos, colocados donde haga falta.
 - Paleta de colores guardados e historial de colores recientes.
 - Autoguardado: tras un cierre inesperado, ofrece recuperar el dibujo.
 - Atajos de herramientas configurables (Editar → Preferencias).
@@ -83,7 +87,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 | `S` | Selección (`Mayús`: cuadrado o círculo; un clic la quita) |
 | `U` | Formas (`Mayús`: cuadrado, círculo o línea a 45°) |
 | `A` | Texto (`Ctrl+Intro` lo coloca, `Esc` cancela); con una capa de texto activa, la reescribe |
-| `Y` | Simetría: clic o arrastre para colocar los ejes |
 | `Ctrl+A` / `Ctrl+D` | Seleccionar todo / Deseleccionar |
 | `Ctrl+Mayús+I` | Invertir la selección |
 | `Supr` | Borrar lo seleccionado |
