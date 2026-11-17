@@ -55,6 +55,17 @@
 //!   group    u32      0 = none, otherwise 1 + position in the list above
 //! ```
 //!
+//! Groups can be inside other groups. Which is inside which comes in a
+//! trailer of its own, written last, so that readers from before groups could
+//! nest still read everything else (they see the groups side by side):
+//!
+//! ```text
+//! magic      4 bytes  "GRPP"
+//! count      u32      group count, as in "GRPS"
+//! per group:
+//!   parent   u32      0 = none, otherwise 1 + position of the group it is in
+//! ```
+//!
 //! A third optional trailer says which layers are text that can still be
 //! rewritten (older readers see them as the pictures they are):
 //!
@@ -111,6 +122,7 @@ const REFERENCES_MAGIC: &[u8; 4] = b"REFS";
 const GROUPS_MAGIC: &[u8; 4] = b"GRPS";
 const TEXT_MAGIC: &[u8; 4] = b"TEXT";
 const MASK_MAGIC: &[u8; 4] = b"MASK";
+const PARENTS_MAGIC: &[u8; 4] = b"GRPP";
 /// Largest reference image side accepted when reading a file.
 const MAX_REFERENCE_SIDE: u32 = 16_384;
 
@@ -275,6 +287,14 @@ impl ProjectSnapshot {
                 }
             }
         }
+        if self.groups.iter().any(|group| group.parent != 0) {
+            w.write_all(PARENTS_MAGIC)?;
+            w.write_all(&(self.groups.len() as u32).to_le_bytes())?;
+            for group in &self.groups {
+                let place = self.groups.iter().position(|g| g.id == group.parent).map_or(0, |i| i as u32 + 1);
+                w.write_all(&place.to_le_bytes())?;
+            }
+        }
         Ok(())
     }
 }
@@ -371,6 +391,7 @@ impl Document {
         let mut groups: Vec<LayerGroup> = Vec::new();
         let mut texts_read = false;
         let mut masks_read = false;
+        let mut parents_read = false;
         loop {
             let mut magic = [0u8; 4];
             match r.read(&mut magic)? {
@@ -395,6 +416,7 @@ impl Document {
                     let blend = BlendMode::from_id(read_u8(r)?).ok_or_else(|| invalid("modo de fusión de grupo no válido"))?;
                     groups.push(LayerGroup {
                         id: place as u64,
+                        parent: 0,
                         name,
                         visible: flags & 1 != 0,
                         opacity,
@@ -408,6 +430,22 @@ impl Document {
                         return Err(invalid("grupo de capa no válido"));
                     }
                     layer.group = place as u64;
+                }
+                continue;
+            }
+            if &magic == PARENTS_MAGIC && !parents_read {
+                parents_read = true;
+                let count = read_u32(r)? as usize;
+                if count != groups.len() {
+                    return Err(invalid("lista de grupos no válida"));
+                }
+                for group in &mut groups {
+                    let place = read_u32(r)? as usize;
+                    if place > count {
+                        return Err(invalid("grupo no válido"));
+                    }
+                    // Groups are numbered from one in the order they were listed.
+                    group.parent = place as u64;
                 }
                 continue;
             }

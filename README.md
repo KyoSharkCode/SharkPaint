@@ -31,7 +31,7 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Máscaras de capa: ocultan partes de una capa sin borrarlas; el borrador oculta y
   el pincel vuelve a mostrar. Se crean vacías o desde la selección.
 - Grupos de capas: carpetas que se ocultan, se atenúan, se pliegan y se mueven juntas,
-  con modo de fusión propio.
+  con modo de fusión propio. Un grupo puede guardar otros grupos, en varios niveles.
 - Modo de fusión del pincel: el trazo puede multiplicar, aclarar, superponer, etc.
   sobre lo que ya hay en la capa.
 - Capas: crear, duplicar, reordenar, fusionar y eliminar; opacidad, visibilidad,
@@ -71,12 +71,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 - Aviso antes de descartar cambios sin guardar.
 
 ## Pendiente
-
-Para la 0.1.5:
-
-- Grupos dentro de grupos: meter un grupo de capas en otro, en varios niveles.
-
-Más adelante:
 
 - Abrir y guardar `.ora` y `.kra`.
 - Importar papeles propios para la textura de los pinceles.

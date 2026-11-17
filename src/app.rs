@@ -196,47 +196,41 @@ fn list_drop(dragged: Dragged, pointer: Pos2, rows: &[(Rect, ListRow)], doc: &Do
         .find(|(rect, _)| (rect.top() - 1.0..=rect.bottom() + 1.0).contains(&pointer.y))
         .unwrap_or(if pointer.y < first.0.top() { first } else { last });
     let upper = pointer.y < rect.center().y;
-    let bottom_of = |id: u64| layers.iter().position(|l| l.group == id);
-    let top_of = |id: u64| layers.iter().rposition(|l| l.group == id);
-    match (dragged, row) {
-        // A layer dropped on a heading goes to the top of that group.
-        (Dragged::Layer(_), ListRow::Heading(id)) => Some(ListDrop { gap: top_of(id)? + 1, group: id, line_y: rect.bottom() }),
-        (Dragged::Layer(_), ListRow::Layer(i)) => {
-            let own = layers[i].group;
-            let lowest = own != 0 && (i == 0 || layers[i - 1].group != own);
-            // Under a group's last layer it may stay in or come out: towards
-            // the left edge of the list it comes out.
-            let leaves = !upper && lowest && pointer.x < list_left + 44.0;
-            Some(ListDrop {
-                gap: if upper { i + 1 } else { i },
-                group: if leaves { 0 } else { own },
-                line_y: if upper { rect.top() } else { rect.bottom() },
-            })
+    let parent = |group: u64| doc.group(group).map_or(0, |g| g.parent);
+    let target = match row {
+        ListRow::Heading(id) => {
+            let (_, top) = doc.group_range(id)?;
+            if upper && matches!(dragged, Dragged::Group(_)) {
+                // A group over the top half of a heading goes beside that group, above it.
+                ListDrop { gap: top + 1, group: parent(id), line_y: rect.top() }
+            } else {
+                // Anything else dropped on a heading goes into the group, at its top.
+                ListDrop { gap: top + 1, group: id, line_y: rect.bottom() }
+            }
         }
-        (Dragged::Group(id), row) => {
-            let over = match row {
-                ListRow::Heading(other) => other,
-                ListRow::Layer(i) => layers[i].group,
-            };
-            if over == id {
-                return None;
+        ListRow::Layer(i) if upper => ListDrop { gap: i + 1, group: layers[i].group, line_y: rect.top() },
+        ListRow::Layer(i) => {
+            // Under the last layer of one or more groups, the drop can stay in
+            // them or come out: the further left the pointer, the further out.
+            let depth = ((pointer.x - (list_left + 28.0)) / 12.0).floor().max(0.0) as usize;
+            let mut group = layers[i].group;
+            while group != 0 && doc.group_depth(group) > depth && doc.group_range(group).is_some_and(|(lowest, _)| lowest == i) {
+                group = parent(group);
             }
-            if over == 0 {
-                let ListRow::Layer(i) = row else { return None };
-                return Some(ListDrop { gap: if upper { i + 1 } else { i }, group: 0, line_y: if upper { rect.top() } else { rect.bottom() } });
-            }
-            // Over another group: above all of it, or below all of it.
-            if matches!(row, ListRow::Heading(_)) && upper {
-                return Some(ListDrop { gap: top_of(over)? + 1, group: 0, line_y: rect.top() });
-            }
-            let lowest = bottom_of(over)?;
-            let line_y = rows
-                .iter()
-                .find(|(_, r)| matches!(r, ListRow::Layer(i) if *i == lowest))
-                .map_or(rect.bottom(), |(rect, _)| rect.bottom());
-            Some(ListDrop { gap: lowest, group: 0, line_y })
+            ListDrop { gap: i, group, line_y: rect.bottom() }
+        }
+    };
+    if let Dragged::Group(id) = dragged {
+        // A group cannot be dropped inside itself.
+        let over = match row {
+            ListRow::Heading(other) => other,
+            ListRow::Layer(i) => layers[i].group,
+        };
+        if doc.group_within(over, id) || doc.group_within(target.group, id) {
+            return None;
         }
     }
+    Some(target)
 }
 
 /// Text rendered for placing on the canvas.
@@ -2864,19 +2858,24 @@ impl SharkPaintApp {
             if tool(ui, "duplicar", true, "Duplicar capa (Ctrl+J)") {
                 commands.push(Command::LayerDuplicate);
             }
-            if tool(ui, "carpeta", chosen_group.is_none(), "Agrupar: pone la capa en un grupo nuevo") {
+            let tip = if chosen_group.is_some() {
+                "Agrupar: mete este grupo dentro de un grupo nuevo"
+            } else {
+                "Agrupar: pone la capa en un grupo nuevo"
+            };
+            if tool(ui, "carpeta", true, tip) {
                 commands.push(Command::LayerGroup);
             }
             match chosen_group {
                 // A group is chosen: the arrows move all of it.
                 Some(id) => {
-                    if tool(ui, "subir", true, "Subir el grupo") {
+                    if tool(ui, "subir", true, "Subir el grupo (en el borde del grupo que lo contiene, sale de él)") {
                         self.doc.move_group(id, true);
                     }
-                    if tool(ui, "bajar", true, "Bajar el grupo") {
+                    if tool(ui, "bajar", true, "Bajar el grupo (en el borde del grupo que lo contiene, sale de él)") {
                         self.doc.move_group(id, false);
                     }
-                    if tool(ui, "quitar", true, "Desagrupar: las capas se quedan") {
+                    if tool(ui, "quitar", true, "Desagrupar: las capas y los grupos de dentro se quedan") {
                         self.doc.ungroup(id);
                         self.active_group = None;
                     }
@@ -3058,13 +3057,29 @@ impl SharkPaintApp {
             ui.spacing_mut().item_spacing.y = 2.0;
             let layers = self.doc.layers();
             let mut rows: Vec<(Rect, ListRow)> = Vec::new();
+            // Each layer's groups, the outermost first.
+            let chain_of = |layer: &sharkpaint::engine::Layer| {
+                let mut chain = self.doc.group_chain(layer.group);
+                chain.reverse();
+                chain
+            };
             for (i, layer) in layers.iter().enumerate().rev() {
-                let group = self.doc.group(layer.group);
-                // The heading goes above the group's topmost layer.
-                if let Some(group) = group.filter(|g| layers.get(i + 1).is_none_or(|above| above.group != g.id)) {
-                    let ink = if group.visible { text } else { faint };
+                let chain = chain_of(layer);
+                let above = layers.get(i + 1).map(chain_of).unwrap_or_default();
+                let shared = chain.iter().zip(&above).take_while(|(a, b)| a == b).count();
+                let folded = |id: &u64| self.doc.group(*id).is_some_and(|g| g.collapsed);
+                let hidden = |id: &u64| self.doc.group(*id).is_some_and(|g| !g.visible);
+                // A heading goes above the topmost layer of each group that
+                // starts here, unless a group around it is folded.
+                for (depth, id) in chain.iter().enumerate().skip(shared) {
+                    if chain[..depth].iter().any(folded) {
+                        break;
+                    }
+                    let Some(group) = self.doc.group(*id) else { continue };
+                    let ink = if group.visible && !chain[..depth].iter().any(hidden) { text } else { faint };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.add_space(12.0 * depth as f32);
                         let (eye, tip) = if group.visible { ("ojo", "Ocultar grupo") } else { ("ojoCerrado", "Mostrar grupo") };
                         let button = egui::Button::image(icon(eye, 16.0, ink)).frame(false).min_size(Vec2::new(26.0, 26.0));
                         if ui.add(button).on_hover_text(tip).clicked() {
@@ -3095,7 +3110,7 @@ impl SharkPaintApp {
                         );
                         let folder = Rect::from_center_size(Pos2::new(row.left() + 30.0, row.center().y), Vec2::splat(16.0));
                         icon("carpeta", 16.0, ink).paint_at(ui, folder);
-                        let members = layers.iter().filter(|l| l.group == group.id).count();
+                        let members = self.doc.group_range(group.id).map_or(0, |(first, last)| last - first + 1);
                         let mut label = group.name.clone();
                         if group.collapsed {
                             label.push_str(&format!(" ({members})"));
@@ -3123,18 +3138,16 @@ impl SharkPaintApp {
                         }
                     });
                 }
-                if group.is_some_and(|g| g.collapsed) {
+                if chain.iter().any(folded) {
                     continue;
                 }
                 let props = &layer.props;
-                let in_group = group.is_some();
-                let shown = props.visible && group.is_none_or(|g| g.visible);
+                let shown = props.visible && !chain.iter().any(hidden);
                 let ink = if shown { text } else { faint };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if in_group {
-                        ui.add_space(12.0);
-                    }
+                    // Set in once for every group the layer is in.
+                    ui.add_space(12.0 * chain.len() as f32);
                     let (eye, tip) = if props.visible {
                         ("ojo", "Ocultar capa")
                     } else {
@@ -3251,7 +3264,7 @@ impl SharkPaintApp {
                     // What is being dragged is marked, with its whole group.
                     let carried = match dragging {
                         Some(Dragged::Layer(id)) => id == layer.id,
-                        Some(Dragged::Group(id)) => id == layer.group,
+                        Some(Dragged::Group(id)) => chain.contains(&id),
                         None => false,
                     };
                     if carried {
@@ -3266,7 +3279,7 @@ impl SharkPaintApp {
                 let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.x_range().contains(pos.x));
                 drop = pointer.and_then(|pos| list_drop(dragged, pos, &rows, &self.doc, list.left()));
                 if let Some(target) = &drop {
-                    let from = list.left() + if target.group != 0 { 40.0 } else { 28.0 };
+                    let from = list.left() + 28.0 + 12.0 * self.doc.group_depth(target.group) as f32;
                     ui.painter().line_segment(
                         [Pos2::new(from, target.line_y), Pos2::new(list.right() - 2.0, target.line_y)],
                         Stroke::new(2.0, Color32::from_rgb(111, 227, 240)),
@@ -3288,7 +3301,7 @@ impl SharkPaintApp {
                         }
                     }
                     (Dragged::Group(id), Some(target)) => {
-                        self.doc.place_group(id, target.gap);
+                        self.doc.place_group(id, target.gap, target.group);
                     }
                     _ => {}
                 }
@@ -4410,10 +4423,17 @@ impl SharkPaintApp {
             Command::LayerMerge => {
                 self.doc.merge_down();
             }
-            Command::LayerGroup => match self.doc.group_active_layer() {
-                Some(id) => self.active_group = Some(id),
-                None => self.status = "Lleva la capa al borde de su grupo para sacarla a un grupo nuevo.".into(),
-            },
+            Command::LayerGroup => {
+                // With a group chosen, the new group goes around it; otherwise
+                // around the active layer.
+                let made = match self.active_group.filter(|id| self.doc.group(*id).is_some()) {
+                    Some(id) => self.doc.group_group(id),
+                    None => self.doc.group_active_layer(),
+                };
+                if let Some(id) = made {
+                    self.active_group = Some(id);
+                }
+            }
             Command::Fit => self.fit_pending = true,
             Command::ActualSize => {
                 self.view.zoom = 1.0;

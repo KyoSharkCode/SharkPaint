@@ -203,6 +203,8 @@ impl LayerProps {
 pub struct LayerGroup {
     /// Unique within a document; never zero.
     pub id: u64,
+    /// The group this one is inside, or zero for none.
+    pub parent: u64,
     pub name: String,
     pub visible: bool,
     /// 0..=1, on top of each layer's own opacity.

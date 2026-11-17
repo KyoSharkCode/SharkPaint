@@ -1502,11 +1502,15 @@ fn layer_groups_move_as_a_block_and_empty_ones_vanish() {
     assert_eq!(order(&doc), ["Capa 3", "Capa 1", "Capa 2"]);
     assert_eq!(doc.layers()[0].group, high);
 
-    // A layer in the middle of a group cannot start its own: it would split it.
+    // A layer in the middle of a group can start a group of its own inside it.
     doc.set_active_layer(2);
     doc.add_layer(); // Capa 4 joins `low`, above Capa 2
     doc.set_active_layer(2);
-    assert!(doc.group_active_layer().is_none());
+    let inner = doc.group_active_layer().expect("a group inside a group");
+    assert_eq!(doc.group(inner).unwrap().parent, low);
+    assert_eq!(doc.group_range(low), Some((1, 3)), "the outer group still holds all three");
+    assert!(doc.ungroup(inner));
+    assert_eq!(doc.layers()[2].group, low, "its layer stays in the group around it");
 
     // Deleting a group's last layer removes the group.
     doc.set_active_layer(0);
@@ -1904,19 +1908,19 @@ fn layers_and_groups_can_be_dropped_anywhere_in_the_stack() {
     assert!(!doc.place_layer(0, 5, 999_999));
 
     // The whole group dropped at the top, then at the bottom.
-    assert!(doc.place_group(id, 5));
+    assert!(doc.place_group(id, 5, 0));
     assert_eq!(order(&doc), ["1", "5", "3", "2g", "4g"]);
-    assert!(doc.place_group(id, 0));
+    assert!(doc.place_group(id, 0, 0));
     assert_eq!(order(&doc), ["2g", "4g", "1", "5", "3"]);
-    assert!(!doc.place_group(id, 1), "inside itself is no move");
-    assert!(!doc.place_group(id, 2), "just above itself is no move");
+    assert!(!doc.place_group(id, 1, 0), "inside itself is no move");
+    assert!(!doc.place_group(id, 2, 0), "just above itself is no move");
     // A second group; the first may not land inside it.
     doc.set_active_layer(3);
     let other = doc.group_active_layer().unwrap();
     assert!(doc.place_layer(4, 4, other));
     assert_eq!(order(&doc), ["2g", "4g", "1", "5g", "3g"]);
-    assert!(!doc.place_group(id, 4));
-    assert!(doc.place_group(id, 5));
+    assert!(!doc.place_group(id, 4, 0));
+    assert!(doc.place_group(id, 5, 0));
     assert_eq!(order(&doc), ["1", "5g", "3g", "2g", "4g"]);
     // Dropping a group's last layer elsewhere removes the group.
     assert!(doc.place_layer(1, 0, 0));
@@ -2232,4 +2236,245 @@ fn fills_can_go_by_the_reference_layers_alone() {
     doc.clear_active_layer();
     assert!(doc.flood_fill_from(150, 150, [255, 0, 0], 0.1, FillSource::Reference));
     assert_eq!(doc.layers()[1].pixel(90, 90)[3], 0, "the yellow counts again");
+}
+
+/// Five layers, bottom to top, each a block of its own colour side by side.
+fn five_layers() -> Document {
+    let mut doc = Document::new(250, 50);
+    let colors = [[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+    for (i, color) in colors.into_iter().enumerate() {
+        if i > 0 {
+            doc.add_layer();
+        }
+        let x = 10.0 + 50.0 * i as f32;
+        doc.draw_shape(Shape::Rectangle, (x, 10.0), (x + 30.0, 40.0), color, 1.0, true, 1.0);
+    }
+    doc
+}
+
+/// The stack as text, bottom first: each layer's number, then the names of
+/// the groups it is in, outermost first.
+fn nesting(doc: &Document) -> Vec<String> {
+    doc.layers()
+        .iter()
+        .map(|layer| {
+            let mut chain = doc.group_chain(layer.group);
+            chain.reverse();
+            let groups: Vec<&str> = chain.iter().map(|id| doc.group(*id).unwrap().name.as_str()).collect();
+            format!("{}{}{}", &layer.props.name[5..], if groups.is_empty() { "" } else { ":" }, groups.join("/"))
+        })
+        .collect()
+}
+
+fn rename_group(doc: &mut Document, id: u64, name: &str) {
+    let mut group = doc.group(id).unwrap().clone();
+    group.name = name.into();
+    doc.set_group(group, false);
+}
+
+#[test]
+fn groups_can_hold_other_groups() {
+    let mut doc = five_layers();
+    let whole = doc.render_rgba8(doc.bounds());
+    // Group A around layer 2; layer 3 steps down into it; then B around 3, inside A.
+    doc.set_active_layer(1);
+    let a = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, a, "A");
+    doc.set_active_layer(2);
+    assert!(doc.move_layer(false));
+    let b = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, b, "B");
+    assert_eq!(nesting(&doc), ["1", "2:A", "3:A/B", "4", "5"]);
+    assert_eq!(doc.group(b).unwrap().parent, a);
+    assert_eq!((doc.group_depth(a), doc.group_depth(b)), (1, 2));
+    assert_eq!((doc.group_range(a), doc.group_range(b)), (Some((1, 2)), Some((2, 2))));
+    assert!(doc.group_within(b, a) && !doc.group_within(a, b));
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole, "grouping changes nothing on the canvas");
+
+    // Hiding the outer group hides what is in the inner one too.
+    let mut group = doc.group(a).unwrap().clone();
+    group.visible = false;
+    doc.set_group(group.clone(), false);
+    assert_eq!(pixel(&doc, 75, 25), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 125, 25), [255, 255, 255, 255]);
+    assert_eq!(pixel(&doc, 175, 25), [0, 0, 255, 255]);
+    // Opacities multiply down the nesting: half of a half is a quarter.
+    group.visible = true;
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let mut inner = doc.group(b).unwrap().clone();
+    inner.opacity = 0.5;
+    doc.set_group(inner, false);
+    let half = pixel(&doc, 75, 25);
+    let quarter = pixel(&doc, 125, 25);
+    assert!((126..=129).contains(&half[1]), "{half:?}");
+    assert!((190..=193).contains(&quarter[0]) && quarter[1] == 255, "{quarter:?}");
+    doc.undo();
+    doc.undo();
+    doc.undo();
+    assert_eq!(doc.render_rgba8(doc.bounds()), whole);
+
+    // Stepping a layer down goes in one level at a time, and out the same way.
+    doc.set_active_layer(3);
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "2:A", "3:A/B", "4:A", "5"], "into the outer group first");
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "2:A", "3:A/B", "4:A/B", "5"], "then into the inner one");
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "2:A", "4:A/B", "3:A/B", "5"], "then past the layer in it");
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "2:A", "4:A", "3:A/B", "5"], "out of the inner group at its edge");
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "4:A", "2:A", "3:A/B", "5"]);
+    assert!(doc.move_layer(false));
+    assert_eq!(nesting(&doc), ["1", "4", "2:A", "3:A/B", "5"], "and out of the outer one");
+    for _ in 0..6 {
+        doc.undo();
+    }
+    assert_eq!(nesting(&doc), ["1", "2:A", "3:A/B", "4", "5"]);
+
+    // A group moves with everything in it: A up past layer 4.
+    assert!(doc.move_group(a, true));
+    assert_eq!(nesting(&doc), ["1", "4", "2:A", "3:A/B", "5"]);
+    // B, at the top edge of A, steps out of it; then past the layer above.
+    assert!(doc.move_group(b, true));
+    assert_eq!(nesting(&doc), ["1", "4", "2:A", "3:B", "5"]);
+    assert_eq!(doc.group(b).unwrap().parent, 0);
+    assert!(doc.move_group(b, true));
+    assert_eq!(nesting(&doc), ["1", "4", "2:A", "5", "3:B"]);
+    // Dropped back inside A, under layer 2.
+    assert!(doc.place_group(b, 2, a));
+    assert_eq!(nesting(&doc), ["1", "4", "3:A/B", "2:A", "5"]);
+    // A group cannot go inside itself, nor inside a group that is in it.
+    assert!(!doc.place_group(a, 3, b));
+    assert!(!doc.place_group(a, 3, a));
+    // Nor may it land where it would cut another group in two.
+    doc.set_active_layer(4);
+    let c = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, c, "C");
+    assert!(!doc.place_group(c, 3, 0), "between A's layers but not in A");
+    assert!(doc.place_group(c, 3, a), "between A's layers, as part of A");
+    assert_eq!(nesting(&doc), ["1", "4", "3:A/B", "5:A/C", "2:A"]);
+
+    // Wrapping a group puts a new one around it, in the same place.
+    let d = doc.group_group(b).unwrap();
+    rename_group(&mut doc, d, "D");
+    assert_eq!(nesting(&doc), ["1", "4", "3:A/D/B", "5:A/C", "2:A"]);
+    // Dissolving a group in the middle moves what it held up one level.
+    assert!(doc.ungroup(d));
+    assert_eq!(nesting(&doc), ["1", "4", "3:A/B", "5:A/C", "2:A"]);
+    assert!(doc.ungroup(a));
+    assert_eq!(nesting(&doc), ["1", "4", "3:B", "5:C", "2"]);
+    doc.undo();
+    assert_eq!(nesting(&doc), ["1", "4", "3:A/B", "5:A/C", "2:A"]);
+
+    // Deleting the only layer of an inner group removes just that group.
+    doc.set_active_layer(2);
+    assert!(doc.delete_layer());
+    assert!(doc.group(b).is_none() && doc.group(a).is_some());
+    assert_eq!(nesting(&doc), ["1", "4", "5:A/C", "2:A"]);
+}
+
+#[test]
+fn nested_groups_are_saved_with_the_project_and_the_psd() {
+    // Three levels: A holds layer 2 and B; B holds layer 3 and C; C holds layer 4.
+    let mut doc = five_layers();
+    doc.set_active_layer(1);
+    let a = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, a, "A");
+    doc.set_active_layer(2);
+    assert!(doc.move_layer(false));
+    let b = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, b, "B");
+    doc.set_active_layer(3);
+    assert!(doc.move_layer(false) && doc.move_layer(false));
+    let c = doc.group_active_layer().unwrap();
+    rename_group(&mut doc, c, "C");
+    let layout = ["1", "2:A", "3:A/B", "4:A/B/C", "5"];
+    assert_eq!(nesting(&doc), layout);
+    let mut group = doc.group(b).unwrap().clone();
+    group.blend = BlendMode::Multiply;
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let picture = doc.render_rgba8(doc.bounds());
+
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(nesting(&loaded), layout);
+    assert_eq!(loaded.groups().len(), 3);
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), picture);
+    // Cut anywhere inside the nesting, the file is refused or read with flat groups.
+    for cut in file.len() - 20..file.len() {
+        if let Ok(partial) = Document::read_from(&mut &file[..cut]) {
+            assert_eq!(partial.layers().len(), 5);
+        }
+    }
+
+    let mut psd = Vec::new();
+    doc.write_psd(&mut psd).unwrap();
+    let from_psd = read_psd(&psd).unwrap();
+    assert_eq!(nesting(&from_psd), layout);
+    let inner = from_psd.groups().iter().find(|group| group.name == "B").unwrap();
+    assert_eq!(inner.blend, BlendMode::Multiply);
+    assert!((inner.opacity - 0.5).abs() < 0.01);
+    let (ours, theirs) = (pixel(&doc, 125, 25), pixel(&from_psd, 125, 25));
+    for channel in 0..3 {
+        assert!((ours[channel] as i32 - theirs[channel] as i32).abs() <= 1, "{ours:?} {theirs:?}");
+    }
+}
+
+#[test]
+fn nested_groups_blend_one_inside_another() {
+    // Grey at the bottom. Above it, an outer group that multiplies, holding a
+    // red layer and an inner group, which screens, holding a blue layer.
+    let mut doc = Document::new(100, 50);
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (100.0, 50.0), [128, 128, 128], 1.0, true, 1.0);
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (100.0, 50.0), [255, 0, 0], 1.0, true, 1.0);
+    let outer = doc.group_active_layer().unwrap();
+    doc.add_layer();
+    doc.draw_shape(Shape::Rectangle, (0.0, 0.0), (50.0, 50.0), [0, 0, 255], 1.0, true, 1.0);
+    let inner = doc.group_active_layer().unwrap();
+    assert_eq!(doc.group(inner).unwrap().parent, outer);
+    assert_eq!(pixel(&doc, 25, 25), [0, 0, 255, 255], "plain groups: blue covers red");
+
+    let mut group = doc.group(inner).unwrap().clone();
+    group.blend = BlendMode::Screen;
+    doc.set_group(group, false);
+    assert_eq!(pixel(&doc, 25, 25), [255, 0, 255, 255], "blue screened over the red beneath it");
+    assert_eq!(pixel(&doc, 75, 25), [255, 0, 0, 255]);
+    let mut group = doc.group(outer).unwrap().clone();
+    group.blend = BlendMode::Multiply;
+    doc.set_group(group.clone(), false);
+    // Inside the outer group: red, with magenta where blue screens over it.
+    // That whole result then multiplies the grey.
+    assert_eq!(pixel(&doc, 25, 25), [128, 0, 128, 255]);
+    assert_eq!(pixel(&doc, 75, 25), [128, 0, 0, 255]);
+    // The outer group's opacity fades the combined result.
+    group.opacity = 0.5;
+    doc.set_group(group, false);
+    let faded = pixel(&doc, 75, 25);
+    assert_eq!(faded[0], 128);
+    assert!((62..=66).contains(&faded[1]), "{faded:?}");
+
+    // Saved as a project and as a Photoshop file, the nesting comes back.
+    let picture = doc.render_rgba8(doc.bounds());
+    let mut file = Vec::new();
+    doc.write_to(&mut file).unwrap();
+    let loaded = Document::read_from(&mut file.as_slice()).unwrap();
+    assert_eq!(nesting(&loaded), nesting(&doc));
+    assert_eq!(loaded.render_rgba8(loaded.bounds()), picture);
+    for cut in file.len() - 20..file.len() {
+        let _ = Document::read_from(&mut &file[..cut]);
+    }
+    let mut psd = Vec::new();
+    doc.write_psd(&mut psd).unwrap();
+    let from_psd = read_psd(&psd).unwrap();
+    assert_eq!(nesting(&from_psd), nesting(&doc));
+    let parents: Vec<bool> = from_psd.groups().iter().map(|g| g.parent != 0).collect();
+    assert_eq!(parents.iter().filter(|nested| **nested).count(), 1);
+    let again = from_psd.render_rgba8(from_psd.bounds());
+    let worst = picture.iter().zip(&again).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    assert!(worst <= 2, "largest difference {worst}");
 }

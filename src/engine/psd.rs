@@ -15,7 +15,7 @@
 //!
 //! A `.psd` lists its layers bottom first. A group is a run of layers between
 //! two marker layers: a hidden divider below and, above, a heading that holds
-//! the group's own settings.
+//! the group's own settings. Groups inside groups are runs inside runs.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -319,9 +319,9 @@ fn read_layers(
         });
     }
 
-    // Layers of the groups still open, innermost last. Only outermost groups
-    // become groups here; the settings of inner ones are folded into their layers.
-    let mut open: Vec<Vec<usize>> = Vec::new();
+    // The groups still open, innermost last: for each, the layers directly in
+    // it and the groups directly in it, by their place in `groups`.
+    let mut open: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
     for record in &records {
         let (w, h) = (record.rect.width(), record.rect.height());
         let mut planes: [Option<Vec<u8>>; 4] = [None, None, None, None]; // red, green, blue, alpha
@@ -338,29 +338,30 @@ fn read_layers(
             planes[slot] = Some(channel(stored, w, h, bytes)?);
         }
         match record.section {
-            3 => open.push(Vec::new()),
+            3 => open.push((Vec::new(), Vec::new())),
             1 | 2 => {
-                let members = open.pop().unwrap_or_default();
-                if let Some(outer) = open.last_mut() {
-                    for &index in &members {
-                        let props = &mut layers[index].props;
-                        props.visible &= record.visible;
-                        props.opacity *= record.opacity;
-                    }
-                    outer.extend(members);
-                } else if !members.is_empty() {
+                let (members, inner) = open.pop().unwrap_or_default();
+                if !members.is_empty() || !inner.is_empty() {
                     let id = groups.len() as u64 + 1;
+                    for index in members {
+                        layers[index].group = id;
+                    }
+                    for place in inner {
+                        groups[place].parent = id;
+                    }
+                    // The group this one is in is not known until its own heading comes up.
+                    if let Some((_, outer)) = open.last_mut() {
+                        outer.push(groups.len());
+                    }
                     groups.push(LayerGroup {
                         id,
+                        parent: 0,
                         name: record.name.clone(),
                         visible: record.visible,
                         opacity: record.opacity,
                         blend: if record.pass_through { BlendMode::Normal } else { record.blend },
                         collapsed: record.section == 2,
                     });
-                    for index in members {
-                        layers[index].group = id;
-                    }
                 }
             }
             _ => {
@@ -375,8 +376,8 @@ fn read_layers(
                 layer.props.clip = record.clip;
                 layer.props.alpha_lock = record.alpha_lock;
                 put_pixels(&mut layer, record.rect, &red, green, blue, alpha.as_deref());
-                if let Some(group) = open.last_mut() {
-                    group.push(layers.len());
+                if let Some((members, _)) = open.last_mut() {
+                    members.push(layers.len());
                 }
                 layers.push(layer);
             }
@@ -621,14 +622,28 @@ impl Document {
             section: None,
         });
         let layers = self.layers();
+        // Each layer's groups, the outermost first.
+        let chains: Vec<Vec<u64>> = layers
+            .iter()
+            .map(|layer| {
+                let mut chain = self.group_chain(layer.group);
+                chain.reverse();
+                chain
+            })
+            .collect();
+        let shared = |a: &[u64], b: Option<&Vec<u64>>| b.map_or(0, |b| a.iter().zip(b).take_while(|(x, y)| x == y).count());
         for (i, layer) in layers.iter().enumerate() {
-            let group = self.group(layer.group);
-            if let Some(group) = group.filter(|g| i == 0 || layers[i - 1].group != g.id) {
-                let _ = group;
+            let chain = &chains[i];
+            // A divider below every group that starts with this layer...
+            let below = shared(chain, i.checked_sub(1).map(|at| &chains[at]));
+            for _ in below..chain.len() {
                 entries.push(Entry::marker("</Layer group>", 3, *b"norm", true, 1.0));
             }
             entries.push(layer_entry(layer));
-            if let Some(group) = group.filter(|g| layers.get(i + 1).is_none_or(|next| next.group != g.id)) {
+            // ...and a heading above every group that ends with it, innermost first.
+            let above = shared(chain, chains.get(i + 1));
+            for id in chain[above..].iter().rev() {
+                let Some(group) = self.group(*id) else { continue };
                 let key = if group.blend == BlendMode::Normal { *b"pass" } else { *key_from_blend(group.blend) };
                 entries.push(Entry::marker(&group.name, if group.collapsed { 2 } else { 1 }, key, group.visible, group.opacity));
             }

@@ -5,6 +5,7 @@ mod brush;
 mod canvas;
 mod document;
 mod export;
+mod groups;
 mod layer;
 mod papers;
 mod project;
