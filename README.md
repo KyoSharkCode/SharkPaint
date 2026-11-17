@@ -55,6 +55,8 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
   un toque lleva la vista a ese punto, y tiene controles de zoom y rotación.
 - Panel de referencias (`F6`): imágenes de consulta en una ventana aparte, con zoom
   propio y cuentagotas. Se guardan con el proyecto y nunca se exportan.
+- Autoguardado: el proyecto se guarda solo en su archivo cada cierto tiempo (a elegir
+  en Preferencias), además de la copia de recuperación ante cierres inesperados.
 - Insertar imágenes (PNG, JPEG, WebP, BMP, GIF) como capa nueva: desde un archivo,
   pegando con `Ctrl+V` o arrastrando el archivo a la ventana.
 - Simetría (menú Simetría): los trazos se repiten en espejo respecto a un eje vertical,
@@ -72,8 +74,6 @@ No usa navegador embebido: se compila a un único `SharkPaint.exe`.
 
 Para la 0.1.5:
 
-- Autoguardado del proyecto: además de la copia de recuperación, guardar solo cada
-  cierto tiempo en el propio archivo, con el intervalo a elegir.
 - Grupos dentro de grupos: meter un grupo de capas en otro, en varios niveles.
 
 Más adelante:

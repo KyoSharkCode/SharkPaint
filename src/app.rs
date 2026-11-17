@@ -662,6 +662,12 @@ pub struct SharkPaintApp {
     autosave_time: f64,
     autosave_revision: u64,
     autosave_thread: Option<std::thread::JoinHandle<()>>,
+    /// Minutes between automatic saves of the project to its own file; zero for none.
+    autosave_minutes: u32,
+    /// When the project was last saved or opened, to time the next automatic save.
+    last_save: std::time::Instant,
+    /// An automatic save of the project under way, with the revision it holds.
+    project_save: Option<(std::thread::JoinHandle<std::io::Result<()>>, u64)>,
     /// A recovery file from an earlier session, waiting for the user's answer.
     recovery_prompt: Option<PathBuf>,
 }
@@ -781,6 +787,9 @@ impl SharkPaintApp {
             autosave_time: 0.0,
             autosave_revision: 0,
             autosave_thread: None,
+            autosave_minutes: settings::DEFAULT_AUTOSAVE_MINUTES,
+            last_save: std::time::Instant::now(),
+            project_save: None,
             recovery_prompt: None,
         };
         app.library = BrushLibrary::load();
@@ -788,6 +797,7 @@ impl SharkPaintApp {
         app.brush_index = app.library.brushes.iter().position(|b| b.settings == app.brush);
         app.brush_source = app.brush_index;
         let stored = Settings::load();
+        app.autosave_minutes = stored.autosave_minutes;
         app.palette = stored.palette.clone();
         app.recent = stored.recent.clone();
         for (tool, key) in &stored.tool_keys {
@@ -819,6 +829,7 @@ impl SharkPaintApp {
 
     fn current_settings(&self) -> Settings {
         Settings {
+            autosave_minutes: self.autosave_minutes,
             palette: self.palette.clone(),
             recent: self.recent.clone(),
             tool_keys: Tool::ALL
@@ -871,6 +882,49 @@ impl SharkPaintApp {
         self.autosave_thread = Some(std::thread::spawn(move || {
             let _ = snapshot.save(&path);
         }));
+    }
+
+    /// Saves the project to its own file every so often, on another thread,
+    /// when it has a file and the user has not switched this off.
+    fn autosave_project(&mut self, ctx: &egui::Context) {
+        if let Some((thread, _)) = &self.project_save {
+            if thread.is_finished() {
+                self.finish_project_save();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            return;
+        }
+        let Some(path) = self.path.clone().filter(|_| self.autosave_minutes > 0) else { return };
+        if !self.modified() || self.doc.is_stroking() {
+            return;
+        }
+        let every = std::time::Duration::from_secs(self.autosave_minutes as u64 * 60);
+        let waited = self.last_save.elapsed();
+        if waited < every {
+            ctx.request_repaint_after((every - waited).min(std::time::Duration::from_secs(30)));
+            return;
+        }
+        let snapshot = self.doc.snapshot();
+        let revision = self.doc.revision();
+        self.last_save = std::time::Instant::now();
+        self.project_save = Some((std::thread::spawn(move || snapshot.save(&path)), revision));
+    }
+
+    /// Waits for an automatic save under way and takes note of how it went.
+    fn finish_project_save(&mut self) {
+        let Some((thread, revision)) = self.project_save.take() else { return };
+        match thread.join() {
+            Ok(Ok(())) => {
+                self.saved_revision = revision;
+                if self.doc.revision() == revision {
+                    self.drop_recovery();
+                }
+                self.status = "Proyecto guardado automáticamente.".into();
+            }
+            Ok(Err(e)) => self.status = format!("No se pudo guardar automáticamente: {e}"),
+            Err(_) => self.status = "No se pudo guardar automáticamente.".into(),
+        }
     }
 
     /// Removes the recovery file: the drawing is safely saved or was let go.
@@ -935,6 +989,25 @@ impl SharkPaintApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                ui.strong("Autoguardado");
+                ui.horizontal(|ui| {
+                    ui.label("Guardar el proyecto");
+                    let shown = match self.autosave_minutes {
+                        0 => "nunca (solo a mano)".to_owned(),
+                        1 => "cada minuto".to_owned(),
+                        n => format!("cada {n} minutos"),
+                    };
+                    egui::ComboBox::from_id_salt("autoguardado").selected_text(shown).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.autosave_minutes, 0, "nunca (solo a mano)");
+                        ui.selectable_value(&mut self.autosave_minutes, 1, "cada minuto");
+                        for minutes in [2, 5, 10, 15, 30] {
+                            ui.selectable_value(&mut self.autosave_minutes, minutes, format!("cada {minutes} minutos"));
+                        }
+                    });
+                });
+                ui.label("Se guarda en el propio archivo del proyecto, si ya lo tiene y hay cambios.");
+                ui.label("Un dibujo que aún no has guardado sigue protegido por la copia de recuperación.");
+                ui.add_space(8.0);
                 ui.strong("Atajos de las herramientas");
                 ui.label("Si eliges una tecla que ya usa otra herramienta, se intercambian.");
                 ui.add_space(4.0);
@@ -979,6 +1052,8 @@ impl SharkPaintApp {
     }
 
     fn replace_document(&mut self, doc: Document, path: Option<PathBuf>) {
+        self.finish_project_save();
+        self.last_save = std::time::Instant::now();
         self.saved_revision = doc.revision();
         self.doc = doc;
         self.path = path;
@@ -1024,6 +1099,8 @@ impl SharkPaintApp {
     /// Returns whether the document is now saved.
     fn save_project(&mut self, ask_path: bool) -> bool {
         self.doc.end_stroke();
+        // Two saves must not write the same file at once.
+        self.finish_project_save();
         let path = match (&self.path, ask_path) {
             (Some(path), false) => path.clone(),
             _ => {
@@ -1051,6 +1128,7 @@ impl SharkPaintApp {
             Ok(()) => {
                 self.status = format!("Guardado: {}", path.display());
                 self.saved_revision = self.doc.revision();
+                self.last_save = std::time::Instant::now();
                 self.path = Some(path);
                 self.drop_recovery();
                 true
@@ -4504,6 +4582,7 @@ impl eframe::App for SharkPaintApp {
         }
         self.recovery_window(&ctx);
         self.autosave(&ctx);
+        self.autosave_project(&ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
             self.store_settings();
         }
